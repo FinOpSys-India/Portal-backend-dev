@@ -1,12 +1,23 @@
 {
   "name": "portal-backend-dev",
   "version": "1.0.0",
-  "description": "",
+  "description": "Node.js + Express backend for the FinOpSys Portal, with PostgreSQL accessed through Prisma.",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "db:seed": "node prisma/seed.js",
+    "db:pull": "prisma db pull",
+    "db:generate": "prisma generate",
+    "db:studio": "prisma studio",
+    "postinstall": "prisma generate",
+    "test": "jest"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ]
   },
   "repository": {
     "type": "git",
@@ -22,15 +33,27 @@
   "homepage": "https://github.com/FinOpSys-India/Portal-backend-dev#readme",
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0",
+    "@prisma/adapter-pg": "^7.8.0",
+    "@prisma/client": "^7.8.0",
     "@supabase/ssr": "^0.12.2",
     "@supabase/supabase-js": "^2.110.5",
+    "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "jsonwebtoken": "^9.0.3",
     "nodemailer": "^9.0.3",
-    "pg": "^8.22.0"
+    "pg": "^8.22.0",
+    "stripe": "^22.3.2"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "jest": "^30.4.2",
+    "nodemon": "^3.1.14",
+    "prisma": "^7.8.0",
+    "supertest": "^7.2.2"
+  },
+  "directories": {
+    "test": "tests"
   }
 }
