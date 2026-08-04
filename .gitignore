@@ -12,8 +12,13 @@ node_modules/
 # and Stripe keys in it — while appearing to be ignored.
 .env
 .env.*
-!.env.example
+.env.example
+API_GAPS_AND_QUESTIONS.md
+API_INTEGRATION.md
+CHANGELOG_API.md
+openapi.yaml
 
+.gitignore
 # Logs
 logs/
 *.log
