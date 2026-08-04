@@ -40,6 +40,7 @@ jest.mock('../src/services/emailService', () => ({
 const request = require('supertest');
 const app = require('../src/app');
 const { digestOtp } = require('../src/utils/otp');
+const config = require('../src/config');
 
 const OTP_URL = '/api/auth/otp';
 const OTP = '012345'; // leading zero on purpose
@@ -63,9 +64,11 @@ function challenge(id, overrides = {}) {
     user: {
       id: 1,
       email: 'user@finopsys.ai',
+      firstName: 'Ada',
+      lastName: 'Lovelace',
       status: 'ACTIVE',
       role: { code: 'CUSTOMER' },
-      specificRole: null,
+      specificRole: { code: 'OWNER' },
     },
     ...overrides,
   };
@@ -89,15 +92,39 @@ describe('POST /api/auth/otp — verify', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data.authenticated).toBe(true);
-    expect(res.body.data.user).toEqual({ id: 1, email: 'user@finopsys.ai', role: 'CUSTOMER' });
+    // The full public view, not the three fields this used to return: a client
+    // that has just signed in should not need a second call to learn the user's
+    // name, and gating "owner" features on `role` alone is wrong — that is what
+    // `specificRole` is for.
+    expect(res.body.data.user).toEqual({
+      id: 1,
+      email: 'user@finopsys.ai',
+      firstName: 'Ada',
+      lastName: 'Lovelace',
+      role: 'CUSTOMER',
+      specificRole: 'OWNER',
+      status: 'ACTIVE',
+    });
     expect(typeof res.body.data.accessToken).toBe('string');
-    expect(res.body.data.expiresInSeconds).toBe(900);
+    // Derived from the same TTL the token was signed with, so the two cannot
+    // drift. Previously this was null because of a config bug.
+    //
+    // Compared against the resolved config rather than a hardcoded 900: a
+    // developer's own .env may set ACCESS_TOKEN_TTL (ours sets 8h locally so
+    // testing is not interrupted by refreshes), and dotenv loads it here too.
+    // A literal made this assertion fail on the machine rather than on a real
+    // defect. What it must actually prove is that the number reported to the
+    // client matches the lifetime the token was signed with.
+    expect(res.body.data.expiresInSeconds).toBe(config.auth.accessTokenTtlSeconds);
+    expect(typeof res.body.data.expiresInSeconds).toBe('number');
 
     // Refresh token is set as an HttpOnly cookie, never in the body.
     const cookies = res.headers['set-cookie'].join(';');
     expect(cookies).toMatch(/refreshToken=/);
     expect(cookies).toMatch(/HttpOnly/i);
-    expect(JSON.stringify(res.body)).not.toContain('refreshToken');
+    // The body may name the field (refreshTokenExpiresAt) but must never carry
+    // the secret itself.
+    expect(res.body.data.refreshToken).toBeUndefined();
 
     // Challenge consumed and a refresh token persisted.
     expect(mockPrisma.loginChallenge.updateMany).toHaveBeenCalledWith(

@@ -146,12 +146,29 @@ describe('POST /onboarding — provision the owner + customer account', () => {
     mockPrisma.customer.create.mockResolvedValue({ id: 100 });
     mockPrisma.user.update.mockResolvedValue(statusUser({ ownedCustomer: ownedCustomer() }));
 
-    await request(app)
+    /*
+     * An id in the body is now REJECTED outright rather than quietly dropped.
+     * Ignoring it was already safe — identity has always come from the token —
+     * but a silently-discarded field is indistinguishable from an accepted one
+     * to whoever is probing the endpoint, and to an honest client with a typo.
+     */
+    const rejected = await request(app)
       .post('/api/onboarding')
       .set('Authorization', auth(USER_ID))
       .send({ userId: 9999, id: 9999, ownerUserId: 9999, companyName: 'Acme' });
 
-    // The account is owned by the token's id (42), not the body's 9999.
+    expect(rejected.status).toBe(400);
+    expect(rejected.body.error.details.unknown).toEqual(
+      expect.arrayContaining(['userId', 'id', 'ownerUserId'])
+    );
+    expect(mockPrisma.customer.create).not.toHaveBeenCalled();
+
+    // And with a clean body, the account is owned by the token's id (42).
+    await request(app)
+      .post('/api/onboarding')
+      .set('Authorization', auth(USER_ID))
+      .send({ companyName: 'Acme' });
+
     expect(mockPrisma.customer.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ ownerUserId: USER_ID, name: 'Acme' }) })
     );

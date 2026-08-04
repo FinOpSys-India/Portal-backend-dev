@@ -14,6 +14,7 @@ const mockPrisma = {
   // findFirst is the company-email availability check reading the users table.
   user: { findUnique: jest.fn(), findFirst: jest.fn() },
   company: { findFirst: jest.fn(), create: jest.fn(), update: jest.fn() },
+  customer: { findUnique: jest.fn() },
   address: { create: jest.fn() },
   companyAddress: { create: jest.fn() },
   specialization: { findMany: jest.fn() },
@@ -117,6 +118,7 @@ function validBody(overrides = {}) {
 
 function stageHappyPath() {
   mockPrisma.user.findUnique.mockResolvedValue(ownerUser());
+  mockPrisma.customer.findUnique.mockResolvedValue({ id: 55 });
   mockPrisma.address.create.mockResolvedValue(addressRow());
   mockPrisma.company.create.mockResolvedValue(companyRow());
   mockPrisma.companyAddress.create.mockResolvedValue({ id: 700 });
@@ -135,6 +137,8 @@ beforeEach(() => {
   // user.findFirst for login addresses.
   mockPrisma.company.findFirst.mockResolvedValue(null);
   mockPrisma.user.findFirst.mockResolvedValue(null);
+  // The customer account the new company will be linked to.
+  mockPrisma.customer.findUnique.mockResolvedValue({ id: 55 });
 });
 
 describe('POST /api/onboarding/company — authentication & authorization', () => {
@@ -146,14 +150,43 @@ describe('POST /api/onboarding/company — authentication & authorization', () =
   });
 
   it('rejects a non-owner token at the role gate (403 FORBIDDEN)', async () => {
+    // The database agrees with the claim, so the gate's re-check confirms the
+    // refusal rather than overturning it.
+    mockPrisma.user.findUnique.mockResolvedValue(
+      ownerUser({ role: { code: 'SPECIALIST' }, specificRole: null })
+    );
+
     const res = await request(app)
       .post('/api/onboarding/company')
       .set('Authorization', auth({ role: 'SPECIALIST', specificRole: null }))
       .send(validBody());
+
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('FORBIDDEN');
-    // Blocked before any DB work.
-    expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+    expect(mockPrisma.company.create).not.toHaveBeenCalled();
+  });
+
+  it('lets a caller through when the token role is STALE but the database says OWNER', async () => {
+    /*
+     * The case that used to be a dead end. POST /onboarding promotes a user to
+     * CUSTOMER/OWNER but the access token they hold was signed before that, so
+     * this call — gated on the OWNER claim — refused them, while GET /onboarding
+     * simultaneously reported specificRole: "OWNER". Two endpoints disagreeing
+     * about one user because one reads the token and the other reads the DB.
+     */
+    mockPrisma.user.findUnique.mockResolvedValue(ownerUser());
+    stageHappyPath();
+
+    const res = await request(app)
+      .post('/api/onboarding/company')
+      // A pre-promotion token: no OWNER claim anywhere on it.
+      .set('Authorization', auth({ role: 'CUSTOMER', specificRole: 'TEAM' }))
+      .send(validBody());
+
+    expect(res.status).toBe(201);
+    // And the client is told its token is behind, so it can refresh rather than
+    // relying on this fallback on every subsequent call.
+    expect(res.headers['x-token-stale']).toBe('true');
   });
 
   it('rejects an owner token whose DB role is no longer OWNER (403 OWNER_ROLE_REQUIRED)', async () => {
@@ -183,12 +216,16 @@ describe('POST /api/onboarding/company — happy path', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.data.company).toMatchObject({
       id: 900,
-      owner_user_id: USER_ID,
+      ownerUserId: USER_ID,
       status: 'ACTIVE',
-      onboarding_completed: true,
-      last_year_revenue: '1500000.00',
+      onboardingCompleted: true,
+      lastYearRevenue: '1500000.00',
     });
-    expect(res.body.data.primary_address).toMatchObject({ id: 500, address_line_1: '123 Main Street', country_code: 'US' });
+    expect(res.body.data.primaryAddress).toMatchObject({
+      id: 500,
+      addressLine1: '123 Main Street',
+      countryCode: 'US',
+    });
 
     // One transaction wraps every write.
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
@@ -221,7 +258,7 @@ describe('POST /api/onboarding/company — happy path', () => {
       .set('Authorization', auth())
       .send(validBody({ owner_user_id: 9999 }));
     expect(res.status).toBe(400);
-    expect(res.body.error.details.unknown).toContain('owner_user_id');
+    expect(res.body.error.details.unknown).toContain('ownerUserId');
     expect(mockPrisma.company.create).not.toHaveBeenCalled();
   });
 });
@@ -354,7 +391,7 @@ describe('POST /api/onboarding/company — validation', () => {
     delete body.company_name;
     const res = await request(app).post('/api/onboarding/company').set('Authorization', auth()).send(body);
     expect(res.status).toBe(400);
-    expect(res.body.error.details.missing).toContain('company_name');
+    expect(res.body.error.details.missing).toContain('companyName');
   });
 
   it('rejects an invalid email (400)', async () => {
@@ -364,7 +401,7 @@ describe('POST /api/onboarding/company — validation', () => {
       .set('Authorization', auth())
       .send(validBody({ company_email: 'not-an-email' }));
     expect(res.status).toBe(400);
-    expect(res.body.error.fields.company_email).toBeDefined();
+    expect(res.body.error.fields.companyEmail).toBeDefined();
   });
 
   it('rejects a negative employee_count (400)', async () => {
@@ -374,7 +411,7 @@ describe('POST /api/onboarding/company — validation', () => {
       .set('Authorization', auth())
       .send(validBody({ employee_count: -3 }));
     expect(res.status).toBe(400);
-    expect(res.body.error.fields.employee_count).toBeDefined();
+    expect(res.body.error.fields.employeeCount).toBeDefined();
   });
 
   it('rejects a negative revenue (400)', async () => {
@@ -384,7 +421,7 @@ describe('POST /api/onboarding/company — validation', () => {
       .set('Authorization', auth())
       .send(validBody({ last_year_revenue: -1 }));
     expect(res.status).toBe(400);
-    expect(res.body.error.fields.last_year_revenue).toBeDefined();
+    expect(res.body.error.fields.lastYearRevenue).toBeDefined();
   });
 
   it('rejects an unknown field inside the address (400)', async () => {

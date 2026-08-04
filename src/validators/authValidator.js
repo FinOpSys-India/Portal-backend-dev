@@ -1,16 +1,16 @@
 'use strict';
 
 const ApiError = require('../utils/ApiError');
+const common = require('./common');
 
 /**
- * Input validation for the auth flows. Mirrors the hand-rolled style of the
- * invitation controller (no schema library in the project) and, like it, keeps
- * the column widths from schema.prisma so oversized input is a clean 400 rather
- * than an opaque database write error.
+ * Input validation for the sign-up flow.
+ *
+ * The email, name, and length rules now come from validators/common, so sign-up
+ * and login agree on what a valid address is. They previously did not: sign-up
+ * allowed 255 characters and login 254, which meant an address of exactly 255
+ * could register and then never authenticate.
  */
-
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MAX_LENGTH = { email: 255, firstName: 100, lastName: 100 };
 
 // Password policy. Deliberately checks composition, not just length: an 8-char
 // minimum alone still permits "password". The 72-byte ceiling is bcrypt's own
@@ -21,33 +21,7 @@ const PASSWORD = {
   maxBytes: 72,
 };
 
-function requireFields(body) {
-  const missing = ['invitationToken', 'email', 'firstName', 'lastName', 'password'].filter(
-    (f) => body[f] === undefined || body[f] === null || body[f] === ''
-  );
-  if (missing.length) {
-    throw new ApiError(400, 'Required fields are missing.', { details: { missing } });
-  }
-}
-
-function validateName(value, field) {
-  const name = String(value).trim();
-  if (!name) {
-    throw new ApiError(400, `${field} cannot be blank.`);
-  }
-  if (name.length > MAX_LENGTH[field]) {
-    throw new ApiError(400, `${field} cannot exceed ${MAX_LENGTH[field]} characters.`);
-  }
-  return name;
-}
-
-function validateEmail(value) {
-  const email = String(value).toLowerCase().trim();
-  if (!EMAIL_PATTERN.test(email) || email.length > MAX_LENGTH.email) {
-    throw new ApiError(400, 'A valid email address is required.');
-  }
-  return email;
-}
+const SIGNUP_FIELDS = ['invitationToken', 'email', 'firstName', 'lastName', 'password'];
 
 /**
  * Enforce the password policy. Returns the password unchanged on success (it is
@@ -72,6 +46,8 @@ function validatePassword(value) {
 
   if (failures.length) {
     throw new ApiError(400, `Password must ${failures.join(', ')}.`, {
+      code: 'VALIDATION_ERROR',
+      fields: { password: `Password must ${failures.join(', ')}.` },
       details: { requirements: failures },
     });
   }
@@ -79,18 +55,31 @@ function validatePassword(value) {
 }
 
 /**
+ * The invitation token is `crypto.randomBytes(32).toString('hex')` — 64 hex
+ * characters. Shape-checking it here rejects obvious junk before it reaches a
+ * database lookup, and keeps a multi-kilobyte "token" out of the query.
+ */
+function validateInvitationToken(value) {
+  if (typeof value !== 'string' || !common.INVITATION_TOKEN_PATTERN.test(value.trim())) {
+    throw common.fieldError('invitationToken', 'A valid invitation token is required.', 'This invitation link is not valid.');
+  }
+  return value.trim();
+}
+
+/**
  * Validate and normalise a sign-up request body. Returns only the whitelisted,
  * cleaned fields — never the raw body — so nothing unexpected reaches the
- * service layer. The invitation token is passed through untrimmed and is not
- * echoed anywhere.
+ * service layer. The token is never echoed anywhere.
  */
-function validateSignup(body) {
-  requireFields(body);
+function validateSignup(body = {}) {
+  common.rejectUnknown(body, SIGNUP_FIELDS);
+  common.requireFields(body, SIGNUP_FIELDS);
+
   return {
-    invitationToken: String(body.invitationToken),
-    email: validateEmail(body.email),
-    firstName: validateName(body.firstName, 'firstName'),
-    lastName: validateName(body.lastName, 'lastName'),
+    invitationToken: validateInvitationToken(body.invitationToken),
+    email: common.email(body.email),
+    firstName: common.str(body.firstName, 'firstName', { max: common.LIMITS.firstName }),
+    lastName: common.str(body.lastName, 'lastName', { max: common.LIMITS.lastName }),
     password: validatePassword(body.password),
   };
 }
@@ -99,4 +88,4 @@ function validateSignup(body) {
 // policy. One definition means a rule tightened here cannot be silently skipped
 // by the other path — which would let a user reset their way to a weaker
 // password than sign-up would ever have accepted.
-module.exports = { validateSignup, validatePassword, PASSWORD };
+module.exports = { validateSignup, validatePassword, validateInvitationToken, PASSWORD };

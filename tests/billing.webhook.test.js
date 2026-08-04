@@ -957,20 +957,20 @@ describe('GET /billing/checkout-status', () => {
     expect(res.status).toBe(200);
     expect(res.body.data).toMatchObject({
       status: 'paid',
-      checkout_status: 'complete',
-      payment_status: 'paid',
-      company_id: COMPANY_ID,
-      subscription_status: 'ACTIVE',
+      checkoutStatus: 'complete',
+      paymentStatus: 'paid',
+      companyId: COMPANY_ID,
+      subscriptionStatus: 'ACTIVE',
     });
     expect(res.body.data.services).toEqual(
       expect.arrayContaining([
-        { service: 'bookkeeping', status: 'active', price_option_id: 'bookkeeping_option_2' },
+        { service: 'bookkeeping', status: 'active', priceOptionId: 'bookkeeping_option_2' },
         {
           service: 'payroll',
           status: 'active',
-          plan_id: 'payroll_standard',
-          employee_count: 12,
-          contractor_count: 0,
+          planId: 'payroll_standard',
+          employeeCount: 12,
+          contractorCount: 0,
         },
       ])
     );

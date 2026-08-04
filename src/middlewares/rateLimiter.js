@@ -132,6 +132,19 @@ const companyLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 60, label:
  */
 const billingLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 20, label: 'Billing' });
 
+/*
+ * Token refresh. Unauthenticated by nature — an expired access token is exactly
+ * when this is called — and every hit writes (revoke the old row, insert the new
+ * one), so it is both a guessing surface and a write amplifier.
+ *
+ * The cap is generous rather than tight: a legitimate client refreshes roughly
+ * once per access-token lifetime, but several tabs of the same app each hold
+ * their own timer, and throttling a real user out of their session is a worse
+ * outcome than letting an attacker make a few dozen doomed guesses against a
+ * 96-hex-character token.
+ */
+const refreshLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 60, label: 'Refresh' });
+
 module.exports = {
   invitationLimiter,
   authLimiter,
@@ -141,4 +154,5 @@ module.exports = {
   onboardingLimiter,
   companyLimiter,
   billingLimiter,
+  refreshLimiter,
 };

@@ -3,9 +3,10 @@
 const asyncHandler = require('../middlewares/asyncHandler');
 const {
   validateCheckoutRequest,
+  validateAddServicesRequest,
   validateSessionId,
   validateCompanyIdQuery,
-  validatePagination,
+  validatePaymentsQuery,
   validateCancelRequest,
   validatePayrollUpdate,
   validatePortalRequest,
@@ -65,7 +66,10 @@ const createCheckout = asyncHandler(async (req, res) => {
  * records — never from anything the success page supplied.
  */
 const getCheckoutStatus = asyncHandler(async (req, res) => {
-  const sessionId = validateSessionId(req.query.session_id);
+  // Accepts `?sessionId=` and `?session_id=` alike — normalizeRequest has already
+  // reconciled the two by the time this runs. Stripe substitutes the value into
+  // the success URL as `session_id`, so both spellings genuinely occur.
+  const sessionId = validateSessionId(req.query.sessionId);
 
   const { message, data } = await checkoutService.getCheckoutStatus({
     userId: req.user.id,
@@ -91,27 +95,58 @@ const getSubscription = asyncHandler(async (req, res) => {
     companyId,
   });
 
-  return res.status(200).json({ success: true, data });
+  // 200 with `hasSubscription: false` rather than a 404 when nothing has been
+  // bought yet. Having no subscription is a normal state for a company between
+  // onboarding and its first checkout, not an error.
+  return res.status(200).json({
+    success: true,
+    message: data.hasSubscription ? 'Subscription retrieved.' : 'This company has no subscription yet.',
+    data,
+  });
 });
 
 /**
- * GET /billing/payments?company_id=1&limit=25&offset=0
+ * GET /billing/payments?companyId=1&limit=25&offset=0&sort=paidAt&order=desc
  *
- * Payment history, newest first.
+ * Payment history.
  */
 const listPayments = asyncHandler(async (req, res) => {
-  const companyId = validateCompanyIdQuery(req.query);
-  const { limit, offset } = validatePagination(req.query);
+  const query = validatePaymentsQuery(req.query);
 
   const data = await subscriptionService.listPayments({
     userId: req.user.id,
     requestId: req.id,
-    companyId,
-    limit,
-    offset,
+    ...query,
   });
 
-  return res.status(200).json({ success: true, data });
+  return res.status(200).json({ success: true, message: 'Payments retrieved.', data });
+});
+
+/**
+ * POST /billing/subscription/services
+ *
+ * Add a service to a live subscription, on the existing Stripe subscription so
+ * the customer keeps one renewal date and one invoice. Previously impossible:
+ * checkout refused a company that already had an active subscription, and there
+ * was no other route, so "add tax to my bookkeeping plan" required cancelling
+ * and re-buying.
+ */
+const addServices = asyncHandler(async (req, res) => {
+  const { companyId, selections, selectedServices } = validateAddServicesRequest(req.body);
+
+  const data = await subscriptionService.addServices({
+    userId: req.user.id,
+    requestId: req.id,
+    companyId,
+    selections,
+    selectedServices,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Services added to the subscription.',
+    data,
+  });
 });
 
 /**
@@ -219,6 +254,7 @@ module.exports = {
   getCheckoutStatus,
   getSubscription,
   listPayments,
+  addServices,
   updatePayroll,
   cancelSubscription,
   createPortalSession,

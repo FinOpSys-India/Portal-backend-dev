@@ -115,18 +115,35 @@ function updatePayment(client, id, data) {
   return client.companyPayment.update({ where: { id }, data });
 }
 
-/** A page of a company's payment history, newest first. */
-function listPaymentsForCompany(client, companyId, { limit, offset }) {
+/** Find a receipt by Stripe Charge — the refund and dispute events' only handle. */
+function findPaymentByChargeId(client, stripeChargeId) {
+  return client.companyPayment.findFirst({ where: { stripeChargeId } });
+}
+
+function findPaymentByPaymentIntentId(client, stripePaymentIntentId) {
+  return client.companyPayment.findFirst({ where: { stripePaymentIntentId } });
+}
+
+/**
+ * A page of a company's payment history.
+ *
+ * The sort was previously hardcoded to paidAt/createdAt descending with no way
+ * to change it, so a sortable table header was impossible to build. `sort` is an
+ * allowlisted column name (see billingValidator), never a raw query value.
+ */
+function listPaymentsForCompany(client, companyId, { limit, offset, sort = 'paidAt', order = 'desc', status = null }) {
   return client.companyPayment.findMany({
-    where: { companyId },
-    orderBy: [{ paidAt: 'desc' }, { createdAt: 'desc' }],
+    where: { companyId, ...(status ? { status } : {}) },
+    // A secondary key on createdAt keeps the order total: paidAt is nullable, so
+    // failed rows would otherwise come back in an arbitrary order between pages.
+    orderBy: [{ [sort]: order }, { createdAt: 'desc' }],
     take: limit,
     skip: offset,
   });
 }
 
-function countPaymentsForCompany(client, companyId) {
-  return client.companyPayment.count({ where: { companyId } });
+function countPaymentsForCompany(client, companyId, { status = null } = {}) {
+  return client.companyPayment.count({ where: { companyId, ...(status ? { status } : {}) } });
 }
 
 /* ------------------------------ stripe events ----------------------------- */
@@ -179,6 +196,8 @@ module.exports = {
   createSubscriptionItem,
   updateSubscriptionItem,
   findPaymentByInvoiceId,
+  findPaymentByChargeId,
+  findPaymentByPaymentIntentId,
   createPayment,
   updatePayment,
   listPaymentsForCompany,

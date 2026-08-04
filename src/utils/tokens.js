@@ -22,6 +22,9 @@ const config = require('../config');
 
 const REFRESH_TOKEN_BYTES = 48;
 const RESET_TOKEN_BYTES = 48;
+// 32 bytes -> 64 hex characters, matching the shape authValidator checks before
+// the token reaches a database lookup.
+const INVITATION_TOKEN_BYTES = 32;
 
 /**
  * Sign a short-lived access token. `sub` is the user id; role/specificRole are
@@ -66,6 +69,31 @@ function hashPasswordResetToken(rawToken) {
 }
 
 /**
+ * Hash an invitation token.
+ *
+ * The invitation token is a real credential: whoever holds it completes a
+ * sign-up as the invited person, inheriting that invitation's role and email.
+ * It was previously the one secret in the schema stored in readable form, so it
+ * now gets the same treatment as the others.
+ *
+ * A fast hash is right here, as with refresh tokens: the input is a 32-byte
+ * random value with full entropy, so there is no dictionary to run against it
+ * and nothing that bcrypt's slowness would buy.
+ */
+function hashInvitationToken(rawToken) {
+  return crypto.createHash('sha256').update(String(rawToken)).digest('hex');
+}
+
+/**
+ * Mint an invitation token. Returns the raw value (emailed to the invitee,
+ * never stored) and its digest (stored, and the only thing the lookup matches).
+ */
+function generateInvitationToken() {
+  const rawToken = crypto.randomBytes(INVITATION_TOKEN_BYTES).toString('hex');
+  return { rawToken, tokenHash: hashInvitationToken(rawToken) };
+}
+
+/**
  * Mint the ticket token handed back after a password-reset OTP is verified.
  * Returns the raw token (client-only), its hash (for storage), and the absolute
  * expiry. Unlike a refresh token this is single-use and lives for minutes, not
@@ -80,20 +108,25 @@ function generatePasswordResetToken() {
 
 /**
  * Mint a refresh token. Returns the raw token (client-only), its hash (for
- * storage), and the absolute expiry. The caller persists the hash + expiry and
- * hands the raw token back to the client.
+ * storage), the absolute expiry, and the family it belongs to.
  *
- * FUTURE: when the /refresh endpoint lands, rotation reuses this same helper —
- * each refresh revokes the old row and mints a new one here. No change to this
- * function is needed; the rotation/reuse-detection logic belongs in the refresh
- * service (see authRoutes.js and the RefreshToken schema note).
+ * `familyId` ties every token descended from one login together. Pass the
+ * existing family when rotating, so the chain stays linked and a replay can be
+ * traced back to the login it came from; omit it at login/sign-up to start a
+ * fresh family. Reuse detection revokes by family, so a token without one could
+ * never be properly cut off.
  */
-function generateRefreshToken() {
+function generateRefreshToken({ familyId } = {}) {
   const rawToken = crypto.randomBytes(REFRESH_TOKEN_BYTES).toString('hex');
   const expiresAt = new Date(
     Date.now() + config.auth.refreshTokenTtlDays * 24 * 60 * 60 * 1000
   );
-  return { rawToken, tokenHash: hashRefreshToken(rawToken), expiresAt };
+  return {
+    rawToken,
+    tokenHash: hashRefreshToken(rawToken),
+    expiresAt,
+    familyId: familyId || crypto.randomUUID(),
+  };
 }
 
 module.exports = {
@@ -103,4 +136,6 @@ module.exports = {
   generateRefreshToken,
   hashPasswordResetToken,
   generatePasswordResetToken,
+  hashInvitationToken,
+  generateInvitationToken,
 };

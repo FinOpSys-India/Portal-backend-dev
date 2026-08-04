@@ -77,33 +77,9 @@ model Address {
   updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   users            User[]
-  customers        Customer[]
   companyAddresses CompanyAddress[]
 
   @@map("addresses")
-}
-
-/// A customer account (tenant), created during post-signup onboarding and owned
-/// by exactly one user — its OWNER. The unique owner_user_id makes ownership
-/// one-to-one; additional users can join the same account later via
-/// User.customerId, but each account still has a single owner.
-model Customer {
-  id          Int      @id @default(autoincrement())
-  name        String   @db.VarChar(255)
-  ownerUserId Int      @unique @map("owner_user_id")
-  addressId   Int?     @map("address_id")
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-
-  // The owning user. RESTRICT so a user who still owns an account cannot be
-  // deleted out from under it, leaving the account orphaned.
-  owner   User     @relation("CustomerOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
-  address Address? @relation(fields: [addressId], references: [id], onDelete: SetNull)
-  // Every user whose customerId points here — includes the owner once onboarding
-  // sets it.
-  members User[]   @relation("CustomerMembers")
-
-  @@map("customers")
 }
 
 /// A portal user. Created as INVITED with no passwordHash; the accept-invitation
@@ -121,9 +97,6 @@ model User {
   roleId         Int        @map("role_id")
   specificRoleId Int?       @map("specific_role_id")
   addressId      Int?       @map("address_id")
-  // The customer account this user belongs to. Set during onboarding when the
-  // user is provisioned as that account's OWNER (see Customer).
-  customerId     Int?       @map("customer_id")
   status         UserStatus @default(INVITED)
   hibernatedAt   DateTime?  @map("hibernated_at") @db.Timestamptz(6)
 
@@ -155,13 +128,6 @@ model User {
   role    Role     @relation(fields: [roleId], references: [id])
   address Address? @relation(fields: [addressId], references: [id])
 
-  // Membership: the customer account this user belongs to (many users per
-  // customer). Distinct from ownership below, which is the one-to-one owner link.
-  customer      Customer? @relation("CustomerMembers", fields: [customerId], references: [id], onDelete: SetNull)
-  // Ownership: the customer account this user owns, if any (at most one). The FK
-  // lives on Customer.ownerUserId; this is only the back-relation.
-  ownedCustomer Customer? @relation("CustomerOwner")
-
   // Composite FK: guarantees specificRole (when set) belongs to role.
   specificRole SpecificRole? @relation(fields: [specificRoleId, roleId], references: [id, roleId])
 
@@ -172,9 +138,9 @@ model User {
   passwordResetTickets PasswordResetTicket[]
 
   // Company relations (post-signup company onboarding). ownedCompanies is a
-  // one-to-many (a user may own several companies — unlike Customer ownership,
-  // which is one-to-one); managedCompanies is the set they are accounting
-  // manager for; specialistAssignments is their per-company specialist work.
+  // one-to-many — a user may own several companies; managedCompanies is the set
+  // they are accounting manager for; specialistAssignments is their per-company
+  // specialist work.
   ownedCompanies        Company[]                     @relation("CompanyOwner")
   managedCompanies      Company[]                     @relation("CompanyAccountingManager")
   specialistAssignments CompanySpecialistAssignment[] @relation("AssignmentSpecialist")
@@ -189,25 +155,51 @@ model User {
 /// revoked (revokedAt set) on logout or rotation rather than deleted, which
 /// keeps an audit trail of when a session ended.
 ///
-/// FUTURE — rotation + reuse detection: to make each refresh token single-use
-/// and detect theft, add:
-///   familyId     String   // shared by every token descended from one login
-///   replacedById Int?     // the token this one was rotated into (null = current)
-/// On refresh, revoke the presented row and create its successor in the same
-/// family. If a row that is already revoked is presented again, that is a reuse
-/// signal — revoke the entire family (all rows sharing familyId) and force a new
-/// login. Index familyId for the family-wide revoke.
+/// ROTATION + REUSE DETECTION (implemented — see services/refreshTokenService).
+///
+/// Each refresh token is single-use. Presenting one revokes it and mints its
+/// successor in the same `familyId`, with `replacedById` pointing at the
+/// successor. A token that already has a `replacedById` is by definition one
+/// that has been used before — and since the legitimate client discarded it the
+/// moment it was rotated, seeing it again means a copy is in circulation.
+///
+/// The response to that is to revoke the WHOLE family, not just the replayed
+/// row. We cannot tell whether the replay came from the thief or the victim, so
+/// keeping either session alive risks keeping the attacker's. Forcing both to
+/// log in again is the only outcome that is certainly safe.
 model RefreshToken {
   id        Int       @id @default(autoincrement())
   userId    Int       @map("user_id")
   tokenHash String    @unique @map("token_hash") @db.VarChar(255)
   expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
   revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// Shared by every token descended from one login. Indexed, because the
+  /// reuse-detection path revokes by family.
+  familyId String? @map("family_id") @db.Uuid
+
+  /// The token this one was rotated into. NULL means "current".
+  replacedById Int? @map("replaced_by_id")
+
+  /// Why the session ended: 'rotated', 'logout', 'logout_all',
+  /// 'password_reset', 'reuse_detected'. A short machine string, never free text.
+  revokedReason String? @map("revoked_reason") @db.VarChar(50)
+
+  /// Keyed hashes of the issuing context, never the values in the clear.
+  createdIpHash String?   @map("created_ip_hash") @db.VarChar(64)
+  userAgentHash String?   @map("user_agent_hash") @db.VarChar(64)
+  lastUsedAt    DateTime? @map("last_used_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  replacedBy RefreshToken?  @relation("TokenRotation", fields: [replacedById], references: [id], onDelete: SetNull)
+  replaces   RefreshToken[] @relation("TokenRotation")
+
   @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
   @@map("refresh_tokens")
 }
 
@@ -225,7 +217,18 @@ model Invitation {
   roleId         Int              @map("role_id")
   specificRoleId Int?             @map("specific_role_id")
   invitedById    Int              @map("invited_by")
-  token          String           @unique @db.VarChar(255)
+
+  /// SHA-256 of the invitation token. The raw value is emailed to the invitee
+  /// and never persisted — it is a real credential, since holding it completes a
+  /// sign-up as the invited person with that invitation's role and email
+  /// address. It used to be stored in the clear, alone among the secrets in this
+  /// schema.
+  ///
+  /// The consequence to know about: the server cannot reproduce the raw token,
+  /// so "resend" mints a fresh one and supersedes the previous link rather than
+  /// re-sending it.
+  tokenHash      String           @unique @map("token_hash") @db.VarChar(64)
+
   status         InvitationStatus @default(PENDING)
   expiresAt      DateTime         @map("expires_at") @db.Timestamptz(6)
   acceptedUserId Int?             @map("accepted_user_id")
@@ -381,9 +384,10 @@ enum InvitationStatus {
 }
 
 /// A company (tenant) created through the post-signup company onboarding flow.
-/// Distinct from Customer: a single user may own MANY companies, so owner_user_id
-/// is indexed but NOT unique. Address fields never live here — they are held in
-/// the shared `addresses` table and linked through CompanyAddress.
+/// Owned directly by the user who created it: a single user may own MANY
+/// companies, so owner_user_id is indexed but NOT unique. Address fields never
+/// live here — they are held in the shared `addresses` table and linked through
+/// CompanyAddress.
 ///
 /// `status` tracks lifecycle (ONBOARDING -> ACTIVE …); `onboardingCompleted` is
 /// the boolean the client gates on. `deletedAt` is a soft-delete tombstone — every
@@ -426,7 +430,7 @@ model Company {
   deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
 
   // RESTRICT: a user who still owns a company cannot be deleted out from under it.
-  owner             User  @relation("CompanyOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  owner             User      @relation("CompanyOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
   // At most one accounting manager per company (single nullable column). SetNull
   // so removing the manager's user account just clears the link.
   accountingManager User? @relation("CompanyAccountingManager", fields: [accountingManagerUserId], references: [id], onDelete: SetNull)
@@ -695,6 +699,20 @@ model CompanyPayment {
   stripePaymentIntentId String? @unique @map("stripe_payment_intent_id") @db.VarChar(255)
 
   amountPaid    Decimal       @default(0) @map("amount_paid") @db.Decimal(18, 2)
+
+  /// Tracked separately from `amountPaid` rather than by mutating it. The record
+  /// of what was charged must stay true — a receipt that silently rewrites
+  /// itself is not a receipt — and a PARTIAL refund has to be expressible
+  /// without destroying the original figure. A CHECK constraint keeps this at or
+  /// below `amountPaid`, because the refund webhooks can arrive out of order.
+  amountRefunded Decimal   @default(0) @map("amount_refunded") @db.Decimal(18, 2)
+  refundedAt     DateTime? @map("refunded_at") @db.Timestamptz(6)
+
+  /// The Stripe Charge. Refund and dispute events identify the payment by charge
+  /// rather than by invoice, so without this column they could not be matched
+  /// back to a row at all.
+  stripeChargeId String? @map("stripe_charge_id") @db.VarChar(255)
+
   currency      String        @db.Char(3)
   status        PaymentStatus @default(PENDING)
   paidAt        DateTime?     @map("paid_at") @db.Timestamptz(6)
@@ -713,6 +731,7 @@ model CompanyPayment {
   @@index([companySubscriptionId])
   @@index([status])
   @@index([paidAt])
+  @@index([stripeChargeId])
   @@map("company_payments")
 }
 

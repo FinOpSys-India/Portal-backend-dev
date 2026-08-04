@@ -399,21 +399,24 @@ async function listCatalog(client = prisma) {
     const plan = byCode.get(entry.planCode);
     if (!plan) return null;
     return {
-      option_id: optionId,
+      optionId,
       name: plan.planName,
-      unit_amount: money.decimalToMinor(plan.amount, plan.currency),
+      unitAmountMinor: money.decimalToMinor(plan.amount, plan.currency),
       currency: plan.currency.toUpperCase(),
-      billing_interval: plan.billingInterval,
-      display_order: plan.displayOrder ?? 0,
-      ...(plan.quantityEnabled ? { quantity_label: plan.quantityLabel } : {}),
+      billingInterval: plan.billingInterval,
+      displayOrder: plan.displayOrder ?? 0,
+      // `quantityLabel` is the wording the client puts next to a counter, so it
+      // is present only for the lines that are actually billed per unit.
+      quantityEnabled: Boolean(plan.quantityEnabled),
+      ...(plan.quantityEnabled ? { quantityLabel: plan.quantityLabel } : {}),
       ...(config.billing.exposeStripeIds
-        ? { product_id: plan.stripeProductId, price_id: plan.stripePriceId }
+        ? { stripe: { productId: plan.stripeProductId, priceId: plan.stripePriceId } }
         : {}),
       ...extra,
     };
   };
 
-  const byOrder = (a, b) => a.display_order - b.display_order;
+  const byOrder = (a, b) => a.displayOrder - b.displayOrder;
 
   const bookkeeping = Object.entries(catalog.BOOKKEEPING_OPTIONS)
     .map(([id, e]) => view(id, e))
@@ -432,7 +435,7 @@ async function listCatalog(client = prisma) {
         const rendered = view(planId, entry, { component });
         if (rendered) parts[component] = rendered;
       }
-      return Object.keys(parts).length ? { plan_id: planId, components: parts } : null;
+      return Object.keys(parts).length ? { planId, components: parts } : null;
     })
     .filter(Boolean);
 

@@ -6,6 +6,12 @@
  * (soft-delete tombstones, raw FK ids we don't want to expose, etc.) never leak
  * by accident. Every id is serialized as a number, matching the integer surrogate
  * keys used throughout the schema.
+ *
+ * Keys are camelCase, matching every other module. The request side still
+ * accepts snake_case (see middlewares/normalizeRequest), so a client written
+ * against the older snake_case responses keeps working on the way IN — but there
+ * is exactly one shape on the way OUT, which is what lets a client model the API
+ * once instead of once per router.
  */
 
 /** A Prisma Decimal (or string/number) rendered as a fixed-2 decimal string. */
@@ -24,29 +30,30 @@ function iso(value) {
 function toPerson(user) {
   if (!user) return null;
   return {
-    user_id: user.id,
-    first_name: user.firstName,
-    last_name: user.lastName,
+    userId: user.id,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    email: user.email ?? null,
   };
 }
 
-/** The company object returned by onboarding and manager assignment. */
+/** The company object returned by onboarding, updates, and manager assignment. */
 function toCompany(company) {
   return {
     id: company.id,
-    company_name: company.companyName,
-    company_type: company.companyType,
-    company_email: company.companyEmail,
-    company_phone: company.companyPhone,
-    employee_count: company.employeeCount,
-    last_year_revenue: decimalString(company.lastYearRevenue),
-    revenue_currency: company.revenueCurrency,
-    owner_user_id: company.ownerUserId,
-    accounting_manager_user_id: company.accountingManagerUserId ?? null,
+    companyName: company.companyName,
+    companyType: company.companyType,
+    companyEmail: company.companyEmail,
+    companyPhone: company.companyPhone,
+    employeeCount: company.employeeCount,
+    lastYearRevenue: decimalString(company.lastYearRevenue),
+    revenueCurrency: company.revenueCurrency,
+    ownerUserId: company.ownerUserId,
+    accountingManagerUserId: company.accountingManagerUserId ?? null,
     status: company.status,
-    onboarding_completed: company.onboardingCompleted,
-    created_at: iso(company.createdAt),
-    updated_at: iso(company.updatedAt),
+    onboardingCompleted: company.onboardingCompleted,
+    createdAt: iso(company.createdAt),
+    updatedAt: iso(company.updatedAt),
   };
 }
 
@@ -55,13 +62,13 @@ function toAddress(address) {
   if (!address) return null;
   return {
     id: address.id,
-    address_line_1: address.line1,
-    address_line_2: address.line2 ?? null,
+    addressLine1: address.line1,
+    addressLine2: address.line2 ?? null,
     city: address.city,
     state: address.state ?? null,
-    postal_code: address.postalCode ?? null,
+    postalCode: address.postalCode ?? null,
     country: address.country,
-    country_code: address.countryCode ?? null,
+    countryCode: address.countryCode ?? null,
   };
 }
 
@@ -69,59 +76,102 @@ function toAddress(address) {
 function toCompanyOnboardingResponse({ company, address }) {
   return {
     company: toCompany(company),
-    primary_address: toAddress(address),
+    primaryAddress: toAddress(address),
   };
 }
 
-/** One specialist-assignment row (used by GET /specialists and POST result). */
+/**
+ * A company with its primary address and the caller's relationship to it, used
+ * by the detail and list endpoints. `accessRole` tells the frontend which
+ * actions to render without it having to re-derive the authorization rules —
+ * the server already knows the answer, and duplicating that logic in the client
+ * is how the two drift apart.
+ */
+function toCompanyDetail({ company, address, accessRole }) {
+  return {
+    ...toCompany(company),
+    primaryAddress: toAddress(address),
+    owner: toPerson(company.owner),
+    accountingManager: toPerson(company.accountingManager),
+    ...(accessRole ? { accessRole } : {}),
+  };
+}
+
+/** One specialist-assignment row (used by GET /specialists and the POST result). */
 function toAssignment(assignment) {
   return {
-    assignment_id: assignment.id,
-    company_id: assignment.companyId,
-    specialist_user_id: assignment.specialistUserId,
-    specialization_code: assignment.specialization?.specializationCode ?? null,
-    specialization_name: assignment.specialization?.specializationName ?? null,
-    assignment_status: assignment.assignmentStatus,
-    assigned_at: iso(assignment.assignedAt),
-    unassigned_at: iso(assignment.unassignedAt),
-    specialist: assignment.specialist ? toPerson(assignment.specialist) : undefined,
+    assignmentId: assignment.id,
+    companyId: assignment.companyId,
+    specialistUserId: assignment.specialistUserId,
+    specializationCode: assignment.specialization?.specializationCode ?? null,
+    specializationName: assignment.specialization?.specializationName ?? null,
+    assignmentStatus: assignment.assignmentStatus,
+    assignedAt: iso(assignment.assignedAt),
+    unassignedAt: iso(assignment.unassignedAt),
+    // Always present as a key — null rather than absent when the join was not
+    // loaded, so a client can read `assignment.specialist?.userId` uniformly
+    // instead of discovering that one endpoint omits the field entirely.
+    specialist: toPerson(assignment.specialist),
   };
 }
 
 /**
  * The team payload:
- *   { company_id, owner, accounting_manager, specialists: [{ ..., specializations: [codes] }] }
- * `assignments` is the list of ACTIVE assignments (with specialist + specialization
- * included); this collapses them to one entry per specialist with a code array.
+ *   { companyId, owner, accountingManager, specialists: [{ ..., specializations }] }
+ *
+ * `assignments` is the list of ACTIVE assignments (with specialist +
+ * specialization included); this collapses them to one entry per specialist.
+ * Each specialization keeps its own `assignmentId`, so a "remove" button
+ * rendered from this payload has the id it needs — previously it did not, and
+ * the client had to call the specialists endpoint as well.
  */
 function toTeam({ company, assignments }) {
   const bySpecialist = new Map();
   for (const a of assignments) {
     const key = a.specialistUserId;
     if (!bySpecialist.has(key)) {
-      bySpecialist.set(key, {
-        ...toPerson(a.specialist),
-        specializations: [],
-      });
+      bySpecialist.set(key, { ...toPerson(a.specialist), specializations: [] });
     }
     const code = a.specialization?.specializationCode;
+    if (!code) continue;
     const entry = bySpecialist.get(key);
-    if (code && !entry.specializations.includes(code)) entry.specializations.push(code);
+    if (entry.specializations.some((s) => s.specializationCode === code)) continue;
+    entry.specializations.push({
+      assignmentId: a.id,
+      specializationCode: code,
+      specializationName: a.specialization?.specializationName ?? null,
+    });
   }
 
   return {
-    company_id: company.id,
+    companyId: company.id,
     owner: toPerson(company.owner),
-    accounting_manager: toPerson(company.accountingManager),
+    accountingManager: toPerson(company.accountingManager),
     specialists: [...bySpecialist.values()],
+  };
+}
+
+/** A user as returned by the directory endpoint. Never includes a password hash. */
+function toDirectoryUser(user) {
+  return {
+    userId: user.id,
+    email: user.email,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    role: user.role?.code ?? null,
+    specificRole: user.specificRole?.code ?? null,
+    jobTitle: user.jobTitle ?? null,
+    status: user.status,
   };
 }
 
 module.exports = {
   toCompany,
+  toCompanyDetail,
   toAddress,
   toCompanyOnboardingResponse,
   toAssignment,
   toTeam,
   toPerson,
+  toDirectoryUser,
 };

@@ -549,7 +549,7 @@ async function completePasswordReset({ resetToken, password, context = {} }) {
     // a refresh token issued under it must sign in again.
     const revoked = await tx.refreshToken.updateMany({
       where: { userId: ticket.userId, revokedAt: null },
-      data: { revokedAt: now },
+      data: { revokedAt: now, revokedReason: 'password_reset' },
     });
 
     // Kill any login challenge that was open mid-flight. Its OTP was issued

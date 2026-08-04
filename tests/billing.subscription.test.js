@@ -176,18 +176,19 @@ describe('GET /billing/subscription', () => {
       .set('Authorization', auth());
 
     expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({
-      subscription_id: SUB_ID,
-      company_id: COMPANY_ID,
+    expect(res.body.data.hasSubscription).toBe(true);
+    expect(res.body.data.subscription).toMatchObject({
+      subscriptionId: SUB_ID,
+      companyId: COMPANY_ID,
       status: 'ACTIVE',
-      cancel_at_period_end: false,
+      cancelAtPeriodEnd: false,
       currency: 'USD',
-      current_period_end: '2026-08-01T00:00:00.000Z',
+      currentPeriodEnd: '2026-08-01T00:00:00.000Z',
     });
 
     // 2900 + (12 x 1500) + (4 x 1000) + 24900 = 49800
-    expect(res.body.data.recurring_total_amount).toBe(49800);
-    expect(res.body.data.lines).toHaveLength(4);
+    expect(res.body.data.subscription.recurringTotalAmountMinor).toBe(49800);
+    expect(res.body.data.subscription.lines).toHaveLength(4);
   });
 
   it('prices lines from what was captured at purchase, not the live catalog', async () => {
@@ -212,8 +213,8 @@ describe('GET /billing/subscription', () => {
       .get(`/api/billing/subscription?company_id=${COMPANY_ID}`)
       .set('Authorization', auth());
 
-    expect(res.body.data.lines[0].unit_amount).toBe(19900);
-    expect(res.body.data.recurring_total_amount).toBe(19900);
+    expect(res.body.data.subscription.lines[0].unitAmountMinor).toBe(19900);
+    expect(res.body.data.subscription.recurringTotalAmountMinor).toBe(19900);
     expect(mockPrisma.servicePlan.findMany).not.toHaveBeenCalled();
   });
 
@@ -224,19 +225,28 @@ describe('GET /billing/subscription', () => {
       .get(`/api/billing/subscription?company_id=${COMPANY_ID}`)
       .set('Authorization', auth());
 
-    expect(res.body.data.lines.map((l) => l.option_id)).not.toContain(null);
-    expect(res.body.data.lines).toHaveLength(3);
+    expect(res.body.data.subscription.lines.map((l) => l.optionId)).not.toContain(null);
+    expect(res.body.data.subscription.lines).toHaveLength(3);
   });
 
-  it('404s when the company has never subscribed', async () => {
+  it('answers 200 with hasSubscription=false when the company has never subscribed', async () => {
     stubSubscription(null);
 
     const res = await request(app)
       .get(`/api/billing/subscription?company_id=${COMPANY_ID}`)
       .set('Authorization', auth());
 
-    expect(res.status).toBe(404);
-    expect(res.body.error.code).toBe('SUBSCRIPTION_NOT_FOUND');
+    /*
+     * Not a 404. Having no subscription is the normal state of every company
+     * between onboarding and its first checkout — and the adjacent payments
+     * endpoint already answered 200 with an empty list for exactly the same
+     * situation, so the billing screen needed two different empty-state paths
+     * for one condition.
+     */
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.hasSubscription).toBe(false);
+    expect(res.body.data.subscription).toBeNull();
   });
 
   it('requires company_id', async () => {
@@ -348,7 +358,10 @@ describe('PATCH /billing/subscription/payroll', () => {
       .send({ company_id: COMPANY_ID, contractor_count: 3, price_id: 'price_one_cent' });
 
     expect(res.status).toBe(400);
-    expect(res.body.error.details.unknown).toContain('price_id');
+    // Reported under the canonical camelCase name. The request said `price_id`;
+    // normalizeRequest reconciles the two spellings before validation, so the
+    // error names one field rather than depending on how the caller spelled it.
+    expect(res.body.error.details.unknown).toContain('priceId');
     expect(mockStripe.subscriptionItems.create).not.toHaveBeenCalled();
   });
 
@@ -570,17 +583,27 @@ describe('GET /billing/payments', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data.payments[0]).toMatchObject({
-      payment_id: 3,
-      amount_paid: 49800,
+      paymentId: 3,
+      // The unit is now part of the field name. A bare `amount_paid: 49800` is
+      // exactly the shape of value that gets rendered as "$49,800".
+      amountPaidMinor: 49800,
+      amountRefundedMinor: 0,
       currency: 'USD',
       status: 'PAID',
-      paid_at: '2026-07-01T00:00:00.000Z',
+      paidAt: '2026-07-01T00:00:00.000Z',
     });
-    expect(res.body.data.payments[1]).toMatchObject({ status: 'FAILED', failure_reason: 'card_declined' });
-    expect(res.body.data.pagination).toEqual({ total: 2, limit: 25, offset: 0, has_more: false });
+    expect(res.body.data.payments[1]).toMatchObject({ status: 'FAILED', failureReason: 'card_declined' });
+    expect(res.body.data.pagination).toEqual({
+      total: 2,
+      limit: 25,
+      offset: 0,
+      hasMore: false,
+      sort: 'paidAt',
+      order: 'desc',
+    });
   });
 
-  it('paginates and reports has_more', async () => {
+  it('paginates and reports hasMore', async () => {
     mockPrisma.companyPayment.findMany.mockResolvedValue([PAYMENTS[0]]);
     mockPrisma.companyPayment.count.mockResolvedValue(10);
 
@@ -591,7 +614,35 @@ describe('GET /billing/payments', () => {
     expect(mockPrisma.companyPayment.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ take: 1, skip: 0 })
     );
-    expect(res.body.data.pagination).toEqual({ total: 10, limit: 1, offset: 0, has_more: true });
+    expect(res.body.data.pagination).toEqual({
+      total: 10,
+      limit: 1,
+      offset: 0,
+      hasMore: true,
+      sort: 'paidAt',
+      order: 'desc',
+    });
+  });
+
+  it('sorts by an allowlisted column and rejects anything else', async () => {
+    mockPrisma.companyPayment.findMany.mockResolvedValue(PAYMENTS);
+    mockPrisma.companyPayment.count.mockResolvedValue(2);
+
+    await request(app)
+      .get(`/api/billing/payments?company_id=${COMPANY_ID}&sort=amountPaid&order=asc`)
+      .set('Authorization', auth());
+
+    expect(mockPrisma.companyPayment.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ orderBy: [{ amountPaid: 'asc' }, { createdAt: 'desc' }] })
+    );
+
+    // The sort key is an allowlist, never a raw value forwarded to ORDER BY.
+    const bad = await request(app)
+      .get(`/api/billing/payments?company_id=${COMPANY_ID}&sort=passwordHash`)
+      .set('Authorization', auth());
+
+    expect(bad.status).toBe(400);
+    expect(bad.body.error.fields.sort).toMatch(/Sort by one of/);
   });
 
   it('clamps an oversized page request', async () => {
@@ -641,8 +692,10 @@ describe('GET /billing/payments', () => {
       .get(`/api/billing/payments?company_id=${COMPANY_ID}`)
       .set('Authorization', auth());
 
-    expect(res.body.data.payments[0]).not.toHaveProperty('stripe_invoice_id');
-    expect(res.body.data.payments[0].amount_paid).toBe(49800);
+    // Stripe ids are grouped under one `stripe` key that is present in full or
+    // absent in full, rather than sprinkled as siblings that vanish one by one.
+    expect(res.body.data.payments[0]).not.toHaveProperty('stripe');
+    expect(res.body.data.payments[0].amountPaidMinor).toBe(49800);
   });
 });
 
@@ -666,7 +719,11 @@ describe('POST /billing/portal', () => {
       customer: 'cus_existing',
       return_url: config.billing.portalReturnUrl,
     });
-    expect(res.body.data.portal_url).toBe('https://billing.stripe.com/p/session/test_123');
+    expect(res.body.data.portalUrl).toBe('https://billing.stripe.com/p/session/test_123');
+    expect(res.body.data.companyId).toBe(COMPANY_ID);
+    // This endpoint was the last one still answering in snake_case; every
+    // response in the API is camelCase.
+    expect(res.body.data).not.toHaveProperty('portal_url');
   });
 
   it('refuses when the company has no Stripe customer yet', async () => {

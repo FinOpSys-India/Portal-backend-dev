@@ -11,6 +11,7 @@ const {
   getCheckoutStatus,
   getSubscription,
   listPayments,
+  addServices,
   updatePayroll,
   cancelSubscription,
   createPortalSession,
@@ -46,15 +47,27 @@ router.use(requireAuth);
 
 const canBill = requireRole('OWNER', 'ADMIN');
 
-// Reads. Cheap, safe to poll, and the service still proves company access.
+/*
+ * Reads. Cheap, safe to poll, and the service still proves company access.
+ *
+ * `/plans` is authenticated like everything else here, but unlike the rest it is
+ * NOT company-scoped: it publishes the catalog by our own option ids, so any
+ * signed-in user can read it. Everything below it carries real customer data —
+ * what a company subscribed to, what it was charged, what failed — and
+ * billingAccess proves the caller owns that company (or is an admin) on each.
+ */
 router.get('/plans', listPlans);
 router.get('/checkout-status', getCheckoutStatus);
 router.get('/subscription', getSubscription);
 router.get('/payments', listPayments);
 
 // Writes. Each costs Stripe API calls and changes what the customer is charged,
-// so all four carry the rate limiter and the coarse role gate.
+// so all five carry the rate limiter and the coarse role gate.
 router.post('/checkout', billingLimiter, canBill, createCheckout);
+// Adding a service to a LIVE subscription. Registered before the payroll route
+// only for readability; Express matches on the full path, so order is not
+// load-bearing between these two.
+router.post('/subscription/services', billingLimiter, canBill, addServices);
 router.patch('/subscription/payroll', billingLimiter, canBill, updatePayroll);
 router.delete('/subscription', billingLimiter, canBill, cancelSubscription);
 router.post('/portal', billingLimiter, canBill, createPortalSession);

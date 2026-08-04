@@ -3,6 +3,7 @@
 const { prisma } = require('../config/prisma');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
+const { signAccessToken } = require('../utils/tokens');
 
 /**
  * Post-signup onboarding.
@@ -35,17 +36,18 @@ const STATUS_SELECT = {
   status: true,
   role: { select: { code: true } },
   specificRole: { select: { code: true } },
-  ownedCustomer: { select: { id: true, name: true, createdAt: true } },
 };
 
 /**
- * Shape a fetched user (with role, specificRole, ownedCustomer) into the
- * onboarding status returned to the frontend. `onboarding.complete` is the one
- * flag the client can gate the app on; the sub-flags let it drive which step to
- * show.
+ * Shape a fetched user (with role and specificRole) into the onboarding status
+ * returned to the frontend. `onboarding.complete` is the one flag the client can
+ * gate the app on; the sub-flags let it drive which step to show.
  */
 function buildStatus(user) {
-  const accountProvisioned = Boolean(user.ownedCustomer);
+  // Provisioned == holds the owner role pair. There is no separate account row
+  // to look for: a company is owned by its user directly.
+  const accountProvisioned =
+    user.role?.code === OWNER_ROLE_CODE && user.specificRole?.code === OWNER_SPECIFIC_ROLE_CODE;
   const profileComplete = Boolean(user.firstName && user.lastName && user.phone && user.jobTitle);
   return {
     user: {
@@ -59,9 +61,6 @@ function buildStatus(user) {
       specificRole: user.specificRole?.code ?? null,
       status: user.status,
     },
-    customer: user.ownedCustomer
-      ? { id: user.ownedCustomer.id, name: user.ownedCustomer.name }
-      : null,
     onboarding: {
       accountProvisioned,
       profileComplete,
@@ -103,19 +102,6 @@ async function resolveOwnerRole() {
 }
 
 /**
- * Pick a display name for the new customer account. A client-supplied company
- * name wins; otherwise fall back to the user's name, then the email local part,
- * so the account always has a sensible label even before the profile form.
- */
-function deriveCustomerName({ companyName, user, email }) {
-  if (companyName) return companyName.slice(0, 255);
-  const fullName = [user.firstName, user.lastName].filter(Boolean).join(' ').trim();
-  if (fullName) return `${fullName}'s Account`.slice(0, 255);
-  const local = String(email || '').split('@')[0] || 'New';
-  return `${local}'s Account`.slice(0, 255);
-}
-
-/**
  * Return the caller's current onboarding status. Read-only.
  *
  * @param {number} userId  From the verified access token.
@@ -127,68 +113,73 @@ async function getStatus(userId) {
 }
 
 /**
- * Provision the authenticated user as the OWNER of a new customer account
- * (onboarding steps 2–6):
- *   - assign the default role (CUSTOMER / OWNER),
- *   - create the customer account,
- *   - link the user as its owner and member.
+ * Provision the authenticated user as an OWNER: assign the default role pair
+ * (CUSTOMER / OWNER), which is what gates POST /onboarding/company.
  *
- * All three writes run in one transaction so the user is never left half
- * provisioned. Idempotent: a user who already owns a customer gets their current
- * status back unchanged (created: false), and the unique constraint on
- * owner_user_id is the hard guard against two concurrent provisions both
- * creating an account.
+ * There is no separate account row to create — a company belongs directly to the
+ * user who owns it — so this is now a single role write. Idempotent: a user who
+ * already holds the owner pair gets their current status back unchanged
+ * (created: false).
  *
- * @param {{ userId: number, email: string|null, companyName: string|null }} params
- * @returns {Promise<{ status: object, created: boolean }>}
+ * @param {{ userId: number }} params
+ * @returns {Promise<{ status: object, created: boolean, accessToken: string|null }>}
  */
-async function provision({ userId, email, companyName }) {
+async function provision({ userId }) {
   const existing = await prisma.user.findUnique({ where: { id: userId }, select: STATUS_SELECT });
   if (!existing) throw userNotFound();
 
-  if (existing.ownedCustomer) {
-    logger.info(
-      `Onboarding: user ${userId} already provisioned (customer ${existing.ownedCustomer.id}); returning status.`
-    );
-    return { status: buildStatus(existing), created: false };
+  // What the caller's token currently claims, so we can tell below whether this
+  // call actually changed their role and a replacement token is warranted.
+  const previousRole = existing.role?.code ?? null;
+  const previousSpecificRole = existing.specificRole?.code ?? null;
+
+  if (previousRole === OWNER_ROLE_CODE && previousSpecificRole === OWNER_SPECIFIC_ROLE_CODE) {
+    logger.info(`Onboarding: user ${userId} already holds the owner role; returning status.`);
+    return { status: buildStatus(existing), created: false, accessToken: null };
   }
 
   const { roleId, specificRoleId } = await resolveOwnerRole();
-  const customerName = deriveCustomerName({ companyName, user: existing, email });
 
   try {
-    const status = await prisma.$transaction(async (tx) => {
-      // Step 3: assign the default OWNER role.
-      await tx.user.update({ where: { id: userId }, data: { roleId, specificRoleId } });
-
-      // Step 4 + 5: create the customer account owned by this user...
-      const customer = await tx.customer.create({
-        data: { name: customerName, ownerUserId: userId },
-        select: { id: true },
-      });
-
-      // ...and make the user a member of it (the owner is also a member).
-      const user = await tx.user.update({
-        where: { id: userId },
-        data: { customerId: customer.id },
-        select: STATUS_SELECT,
-      });
-
-      return buildStatus(user);
+    const user = await prisma.user.update({
+      where: { id: userId },
+      data: { roleId, specificRoleId },
+      select: STATUS_SELECT,
     });
+    const status = buildStatus(user);
 
-    logger.info(`Onboarding: provisioned user ${userId} as OWNER of customer "${customerName}".`);
-    return { status, created: true };
+    logger.info(`Onboarding: provisioned user ${userId} as OWNER.`);
+
+    /*
+     * Hand back a REPLACEMENT access token whenever this call changed the role.
+     *
+     * The caller's existing token was signed before the promotion, so it still
+     * claims their pre-onboarding role. The very next step of the flow —
+     * POST /onboarding/company — is gated on the OWNER claim, so without this the
+     * user was told they had been made an owner and then refused for not being
+     * one. (requireRole now also re-checks the database, so the old token would
+     * no longer be turned away; this simply means the client stops carrying a
+     * token it knows to be wrong.)
+     */
+    const roleChanged =
+      status.user.role !== previousRole || status.user.specificRole !== previousSpecificRole;
+
+    return {
+      status,
+      created: true,
+      accessToken: roleChanged
+        ? signAccessToken({
+            userId,
+            email: status.user.email,
+            role: status.user.role,
+            specificRole: status.user.specificRole,
+          })
+        : null,
+    };
   } catch (err) {
-    // A racing second provision loses the unique(owner_user_id) race with P2002.
-    // Re-read and hand back the winner's result rather than surfacing an error.
-    if (err.code === 'P2002') {
-      const after = await prisma.user.findUnique({ where: { id: userId }, select: STATUS_SELECT });
-      if (after?.ownedCustomer) {
-        logger.info(`Onboarding: concurrent provision for user ${userId} resolved to existing customer.`);
-        return { status: buildStatus(after), created: false };
-      }
-    }
+    // update on a missing row throws P2025 — the token's subject is gone. A
+    // concurrent second provision is harmless now: both write the same role pair.
+    if (err.code === 'P2025') throw userNotFound();
     throw err;
   }
 }

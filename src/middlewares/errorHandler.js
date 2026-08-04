@@ -16,6 +16,41 @@ const PRISMA_ERROR_MAP = {
   P2025: { status: 404, code: 'NOT_FOUND', message: () => 'Record not found.' },
 };
 
+/*
+ * Errors raised by body-parser (express.json / express.urlencoded) before any
+ * route runs. Without these they fell through to the generic branch below and
+ * were reported as 500 INTERNAL_ERROR — so malformed JSON, which is squarely a
+ * client mistake, read to the client as "the server is broken" and to us as a
+ * server fault worth paging about.
+ */
+const BODY_PARSER_ERROR_MAP = {
+  'entity.parse.failed': {
+    status: 400,
+    code: 'MALFORMED_JSON',
+    message: 'The request body is not valid JSON.',
+  },
+  'entity.too.large': {
+    status: 413,
+    code: 'PAYLOAD_TOO_LARGE',
+    message: 'The request body is too large.',
+  },
+  'request.aborted': {
+    status: 400,
+    code: 'REQUEST_ABORTED',
+    message: 'The request was aborted before it completed.',
+  },
+  'encoding.unsupported': {
+    status: 415,
+    code: 'UNSUPPORTED_ENCODING',
+    message: 'The request content encoding is not supported.',
+  },
+  'entity.verify.failed': {
+    status: 400,
+    code: 'MALFORMED_JSON',
+    message: 'The request body could not be verified.',
+  },
+};
+
 // P2002/P2003 name the column(s) in meta.target; P2000 uses meta.column_name.
 function fieldList(err) {
   const target = err?.meta?.target ?? err?.meta?.column_name;
@@ -38,7 +73,17 @@ function translate(err) {
   if (err.name === 'PrismaClientValidationError') {
     return { statusCode: 400, code: 'VALIDATION_ERROR', message: 'Invalid request data.' };
   }
-  const statusCode = err.statusCode || 500;
+  if (err.type && BODY_PARSER_ERROR_MAP[err.type]) {
+    const mapped = BODY_PARSER_ERROR_MAP[err.type];
+    return { statusCode: mapped.status, code: mapped.code, message: mapped.message };
+  }
+  // Some body-parser versions surface a bare SyntaxError with a `body` property
+  // rather than a typed error.
+  if (err instanceof SyntaxError && 'body' in err) {
+    return { statusCode: 400, code: 'MALFORMED_JSON', message: 'The request body is not valid JSON.' };
+  }
+
+  const statusCode = err.statusCode || err.status || 500;
   return {
     statusCode,
     code: err.code || (statusCode >= 500 ? 'INTERNAL_ERROR' : 'ERROR'),
@@ -53,7 +98,7 @@ function translate(err) {
  * Central error handler. Must be registered last, after all routes.
  * Emits one consistent JSON shape:
  *   { success: false, error: { code, message, requestId, fields?, details? } }
- * and hides server-error internals in production.
+ * and hides server-error internals outside development.
  */
 // eslint-disable-next-line no-unused-vars
 module.exports = function errorHandler(err, req, res, next) {
@@ -71,10 +116,17 @@ module.exports = function errorHandler(err, req, res, next) {
   }
 
   // Never surface a raw server-error message (which may carry a stack, a SQL
-  // string, or a file path) in production — send a fixed line instead.
+  // string, or a file path) outside development — send a fixed line instead.
   const safeMessage =
-    isServerError && config.isProduction ? 'An unexpected error occurred.' : message;
+    isServerError && !config.exposeErrorDetails ? 'An unexpected error occurred.' : message;
 
+  /*
+   * The stack is gated on an EXPLICIT opt-in, not on `NODE_ENV !== 'production'`.
+   * The old test was true whenever NODE_ENV was simply unset — which it was in
+   * every deployment that had not thought to set it — so staging servers were
+   * returning file paths and internal call frames to any client that could
+   * trigger a 500. An absent variable should not be what decides this.
+   */
   res.status(statusCode).json({
     success: false,
     error: {
@@ -83,7 +135,7 @@ module.exports = function errorHandler(err, req, res, next) {
       requestId: req.id,
       ...(fields ? { fields } : {}),
       ...(details ? { details } : {}),
-      ...(config.isProduction ? {} : { stack: err.stack }),
+      ...(config.exposeErrorDetails && err.stack ? { stack: err.stack } : {}),
     },
   });
 };

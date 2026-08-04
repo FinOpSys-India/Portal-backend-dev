@@ -2,9 +2,17 @@
 node_modules/
 
 # Environment
+#
+# Every .env variant is ignored, EXCEPT .env.example, which is the committed
+# template and must therefore contain placeholders only — never a real key.
+#
+# .env.example used to be listed here as if that protected it. It did not: git
+# had already begun tracking the file, and .gitignore has no effect on a file
+# already in the index. It went on being committed — with a live SMTP password
+# and Stripe keys in it — while appearing to be ignored.
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Logs
 logs/

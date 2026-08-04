@@ -7,7 +7,7 @@ const config = require('../config');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { hashPassword, verifyPassword, verifyPasswordDummy } = require('../utils/password');
-const { signAccessToken, generateRefreshToken } = require('../utils/tokens');
+const { signAccessToken, generateRefreshToken, hashInvitationToken } = require('../utils/tokens');
 const {
   generateOtp,
   digestOtp,
@@ -87,8 +87,9 @@ function assertInvitationUsable(invitation, requestEmail) {
  *             refreshTokenExpiresAt: Date }}
  */
 async function signup({ invitationToken, email, firstName, lastName, password }) {
+  // Looked up by digest: the raw token exists only in the invitee's email.
   const invitation = await prisma.invitation.findUnique({
-    where: { token: invitationToken },
+    where: { tokenHash: hashInvitationToken(invitationToken) },
     select: {
       id: true,
       email: true,
@@ -160,6 +161,7 @@ async function signup({ invitationToken, email, firstName, lastName, password })
         userId: created.id,
         tokenHash: refresh.tokenHash,
         expiresAt: refresh.expiresAt,
+        familyId: refresh.familyId,
       },
     });
 
@@ -178,6 +180,9 @@ async function signup({ invitationToken, email, firstName, lastName, password })
   return {
     user,
     accessToken,
+    // Reported so the client never has to parse a duration string, and never has
+    // to guess. Derived from the very TTL the token was signed with.
+    expiresInSeconds: config.auth.accessTokenTtlSeconds,
     refreshToken: refresh.rawToken,
     refreshTokenExpiresAt: refresh.expiresAt,
   };
@@ -359,6 +364,8 @@ const CHALLENGE_VERIFY_FIELDS = {
     select: {
       id: true,
       email: true,
+      firstName: true,
+      lastName: true,
       status: true,
       role: { select: { code: true } },
       specificRole: { select: { code: true } },
@@ -473,12 +480,16 @@ async function verifyOtpChallenge({ challengeId, otp, context = {} }) {
     });
 
     // Only now — after OTP success — are tokens issued and a session created.
+    // A fresh family: this is a new login, not a rotation of an existing one.
     const refresh = generateRefreshToken();
     await tx.refreshToken.create({
       data: {
         userId: challenge.userId,
         tokenHash: refresh.tokenHash,
         expiresAt: refresh.expiresAt,
+        familyId: refresh.familyId,
+        createdIpHash: hashContext(context.ip),
+        userAgentHash: hashContext(context.userAgent),
       },
     });
 
@@ -492,10 +503,21 @@ async function verifyOtpChallenge({ challengeId, otp, context = {} }) {
     logger.info(`Login completed for user ${challenge.userId} via challenge ${challengeId}.`);
 
     return {
+      /*
+       * The full public view, not the three fields this used to return. A client
+       * that had just logged in got `{ id, email, role }` and had to make a
+       * second call to /onboarding to learn the user's name or whether they were
+       * an OWNER — and `role` alone is the wrong thing to gate ownership on,
+       * which made that second call easy to forget and easy to get wrong.
+       */
       user: {
         id: challenge.user.id,
         email: challenge.user.email,
-        role: challenge.user.role.code,
+        firstName: challenge.user.firstName,
+        lastName: challenge.user.lastName,
+        role: challenge.user.role?.code ?? null,
+        specificRole: challenge.user.specificRole?.code ?? null,
+        status: challenge.user.status,
       },
       accessToken,
       expiresInSeconds: config.auth.accessTokenTtlSeconds,

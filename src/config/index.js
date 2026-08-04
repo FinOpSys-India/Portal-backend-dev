@@ -28,7 +28,14 @@ function durationToSeconds(value) {
  * ACCESS_TOKEN_TTL falls back to the default for both forms — never a string
  * jsonwebtoken would reject at signing time.
  */
-const DEFAULT_ACCESS_TOKEN_TTL = '615m';
+/*
+ * 15 minutes. The previous default was '615m' — over ten hours — which was not a
+ * short-lived token by any reading, and left a leaked one useful for most of a
+ * working day. It was only survivable because there was no refresh endpoint;
+ * now that /auth/refresh exists, the access token can be as short as it should
+ * always have been and the refresh token carries the session.
+ */
+const DEFAULT_ACCESS_TOKEN_TTL = '15m';
 
 function resolveAccessTokenTtl(raw) {
   const ttl = String(raw ?? '').trim() || DEFAULT_ACCESS_TOKEN_TTL;
@@ -58,6 +65,31 @@ const config = {
    * limit entirely.
    */
   trustProxy: process.env.TRUST_PROXY || '',
+  /*
+   * Transport and browser hardening. These used to be a "FUTURE" comment in
+   * app.js; they are now enforced, with the knobs here so a deployment can tune
+   * them without editing middleware.
+   */
+  security: {
+    // Maximum JSON / urlencoded body. Previously left at body-parser's implicit
+    // 100kb default, which meant the limit was real but undocumented and its
+    // breach surfaced as an unhandled 500.
+    bodyLimit: process.env.BODY_LIMIT || '100kb',
+    /*
+     * CSRF protection for cookie-authenticated, state-changing requests. On by
+     * default: the refresh cookie is a real credential, and SameSite=Lax alone
+     * is a partial mitigation rather than a defence.
+     */
+    csrfEnabled: process.env.CSRF_ENABLED ? process.env.CSRF_ENABLED === 'true' : true,
+    csrfCookieName: process.env.CSRF_COOKIE_NAME || 'csrfToken',
+    csrfHeaderName: (process.env.CSRF_HEADER_NAME || 'x-csrf-token').toLowerCase(),
+    // Redirect plain HTTP to HTTPS and send HSTS. Off outside production so
+    // local development over http keeps working.
+    forceHttps: process.env.FORCE_HTTPS
+      ? process.env.FORCE_HTTPS === 'true'
+      : process.env.NODE_ENV === 'production',
+    hstsMaxAgeSeconds: parseInt(process.env.HSTS_MAX_AGE_SECONDS, 10) || 15552000,
+  },
   auth: {
     /*
      * Secret used to sign access-token JWTs. There is deliberately no default:
@@ -67,12 +99,19 @@ const config = {
      * silent security hole.
      */
     jwtSecret: process.env.JWT_SECRET || '',
-    // Access tokens are short-lived so a leaked one is only briefly useful;
-    // the refresh token (revocable, stored hashed) carries the long session.
-    accessTokenTtl: process.env.ACCESS_TOKEN_TTL || '615m',
-    // Same TTL expressed in seconds, so the API can return `expiresInSeconds`
-    // without the client having to parse a duration string.
-    accessTokenTtlSeconds: durationToSeconds(process.env.ACCESS_TOKEN_TTL, 900),
+    /*
+     * Access tokens are short-lived so a leaked one is only briefly useful; the
+     * refresh token (revocable, stored hashed, rotated on every use) carries the
+     * long session.
+     *
+     * Both forms come from the SAME resolution, so the token's real lifetime and
+     * the `expiresInSeconds` reported to the client cannot drift. They used to:
+     * `accessTokenTtlSeconds` called durationToSeconds with a second argument the
+     * function does not accept, so an unset ACCESS_TOKEN_TTL produced `null` —
+     * and every client computing an expiry from it got NaN.
+     */
+    accessTokenTtl: accessTokenTtl.ttl,
+    accessTokenTtlSeconds: accessTokenTtl.seconds,
     refreshTokenTtlDays: parseInt(process.env.REFRESH_TOKEN_TTL_DAYS, 10) || 30,
     // bcrypt work factor. 12 is a sensible 2020s default; raise as hardware
     // improves. Higher is slower to both hash and brute-force.
@@ -216,6 +255,21 @@ const config = {
 
 config.isProduction = config.env === 'production';
 config.isDevelopment = config.env === 'development';
+
+/*
+ * Whether error responses may carry a stack trace and the raw message of a
+ * server error.
+ *
+ * Gated on an explicit opt-in rather than on `NODE_ENV !== 'production'`. That
+ * older test was true whenever NODE_ENV was merely unset — which it is by
+ * default — so any deployment that had not thought to set it was returning file
+ * paths and internal call frames to clients. An absent environment variable
+ * should never be the thing that decides to disclose internals; say so on
+ * purpose, or get the safe behaviour.
+ */
+config.exposeErrorDetails = process.env.DEBUG_ERRORS
+  ? process.env.DEBUG_ERRORS === 'true'
+  : config.env === 'development' || config.env === 'test';
 
 /*
  * Fail fast on a missing JWT secret in production: without it the auth routes

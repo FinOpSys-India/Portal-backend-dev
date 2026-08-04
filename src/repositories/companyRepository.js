@@ -74,12 +74,107 @@ function findCompanyByEmail(client, email) {
   });
 }
 
+/** A company with owner, manager, and its primary address joined. */
+function findCompanyDetail(client, companyId) {
+  return client.company.findFirst({
+    where: { id: companyId, deletedAt: null },
+    include: {
+      ...COMPANY_WITH_PEOPLE,
+      addresses: {
+        where: { isPrimary: true },
+        include: { address: true },
+        take: 1,
+      },
+    },
+  });
+}
+
+/**
+ * Every live company the user can reach, in one query.
+ *
+ * The three ways in are deliberately the same three the read-authorization rule
+ * recognises, so the list can never show a company that a subsequent detail call
+ * would refuse: owned, managed as accounting manager, or served through an ACTIVE
+ * specialist assignment. An ADMIN skips the filter entirely.
+ */
+function companyAccessFilter({ userId, isAdmin }) {
+  if (isAdmin) return {};
+  return {
+    OR: [
+      { ownerUserId: userId },
+      { accountingManagerUserId: userId },
+      { specialistAssignments: { some: { specialistUserId: userId, assignmentStatus: 'ACTIVE' } } },
+    ],
+  };
+}
+
+function buildCompanyListWhere({ userId, isAdmin, status, search }) {
+  return {
+    deletedAt: null,
+    ...companyAccessFilter({ userId, isAdmin }),
+    ...(status ? { status } : {}),
+    ...(search
+      ? {
+          OR: [
+            { companyName: { contains: search, mode: 'insensitive' } },
+            { companyEmail: { contains: search, mode: 'insensitive' } },
+          ],
+        }
+      : {}),
+  };
+}
+
+function listCompaniesForUser(client, { userId, isAdmin, status, search, limit, offset, sort, order }) {
+  return client.company.findMany({
+    where: buildCompanyListWhere({ userId, isAdmin, status, search }),
+    include: {
+      ...COMPANY_WITH_PEOPLE,
+      addresses: { where: { isPrimary: true }, include: { address: true }, take: 1 },
+    },
+    orderBy: { [sort]: order },
+    take: limit,
+    skip: offset,
+  });
+}
+
+function countCompaniesForUser(client, { userId, isAdmin, status, search }) {
+  return client.company.count({ where: buildCompanyListWhere({ userId, isAdmin, status, search }) });
+}
+
 function createCompany(client, data) {
   return client.company.create({ data });
 }
 
 function updateCompany(client, companyId, data) {
   return client.company.update({ where: { id: companyId }, data });
+}
+
+/**
+ * Soft-delete a company.
+ *
+ * The tombstone column existed and every read already filtered on it, but
+ * nothing ever set it — so there was no way to remove a company at all. A soft
+ * delete rather than a real one because billing history, assignments, and
+ * payments all reference the row and must survive for audit.
+ */
+function softDeleteCompany(client, companyId, deletedAt) {
+  return client.company.update({
+    where: { id: companyId },
+    data: { deletedAt, status: 'ARCHIVED' },
+  });
+}
+
+/** The primary address row linked to a company, or null. */
+async function findPrimaryAddress(client, companyId) {
+  const link = await client.companyAddress.findFirst({
+    where: { companyId, isPrimary: true },
+    include: { address: true },
+  });
+  return link?.address ?? null;
+}
+
+function updateAddress(client, addressId, data) {
+  return client.address.update({ where: { id: addressId }, data });
 }
 
 /* ------------------------------ addresses -------------------------------- */
@@ -152,11 +247,86 @@ function listActiveAssignments(client, companyId) {
   return client.companySpecialistAssignment.findMany({
     where: { companyId, assignmentStatus: 'ACTIVE' },
     include: {
-      specialist: { select: { id: true, firstName: true, lastName: true } },
+      specialist: { select: { id: true, firstName: true, lastName: true, email: true } },
       specialization: true,
     },
     orderBy: [{ specialistUserId: 'asc' }, { specializationId: 'asc' }],
   });
+}
+
+/** A page of a company's assignments, with optional inactive rows. */
+function listAssignmentsPage(client, companyId, { includeInactive, limit, offset, sort, order }) {
+  const where = { companyId, ...(includeInactive ? {} : { assignmentStatus: 'ACTIVE' }) };
+  return client.companySpecialistAssignment.findMany({
+    where,
+    include: {
+      specialist: { select: { id: true, firstName: true, lastName: true, email: true } },
+      specialization: true,
+    },
+    orderBy: { [sort]: order },
+    take: limit,
+    skip: offset,
+  });
+}
+
+function countAssignments(client, companyId, { includeInactive }) {
+  return client.companySpecialistAssignment.count({
+    where: { companyId, ...(includeInactive ? {} : { assignmentStatus: 'ACTIVE' }) },
+  });
+}
+
+/* --------------------------- user directory ------------------------------- */
+
+/**
+ * The user directory backing the "who can I assign?" pickers.
+ *
+ * This exists because three endpoints required a `userId` that the frontend had
+ * no way to discover: assigning an accounting manager, assigning a specialist,
+ * and (previously) naming an inviter. A required id with no lookup makes the
+ * screen unbuildable.
+ *
+ * Only ACTIVE users are listed, and only the fields a picker needs — never a
+ * password hash, never login-security columns.
+ */
+const DIRECTORY_SELECT = {
+  id: true,
+  email: true,
+  firstName: true,
+  lastName: true,
+  jobTitle: true,
+  status: true,
+  role: { select: { code: true } },
+  specificRole: { select: { code: true } },
+};
+
+function buildDirectoryWhere({ role, search }) {
+  return {
+    status: 'ACTIVE',
+    ...(role ? { role: { code: role } } : {}),
+    ...(search
+      ? {
+          OR: [
+            { email: { contains: search, mode: 'insensitive' } },
+            { firstName: { contains: search, mode: 'insensitive' } },
+            { lastName: { contains: search, mode: 'insensitive' } },
+          ],
+        }
+      : {}),
+  };
+}
+
+function listDirectoryUsers(client, { role, search, limit, offset, sort, order }) {
+  return client.user.findMany({
+    where: buildDirectoryWhere({ role, search }),
+    select: DIRECTORY_SELECT,
+    orderBy: { [sort]: order },
+    take: limit,
+    skip: offset,
+  });
+}
+
+function countDirectoryUsers(client, { role, search }) {
+  return client.user.count({ where: buildDirectoryWhere({ role, search }) });
 }
 
 /* ----------------------------- idempotency ------------------------------- */
@@ -173,14 +343,21 @@ function createIdempotencyKey(client, data) {
 
 module.exports = {
   USER_ROLE_SELECT,
+  DIRECTORY_SELECT,
   findUserWithRole,
   findUserByEmail,
   findCompanyById,
   findCompanyByEmail,
   findCompanyWithPeople,
+  findCompanyDetail,
+  listCompaniesForUser,
+  countCompaniesForUser,
   createCompany,
   updateCompany,
+  softDeleteCompany,
   createAddress,
+  updateAddress,
+  findPrimaryAddress,
   createCompanyAddress,
   findSpecializationsByCodes,
   findActiveAssignments,
@@ -189,6 +366,10 @@ module.exports = {
   findActiveAssignmentForUser,
   deactivateAssignment,
   listActiveAssignments,
+  listAssignmentsPage,
+  countAssignments,
+  listDirectoryUsers,
+  countDirectoryUsers,
   findIdempotencyKey,
   createIdempotencyKey,
 };

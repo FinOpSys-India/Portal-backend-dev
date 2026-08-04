@@ -683,6 +683,9 @@ async function writeInvoiceReceipt({ invoice, subscription, paid }) {
     companySubscriptionId: subscription.id,
     stripeInvoiceId: invoice.id,
     stripePaymentIntentId: await paymentIntentIdOfInvoice(invoice),
+    // Stored so a later refund or dispute — both of which identify the payment by
+    // CHARGE and by nothing else — can be matched back to this receipt.
+    stripeChargeId: idOf(invoice.charge),
     amountPaid: money.minorToDecimalString(amountMinor, currency),
     currency,
     status: paid ? 'PAID' : 'FAILED',
@@ -838,6 +841,154 @@ async function handlePaymentIntent(event, { requestId, succeeded }) {
   return { handled: true, subscriptionId: subscription.id };
 }
 
+/* -------------------------------- refunds --------------------------------- */
+
+/**
+ * charge.refunded — money went back to the customer.
+ *
+ * PaymentStatus.REFUNDED existed in the enum from the beginning and nothing ever
+ * wrote it, so a refunded invoice kept displaying as PAID indefinitely: the
+ * billing history in the portal contradicted the customer's bank statement, and
+ * support had no way to reconcile the two.
+ *
+ * `amount_refunded` is tracked in its own column rather than by reducing
+ * `amount_paid`. The receipt of what was actually charged has to stay true — a
+ * record that silently rewrites itself is not a record — and a PARTIAL refund
+ * has to be expressible at all, which subtracting cannot do without destroying
+ * the original figure.
+ *
+ * The status therefore reflects the RELATIONSHIP between the two amounts rather
+ * than the mere presence of a refund: fully refunded is REFUNDED, partially
+ * refunded stays PAID (the customer did pay, and still owes nothing more), and
+ * the amounts tell the rest of the story.
+ */
+async function handleChargeRefunded(event, { requestId }) {
+  const charge = event.data.object;
+
+  const payment = await findPaymentForCharge(charge);
+  if (!payment) {
+    logger.warn(`Webhook: charge ${charge.id} refunded but no local payment row matches it.`);
+    logEvent({
+      event: 'billing.refund.unmatched',
+      status: 'failure',
+      requestId,
+      stripeEventId: event.id,
+      stripeEventType: event.type,
+      errorCode: 'PAYMENT_NOT_FOUND',
+    });
+    return { handled: false, reason: 'unknown_payment' };
+  }
+
+  const currency = String(charge.currency || payment.currency).toUpperCase();
+  const refundedMinor = charge.amount_refunded ?? 0;
+  const paidMinor = money.decimalToMinor(payment.amountPaid, currency);
+
+  // Stripe is authoritative for the amount, but the CHECK constraint refuses a
+  // refund larger than the recorded charge. Clamping keeps a rounding or
+  // currency-scale surprise from failing the event and asking Stripe to redeliver
+  // a refund we have already seen.
+  const applied = Math.min(refundedMinor, paidMinor);
+  if (applied !== refundedMinor) {
+    logger.warn(
+      `Webhook: charge ${charge.id} reports ${refundedMinor} refunded but the local payment records ${paidMinor} paid; clamping.`
+    );
+  }
+
+  const fullyRefunded = applied >= paidMinor && paidMinor > 0;
+
+  await repo.updatePayment(prisma, payment.id, {
+    amountRefunded: money.minorToDecimalString(applied, currency),
+    refundedAt: applied > 0 ? new Date() : null,
+    status: fullyRefunded ? 'REFUNDED' : payment.status,
+    stripeChargeId: charge.id,
+  });
+
+  logEvent({
+    event: 'billing.refund.recorded',
+    status: 'success',
+    requestId,
+    companyId: payment.companyId,
+    subscriptionId: payment.companySubscriptionId ?? undefined,
+    stripeEventId: event.id,
+    stripeEventType: event.type,
+    stripeInvoiceId: payment.stripeInvoiceId ?? undefined,
+    amountMinor: applied,
+    currency,
+    detail: fullyRefunded ? 'full' : 'partial',
+  });
+
+  return { handled: true, paymentId: payment.id, fullyRefunded };
+}
+
+/**
+ * charge.dispute.created — the customer charged back.
+ *
+ * Recorded rather than acted on. A dispute is not a refund and must not silently
+ * cancel a subscription: it may be resolved in the merchant's favour, and
+ * cutting the customer's service on the strength of an unresolved claim is a
+ * business decision, not a webhook's. What matters here is that the payment stops
+ * reading as a clean PAID with nothing attached.
+ */
+async function handleDisputeCreated(event, { requestId }) {
+  const dispute = event.data.object;
+  const chargeId = idOf(dispute.charge);
+  if (!chargeId) return { handled: false, reason: 'no_charge' };
+
+  const payment = await repo.findPaymentByChargeId(prisma, chargeId);
+  if (!payment) {
+    logger.warn(`Webhook: dispute on charge ${chargeId} but no local payment row matches it.`);
+    return { handled: false, reason: 'unknown_payment' };
+  }
+
+  await repo.updatePayment(prisma, payment.id, {
+    failureReason: String(dispute.reason || 'disputed').slice(0, 255),
+  });
+
+  logEvent({
+    event: 'billing.dispute.opened',
+    status: 'failure',
+    requestId,
+    companyId: payment.companyId,
+    subscriptionId: payment.companySubscriptionId ?? undefined,
+    stripeEventId: event.id,
+    stripeEventType: event.type,
+    amountMinor: dispute.amount ?? undefined,
+    currency: dispute.currency ? String(dispute.currency).toUpperCase() : undefined,
+    errorCode: 'PAYMENT_DISPUTED',
+    detail: String(dispute.reason || 'unknown'),
+  });
+
+  return { handled: true, paymentId: payment.id };
+}
+
+/**
+ * Find the receipt a charge belongs to.
+ *
+ * Three routes, because which identifier is available depends on how the payment
+ * was made and on the API version: the charge id (once we have stored it), the
+ * PaymentIntent (a one-time checkout), or the invoice (a subscription renewal).
+ * The first match wins, and the charge id is written back so the next event on
+ * this payment takes the cheap path.
+ */
+async function findPaymentForCharge(charge) {
+  const byCharge = await repo.findPaymentByChargeId(prisma, charge.id);
+  if (byCharge) return byCharge;
+
+  const intentId = idOf(charge.payment_intent);
+  if (intentId) {
+    const byIntent = await repo.findPaymentByPaymentIntentId(prisma, intentId);
+    if (byIntent) return byIntent;
+  }
+
+  const invoiceId = idOf(charge.invoice);
+  if (invoiceId) {
+    const byInvoice = await repo.findPaymentByInvoiceId(prisma, invoiceId);
+    if (byInvoice) return byInvoice;
+  }
+
+  return null;
+}
+
 /* ----------------------------- reconciliation ----------------------------- */
 
 /**
@@ -956,6 +1107,10 @@ const HANDLERS = {
   'invoice.payment_failed': (e, ctx) => handleInvoice(e, { ...ctx, paid: false }),
   'payment_intent.succeeded': (e, ctx) => handlePaymentIntent(e, { ...ctx, succeeded: true }),
   'payment_intent.payment_failed': (e, ctx) => handlePaymentIntent(e, { ...ctx, succeeded: false }),
+  // Refunds and chargebacks. Without these, PaymentStatus.REFUNDED was
+  // unreachable and a refunded invoice still read as PAID forever.
+  'charge.refunded': (e, ctx) => handleChargeRefunded(e, ctx),
+  'charge.dispute.created': (e, ctx) => handleDisputeCreated(e, ctx),
 };
 
 /**
@@ -1041,5 +1196,8 @@ module.exports = {
     handleCheckoutCompleted,
     handleSubscriptionLifecycle,
     handleInvoice,
+    handleChargeRefunded,
+    handleDisputeCreated,
+    findPaymentForCharge,
   },
 };

@@ -3,8 +3,12 @@
 const asyncHandler = require('../middlewares/asyncHandler');
 const {
   validateCompanyOnboarding,
+  validateCompanyUpdate,
   validateAccountingManagerAssignment,
   validateSpecialistAssignment,
+  validateCompanyListQuery,
+  validateUserListQuery,
+  validateSpecialistListQuery,
   parseId,
 } = require('../validators/companyValidator');
 const companyService = require('../services/companyService');
@@ -36,6 +40,123 @@ const onboardCompany = asyncHandler(async (req, res) => {
 
   if (idempotent) res.setHeader('Idempotent-Replay', 'true');
   return res.status(statusCode).json(body);
+});
+
+/**
+ * GET /companies
+ *
+ * Every live company the caller can reach — owned, managed, or served as a
+ * specialist. This is how the frontend rediscovers a `companyId` after a
+ * refresh; nothing else returns one except the call that created it.
+ */
+const listCompanies = asyncHandler(async (req, res) => {
+  const query = validateCompanyListQuery(req.query);
+
+  const { companies, total } = await companyService.listCompanies({
+    userId: req.user.id,
+    requestId: req.id,
+    query,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Companies retrieved.',
+    data: {
+      companies,
+      pagination: {
+        total,
+        limit: query.limit,
+        offset: query.offset,
+        hasMore: query.offset + companies.length < total,
+        sort: query.sort,
+        order: query.order,
+      },
+    },
+  });
+});
+
+/** GET /companies/:companyId */
+const getCompany = asyncHandler(async (req, res) => {
+  const companyId = parseId(req.params.companyId, 'companyId');
+  const company = await companyService.getCompany({
+    userId: req.user.id,
+    requestId: req.id,
+    companyId,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Company retrieved.',
+    data: { company },
+  });
+});
+
+/** PATCH /companies/:companyId */
+const updateCompany = asyncHandler(async (req, res) => {
+  const companyId = parseId(req.params.companyId, 'companyId');
+  const input = validateCompanyUpdate(req.body);
+
+  const company = await companyService.updateCompany({
+    userId: req.user.id,
+    requestId: req.id,
+    companyId,
+    input,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Company updated.',
+    data: { company },
+  });
+});
+
+/** DELETE /companies/:companyId — soft delete (archive). */
+const deleteCompany = asyncHandler(async (req, res) => {
+  const companyId = parseId(req.params.companyId, 'companyId');
+
+  const { company } = await companyService.deleteCompany({
+    userId: req.user.id,
+    requestId: req.id,
+    companyId,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Company archived.',
+    data: { company },
+  });
+});
+
+/**
+ * GET /users
+ *
+ * The directory behind the assignment pickers. Assigning an accounting manager
+ * or a specialist requires a userId, and nothing else exposes one.
+ */
+const listUsers = asyncHandler(async (req, res) => {
+  const query = validateUserListQuery(req.query);
+
+  const { users, total } = await companyService.listUsers({
+    userId: req.user.id,
+    requestId: req.id,
+    query,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Users retrieved.',
+    data: {
+      users,
+      pagination: {
+        total,
+        limit: query.limit,
+        offset: query.offset,
+        hasMore: query.offset + users.length < total,
+        sort: query.sort,
+        order: query.order,
+      },
+    },
+  });
 });
 
 /**
@@ -91,7 +212,7 @@ const assignSpecialists = asyncHandler(async (req, res) => {
 const getTeam = asyncHandler(async (req, res) => {
   const companyId = parseId(req.params.companyId, 'companyId');
   const team = await companyService.getTeam({ userId: req.user.id, companyId });
-  return res.status(200).json({ success: true, data: team });
+  return res.status(200).json({ success: true, message: 'Team retrieved.', data: team });
 });
 
 /**
@@ -99,8 +220,10 @@ const getTeam = asyncHandler(async (req, res) => {
  */
 const listSpecialists = asyncHandler(async (req, res) => {
   const companyId = parseId(req.params.companyId, 'companyId');
-  const data = await companyService.listSpecialists({ userId: req.user.id, companyId });
-  return res.status(200).json({ success: true, data });
+  const query = validateSpecialistListQuery(req.query);
+
+  const data = await companyService.listSpecialists({ userId: req.user.id, companyId, query });
+  return res.status(200).json({ success: true, message: 'Specialists retrieved.', data });
 });
 
 /**
@@ -137,6 +260,11 @@ function normalizeIdempotencyKey(raw) {
 
 module.exports = {
   onboardCompany,
+  listCompanies,
+  getCompany,
+  updateCompany,
+  deleteCompany,
+  listUsers,
   assignAccountingManager,
   assignSpecialists,
   getTeam,

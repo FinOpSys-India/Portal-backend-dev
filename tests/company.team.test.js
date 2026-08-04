@@ -77,9 +77,9 @@ beforeEach(() => {
 /* --------------------- PUT accounting-manager ---------------------------- */
 
 describe('PUT /companies/:id/accounting-manager', () => {
-  it('assigns a valid accounting manager (200)', async () => {
+  it('assigns a valid accounting manager as ADMIN (200)', async () => {
     stageUsers({
-      [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER'),
+      [OWNER_ID]: person(OWNER_ID, 'Root', 'Admin', 'ADMIN', null),
       [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER'),
     });
     mockPrisma.company.findFirst.mockResolvedValue(company());
@@ -87,11 +87,11 @@ describe('PUT /companies/:id/accounting-manager', () => {
 
     const res = await request(app)
       .put(`/api/companies/${COMPANY_ID}/accounting-manager`)
-      .set('Authorization', auth())
+      .set('Authorization', auth({ role: 'ADMIN', specificRole: null }))
       .send({ accounting_manager_user_id: MANAGER_ID });
 
     expect(res.status).toBe(200);
-    expect(res.body.data.company.accounting_manager_user_id).toBe(MANAGER_ID);
+    expect(res.body.data.company.accountingManagerUserId).toBe(MANAGER_ID);
     expect(mockPrisma.company.update).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: COMPANY_ID }, data: { accountingManagerUserId: MANAGER_ID } })
     );
@@ -99,14 +99,14 @@ describe('PUT /companies/:id/accounting-manager', () => {
 
   it('rejects a user without the ACCOUNTING_MANAGER role (422)', async () => {
     stageUsers({
-      [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER'),
+      [OWNER_ID]: person(OWNER_ID, 'Root', 'Admin', 'ADMIN', null),
       [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'SPECIALIST'),
     });
     mockPrisma.company.findFirst.mockResolvedValue(company());
 
     const res = await request(app)
       .put(`/api/companies/${COMPANY_ID}/accounting-manager`)
-      .set('Authorization', auth())
+      .set('Authorization', auth({ role: 'ADMIN', specificRole: null }))
       .send({ accounting_manager_user_id: MANAGER_ID });
 
     expect(res.status).toBe(422);
@@ -114,7 +114,7 @@ describe('PUT /companies/:id/accounting-manager', () => {
     expect(mockPrisma.company.update).not.toHaveBeenCalled();
   });
 
-  it('rejects a caller who does not own the company (403)', async () => {
+  it('rejects a non-admin caller, even one who owns the company (403)', async () => {
     stageUsers({ [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER') });
     mockPrisma.company.findFirst.mockResolvedValue(company({ ownerUserId: 999 })); // owned by someone else
 
@@ -123,24 +123,53 @@ describe('PUT /companies/:id/accounting-manager', () => {
       .set('Authorization', auth())
       .send({ accounting_manager_user_id: MANAGER_ID });
 
+    // FORBIDDEN, not COMPANY_ACCESS_DENIED: the route gate now turns away any
+    // non-admin before ownership is even considered.
     expect(res.status).toBe(403);
-    expect(res.body.error.code).toBe('COMPANY_ACCESS_DENIED');
+    expect(res.body.error.code).toBe('FORBIDDEN');
   });
 
   it('returns 404 for a missing company', async () => {
-    stageUsers({ [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER') });
+    stageUsers({ [OWNER_ID]: person(OWNER_ID, 'Root', 'Admin', 'ADMIN', null) });
     mockPrisma.company.findFirst.mockResolvedValue(null);
 
     const res = await request(app)
       .put(`/api/companies/${COMPANY_ID}/accounting-manager`)
-      .set('Authorization', auth())
+      .set('Authorization', auth({ role: 'ADMIN', specificRole: null }))
       .send({ accounting_manager_user_id: MANAGER_ID });
 
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe('COMPANY_NOT_FOUND');
   });
 
+  it('refuses the company OWNER — assigning staff is an ADMIN decision', async () => {
+    /*
+     * Deliberately narrower than every other company write. An accounting
+     * manager is internal staff, and who serves which account is a staffing
+     * decision — not something a customer makes about their own company by
+     * attaching whichever manager they like.
+     */
+    stageUsers({
+      [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER'),
+      [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER'),
+    });
+    mockPrisma.company.findFirst.mockResolvedValue(company());
+
+    const res = await request(app)
+      .put(`/api/companies/${COMPANY_ID}/accounting-manager`)
+      .set('Authorization', auth())
+      .send({ accounting_manager_user_id: MANAGER_ID });
+
+    expect(res.status).toBe(403);
+    expect(mockPrisma.company.update).not.toHaveBeenCalled();
+  });
+
   it('blocks a non-owner/admin token at the role gate (403 FORBIDDEN)', async () => {
+    // The gate re-checks the database on a claim miss — that is what stops a
+    // merely STALE token from being refused — so the DB has to agree here for
+    // the refusal to stand.
+    stageUsers({ [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'SPECIALIST', null) });
+
     const res = await request(app)
       .put(`/api/companies/${COMPANY_ID}/accounting-manager`)
       .set('Authorization', auth({ role: 'SPECIALIST', specificRole: null }))
@@ -148,7 +177,7 @@ describe('PUT /companies/:id/accounting-manager', () => {
 
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('FORBIDDEN');
-    expect(mockPrisma.company.findFirst).not.toHaveBeenCalled();
+    expect(mockPrisma.company.update).not.toHaveBeenCalled();
   });
 });
 
@@ -192,7 +221,7 @@ describe('POST /companies/:id/specialists', () => {
 
     expect(res.status).toBe(201);
     expect(res.body.data.assignments).toHaveLength(2);
-    expect(res.body.data.assignments.map((a) => a.specialization_code).sort()).toEqual(['BOOKKEEPING', 'PAYROLL']);
+    expect(res.body.data.assignments.map((a) => a.specializationCode).sort()).toEqual(['BOOKKEEPING', 'PAYROLL']);
     expect(res.body.data.skipped).toEqual([]);
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
   });
@@ -211,7 +240,7 @@ describe('POST /companies/:id/specialists', () => {
 
     expect(res.status).toBe(201);
     expect(res.body.data.assignments).toHaveLength(1);
-    expect(res.body.data.assignments[0].specialization_code).toBe('PAYROLL');
+    expect(res.body.data.assignments[0].specializationCode).toBe('PAYROLL');
     expect(res.body.data.skipped).toContain('BOOKKEEPING');
     expect(mockPrisma.companySpecialistAssignment.create).toHaveBeenCalledTimes(1);
   });
@@ -253,7 +282,7 @@ describe('POST /companies/:id/specialists', () => {
       .set('Authorization', auth())
       .send({ specialist_user_id: SPECIALIST_ID, specialization_codes: [] });
     expect(res.status).toBe(400);
-    expect(res.body.error.fields.specialization_codes).toBeDefined();
+    expect(res.body.error.fields.specializationCodes).toBeDefined();
   });
 });
 
@@ -266,19 +295,24 @@ describe('GET /companies/:id/team', () => {
       company({ accountingManagerUserId: MANAGER_ID, accountingManager: { id: MANAGER_ID, firstName: 'Sarah', lastName: 'Jones' } })
     );
     mockPrisma.companySpecialistAssignment.findMany.mockResolvedValue([
-      { specialistUserId: SPECIALIST_ID, specialist: { id: SPECIALIST_ID, firstName: 'Jane', lastName: 'Doe' }, specialization: { specializationCode: 'BOOKKEEPING' } },
-      { specialistUserId: SPECIALIST_ID, specialist: { id: SPECIALIST_ID, firstName: 'Jane', lastName: 'Doe' }, specialization: { specializationCode: 'PAYROLL' } },
+      { id: 8001, specialistUserId: SPECIALIST_ID, specialist: { id: SPECIALIST_ID, firstName: 'Jane', lastName: 'Doe' }, specialization: { specializationCode: 'BOOKKEEPING' } },
+      { id: 8002, specialistUserId: SPECIALIST_ID, specialist: { id: SPECIALIST_ID, firstName: 'Jane', lastName: 'Doe' }, specialization: { specializationCode: 'PAYROLL' } },
     ]);
 
     const res = await request(app).get(`/api/companies/${COMPANY_ID}/team`).set('Authorization', auth());
 
     expect(res.status).toBe(200);
-    expect(res.body.data.company_id).toBe(COMPANY_ID);
-    expect(res.body.data.owner).toEqual({ user_id: OWNER_ID, first_name: 'John', last_name: 'Smith' });
-    expect(res.body.data.accounting_manager).toEqual({ user_id: MANAGER_ID, first_name: 'Sarah', last_name: 'Jones' });
+    expect(res.body.data.companyId).toBe(COMPANY_ID);
+    expect(res.body.data.owner).toMatchObject({ userId: OWNER_ID, firstName: 'John', lastName: 'Smith' });
+    expect(res.body.data.accountingManager).toMatchObject({ userId: MANAGER_ID, firstName: 'Sarah', lastName: 'Jones' });
     expect(res.body.data.specialists).toHaveLength(1);
-    expect(res.body.data.specialists[0]).toMatchObject({ user_id: SPECIALIST_ID, first_name: 'Jane', last_name: 'Doe' });
-    expect(res.body.data.specialists[0].specializations.sort()).toEqual(['BOOKKEEPING', 'PAYROLL']);
+    expect(res.body.data.specialists[0]).toMatchObject({ userId: SPECIALIST_ID, firstName: 'Jane', lastName: 'Doe' });
+    // Each specialization now carries its own assignmentId. The team payload
+    // previously dropped it, so a "remove" button rendered from this response
+    // had no id to send and the client had to call the specialists endpoint too.
+    expect(res.body.data.specialists[0].specializations.map((s) => s.specializationCode).sort())
+      .toEqual(['BOOKKEEPING', 'PAYROLL']);
+    expect(res.body.data.specialists[0].specializations.every((s) => typeof s.assignmentId === 'number')).toBe(true);
   });
 
   it('denies read access to an unrelated user (403)', async () => {
@@ -314,7 +348,7 @@ describe('DELETE /companies/:id/specialists/:assignmentId', () => {
     const res = await request(app).delete(`/api/companies/${COMPANY_ID}/specialists/44`).set('Authorization', auth());
 
     expect(res.status).toBe(200);
-    expect(res.body.data.assignment.assignment_status).toBe('INACTIVE');
+    expect(res.body.data.assignment.assignmentStatus).toBe('INACTIVE');
     expect(mockPrisma.companySpecialistAssignment.update).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: 44 }, data: expect.objectContaining({ assignmentStatus: 'INACTIVE' }) })
     );

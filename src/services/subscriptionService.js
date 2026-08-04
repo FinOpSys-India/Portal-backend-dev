@@ -7,8 +7,10 @@ const { getStripe } = require('../config/stripe');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { logEvent } = require('../utils/auditLog');
+const money = require('../utils/money');
 const repo = require('../repositories/billingRepository');
 const { authorizeCompany } = require('./billingAccess');
+const planCatalog = require('./planCatalogService');
 const dto = require('../dto/billingDto');
 
 /**
@@ -66,28 +68,39 @@ async function getSubscription({ userId, requestId, companyId }) {
   await authorizeCompany(userId, companyId);
 
   const subscription = await repo.findCurrentSubscriptionForCompany(prisma, companyId);
-  if (!subscription) throw subscriptionNotFound();
 
+  /*
+   * A company with no subscription is a NORMAL state, not an error: every company
+   * is in it between onboarding and its first checkout. This used to 404, while
+   * the adjacent payments endpoint answered 200 with an empty list for the same
+   * situation — so the billing screen needed two different empty-state paths for
+   * one condition, and a 404 in the network tab looked like a bug rather than
+   * "nothing bought yet".
+   */
   logEvent({
     event: 'billing.subscription.read',
     status: 'success',
     requestId,
     userId,
     companyId,
-    subscriptionId: subscription.id,
-    detail: subscription.status,
+    subscriptionId: subscription?.id,
+    detail: subscription?.status ?? 'none',
   });
 
-  return dto.toSubscriptionResponse({ subscription });
+  return {
+    companyId,
+    hasSubscription: Boolean(subscription),
+    subscription: subscription ? dto.toSubscriptionResponse({ subscription }) : null,
+  };
 }
 
-/** GET /billing/payments — the company's receipts, newest first. */
-async function listPayments({ userId, requestId, companyId, limit, offset }) {
+/** GET /billing/payments — the company's receipts. */
+async function listPayments({ userId, requestId, companyId, limit, offset, sort, order, status }) {
   await authorizeCompany(userId, companyId);
 
   const [payments, total] = await Promise.all([
-    repo.listPaymentsForCompany(prisma, companyId, { limit, offset }),
-    repo.countPaymentsForCompany(prisma, companyId),
+    repo.listPaymentsForCompany(prisma, companyId, { limit, offset, sort, order, status }),
+    repo.countPaymentsForCompany(prisma, companyId, { status }),
   ]);
 
   logEvent({
@@ -99,7 +112,7 @@ async function listPayments({ userId, requestId, companyId, limit, offset }) {
     detail: `${payments.length}/${total}`,
   });
 
-  return dto.toPaymentsResponse({ payments, total, limit, offset, companyId });
+  return dto.toPaymentsResponse({ payments, total, limit, offset, companyId, sort, order });
 }
 
 /* ---------------------------- shared preconditions ------------------------ */
@@ -260,6 +273,153 @@ async function updatePayrollCounts({ userId, requestId, companyId, employeeCount
   };
 }
 
+/* ------------------------------ add services ------------------------------ */
+
+/**
+ * POST /billing/subscription/services — add a service to a LIVE subscription.
+ *
+ * This closes a genuine dead end. A customer who bought bookkeeping and later
+ * wanted tax had no route at all: POST /billing/checkout refused with
+ * SUBSCRIPTION_ALREADY_ACTIVE, and PATCH /subscription/payroll only moves head
+ * counts on a service already purchased. The only workaround was to cancel and
+ * re-buy everything, which loses the billing period the customer had paid for.
+ *
+ * Everything is added to the EXISTING Stripe subscription rather than sold as a
+ * second one, which is what keeps a single renewal date and a single invoice.
+ * Proration follows BILLING_PRORATION_BEHAVIOR, so the customer pays for the
+ * remainder of the current period and nothing more.
+ *
+ * Prices are resolved through exactly the same server-side path as checkout
+ * (planCatalogService.resolveSelection): an option id in, a verified Stripe
+ * Price out. No amount and no Stripe id is accepted from the request, here or
+ * anywhere else.
+ */
+async function addServices({ userId, requestId, companyId, selections, selectedServices }) {
+  await authorizeCompany(userId, companyId);
+  const subscription = await loadMutableSubscription(companyId);
+
+  // Resolve and validate BEFORE touching Stripe, so a rejected selection leaves
+  // the live subscription exactly as it was.
+  const { lines, currency } = await planCatalog.resolveSelection(selections);
+
+  // Refuse anything the company already pays for. Adding a second line for a
+  // plan already on the subscription would charge twice for one service, and the
+  // unique on (subscription, plan) would reject it halfway through anyway —
+  // after the Stripe call had already succeeded.
+  const existingPlanIds = new Set(subscription.items.filter((i) => i.quantity > 0).map((i) => i.servicePlanId));
+  const duplicates = lines.filter((l) => existingPlanIds.has(l.servicePlanId));
+  if (duplicates.length) {
+    throw new ApiError(409, 'This company is already subscribed to one or more of the selected services.', {
+      code: 'SERVICE_ALREADY_SUBSCRIBED',
+      details: {
+        services: [...new Set(duplicates.map((l) => l.service))],
+        optionIds: [...new Set(duplicates.map((l) => l.optionId))],
+      },
+    });
+  }
+
+  // Every plan in the catalog renews monthly, but a mixed-interval addition would
+  // silently change what "next renewal" means for the whole subscription.
+  const intervals = [...new Set(lines.filter((l) => l.recurring).map((l) => l.interval))];
+  if (intervals.length > 1) {
+    throw new ApiError(422, 'The selected services renew on different schedules.', {
+      code: 'INCOMPATIBLE_CHECKOUT_PRICES',
+      details: { reason: 'mixed_intervals', intervals },
+    });
+  }
+
+  const stripe = getStripe();
+  const added = [];
+
+  for (const line of lines) {
+    try {
+      const created = await stripe.subscriptionItems.create({
+        subscription: subscription.stripeSubscriptionId,
+        // From OUR verified catalog row, never from the request.
+        price: line.stripePriceId,
+        quantity: line.quantity,
+        proration_behavior: config.billing.prorationBehavior,
+      });
+
+      /*
+       * A row may already exist at quantity 0 — that is how a component whose
+       * count dropped to zero is kept, so its history and plan link survive. Reuse
+       * it rather than inserting a duplicate, which the unique on (subscription,
+       * plan) would reject.
+       */
+      const existingItem = subscription.items.find((i) => i.servicePlanId === line.servicePlanId);
+      if (existingItem) {
+        await repo.updateSubscriptionItem(prisma, existingItem.id, {
+          quantity: line.quantity,
+          stripeSubscriptionItemId: created.id,
+          unitAmount: money.minorToDecimalString(line.unitAmountMinor, line.currency),
+          currency: line.currency,
+        });
+      } else {
+        await repo.createSubscriptionItem(prisma, {
+          companySubscriptionId: subscription.id,
+          servicePlanId: line.servicePlanId,
+          quantity: line.quantity,
+          stripeSubscriptionItemId: created.id,
+          // The price PAID, captured now — the same rule as checkout, so a later
+          // price rise never rewrites what this customer is recorded as paying.
+          unitAmount: money.minorToDecimalString(line.unitAmountMinor, line.currency),
+          currency: line.currency,
+        });
+      }
+
+      added.push({ service: line.service, component: line.component, optionId: line.optionId, quantity: line.quantity });
+    } catch (err) {
+      logger.error(`[${requestId}] Stripe subscription item create failed: ${err.message}`);
+      logEvent({
+        event: 'billing.subscription.add_services_failed',
+        status: 'error',
+        requestId,
+        userId,
+        companyId,
+        subscriptionId: subscription.id,
+        planCodes: [line.planCode],
+        errorCode: 'SUBSCRIPTION_UPDATE_FAILED',
+      });
+      /*
+       * Partial application is possible: an earlier line may already be on the
+       * subscription. Every write above happens only AFTER its Stripe call
+       * succeeded, so what is stored is always a prefix of what Stripe did —
+       * never a claim about something that did not happen. `applied` tells the
+       * client what to expect when it refetches.
+       */
+      throw new ApiError(502, 'Unable to add the selected services. Please try again.', {
+        code: 'SUBSCRIPTION_UPDATE_FAILED',
+        details: { applied: added.map((a) => a.service) },
+      });
+    }
+  }
+
+  logEvent({
+    event: 'billing.subscription.services_added',
+    status: 'success',
+    requestId,
+    userId,
+    companyId,
+    subscriptionId: subscription.id,
+    selectedServices,
+    planCodes: lines.map((l) => l.planCode),
+    amountMinor: lines.reduce((sum, l) => sum + l.totalAmountMinor, 0),
+    currency,
+  });
+
+  const refreshed = await repo.findCurrentSubscriptionForCompany(prisma, companyId);
+  return {
+    added,
+    pricingSummary: dto.toPricingSummary({
+      lines,
+      currency,
+      grandTotalMinor: lines.reduce((sum, l) => sum + l.totalAmountMinor, 0),
+    }),
+    subscription: dto.toSubscriptionResponse({ subscription: refreshed }),
+  };
+}
+
 /* -------------------------------- cancellation ---------------------------- */
 
 /**
@@ -388,12 +548,13 @@ async function createPortalSession({ userId, requestId, companyId }) {
     stripeCustomerId: company.stripeCustomerId,
   });
 
-  return { portal_url: session.url, company_id: companyId };
+  return { portalUrl: session.url, companyId };
 }
 
 module.exports = {
   getSubscription,
   listPayments,
+  addServices,
   updatePayrollCounts,
   cancelSubscription,
   createPortalSession,

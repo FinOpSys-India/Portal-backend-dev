@@ -9,31 +9,38 @@ const money = require('../utils/money');
  * shapes that leave the service, so the contract lives in one place and internal
  * columns never leak by accident.
  *
+ * Keys are camelCase throughout, matching every other module.
+ *
  * Every money figure is an integer in MINOR units (cents) under a `currency`
  * field — the same units Stripe reports — so the client never has to parse a
- * decimal string or guess a scale.
+ * decimal string or guess a scale. The field is named `...AmountMinor` rather
+ * than `...Amount`: the unit is part of the meaning, and a bare `unitAmount` of
+ * 24900 is exactly the shape of value someone renders as "$24,900".
  *
  * Stripe product and price ids appear only when BILLING_EXPOSE_STRIPE_IDS is on
  * (the default outside production). They are useful while wiring the frontend up
  * and unnecessary afterwards: the client selects by our option ids, so shipping
  * the Stripe ids to every browser only widens what an attacker can see of the
- * billing configuration.
+ * billing configuration. Because they vanish in production, a client must never
+ * depend on them — which is why they are grouped under a single `stripe` key
+ * that is either present in full or absent in full, rather than sprinkled as
+ * sibling fields that disappear one by one.
  */
 
 /** The optional Stripe id pair, included per config. */
 function stripeIds(line) {
   if (!config.billing.exposeStripeIds) return {};
-  return { product_id: line.stripeProductId, price_id: line.stripePriceId };
+  return { stripe: { productId: line.stripeProductId, priceId: line.stripePriceId } };
 }
 
 /** One priced line: ids (optionally), quantity, unit price, line total. */
 function toLine(line) {
   return {
-    ...stripeIds(line),
-    option_id: line.optionId,
+    optionId: line.optionId,
     quantity: line.quantity,
-    unit_amount: line.unitAmountMinor,
-    total_amount: line.totalAmountMinor,
+    unitAmountMinor: line.unitAmountMinor,
+    totalAmountMinor: line.totalAmountMinor,
+    ...stripeIds(line),
   };
 }
 
@@ -58,29 +65,38 @@ function toPricingSummary({ lines, currency, grandTotalMinor }) {
     const payroll = {};
     for (const line of payrollLines) payroll[line.component] = toLine(line);
     // Components with a zero count are dropped before they reach Stripe; report
-    // them as an explicit zero so the client can render a stable table.
+    // them as an explicit zero so the client can render a stable table. The
+    // optionId is carried through so the row is still identifiable when empty.
+    const planId = payrollLines[0]?.optionId ?? null;
     for (const component of ['base', 'employees', 'contractors']) {
-      if (!payroll[component]) payroll[component] = { quantity: 0, unit_amount: 0, total_amount: 0 };
+      if (!payroll[component]) {
+        payroll[component] = {
+          optionId: planId,
+          quantity: 0,
+          unitAmountMinor: 0,
+          totalAmountMinor: 0,
+        };
+      }
     }
-    payroll.total_amount = payrollLines.reduce((sum, l) => sum + l.totalAmountMinor, 0);
+    payroll.totalAmountMinor = payrollLines.reduce((sum, l) => sum + l.totalAmountMinor, 0);
     summary.payroll = payroll;
   }
 
   const taxes = lines.find((l) => l.service === catalog.SERVICES.TAXES);
   if (taxes) summary.taxes = toLine(taxes);
 
-  summary.grand_total_amount = grandTotalMinor;
+  summary.grandTotalAmountMinor = grandTotalMinor;
   return summary;
 }
 
 /** The body returned by POST /billing/checkout. */
 function toCheckoutResponse({ session, companyId, selectedServices, pricingSummary }) {
   return {
-    checkout_session_id: session.id,
-    checkout_url: session.url,
-    company_id: companyId,
-    selected_services: selectedServices,
-    pricing_summary: pricingSummary,
+    checkoutSessionId: session.id,
+    checkoutUrl: session.url,
+    companyId,
+    selectedServices,
+    pricingSummary,
   };
 }
 
@@ -139,11 +155,11 @@ function toServiceStatuses({ subscription }) {
     const view = byService.get(entry.service);
 
     if (entry.service === catalog.SERVICES.PAYROLL) {
-      if (entry.component === 'employees') view.employee_count = item.quantity;
-      if (entry.component === 'contractors') view.contractor_count = item.quantity;
-      view.plan_id = entry.optionId;
+      if (entry.component === 'employees') view.employeeCount = item.quantity;
+      if (entry.component === 'contractors') view.contractorCount = item.quantity;
+      view.planId = entry.optionId;
     } else {
-      view.price_option_id = entry.optionId;
+      view.priceOptionId = entry.optionId;
     }
   }
 
@@ -151,8 +167,8 @@ function toServiceStatuses({ subscription }) {
   // report the absent counts as zero rather than leaving the field undefined.
   for (const view of byService.values()) {
     if (view.service === catalog.SERVICES.PAYROLL) {
-      view.employee_count ??= 0;
-      view.contractor_count ??= 0;
+      view.employeeCount ??= 0;
+      view.contractorCount ??= 0;
     }
   }
 
@@ -163,11 +179,11 @@ function toServiceStatuses({ subscription }) {
 function toCheckoutStatusResponse({ session, subscription, companyId }) {
   return {
     status: normalizeStatus({ session, subscription }),
-    checkout_status: session.status,
-    payment_status: session.payment_status ?? null,
-    company_id: companyId,
-    subscription_status: subscription?.status ?? null,
-    current_period_end: subscription?.currentPeriodEnd
+    checkoutStatus: session.status,
+    paymentStatus: session.payment_status ?? null,
+    companyId,
+    subscriptionStatus: subscription?.status ?? null,
+    currentPeriodEnd: subscription?.currentPeriodEnd
       ? new Date(subscription.currentPeriodEnd).toISOString()
       : null,
     services: toServiceStatuses({ subscription }),
@@ -196,22 +212,25 @@ function toSubscriptionResponse({ subscription }) {
       const planCode = item.servicePlan?.planCode;
       const entry = planCode ? catalog.BY_PLAN_CODE.get(planCode) : null;
       const currency = (item.currency || '').toUpperCase();
-      const unitAmount = money.decimalToMinor(item.unitAmount, currency);
+      const unitAmountMinor = money.decimalToMinor(item.unitAmount, currency);
       return {
         service: entry?.service ?? null,
         component: entry?.component ?? 'plan',
-        option_id: entry?.optionId ?? null,
-        plan_name: item.servicePlan?.planName ?? null,
+        optionId: entry?.optionId ?? null,
+        planName: item.servicePlan?.planName ?? null,
+        quantity: item.quantity,
+        unitAmountMinor,
+        totalAmountMinor: unitAmountMinor * item.quantity,
+        currency,
         ...(config.billing.exposeStripeIds
           ? {
-              product_id: item.servicePlan?.stripeProductId ?? null,
-              price_id: item.servicePlan?.stripePriceId ?? null,
+              stripe: {
+                productId: item.servicePlan?.stripeProductId ?? null,
+                priceId: item.servicePlan?.stripePriceId ?? null,
+                subscriptionItemId: item.stripeSubscriptionItemId ?? null,
+              },
             }
           : {}),
-        quantity: item.quantity,
-        unit_amount: unitAmount,
-        total_amount: unitAmount * item.quantity,
-        currency,
       };
     })
     // A component dropped to zero keeps its row (history, and the id to re-add
@@ -221,20 +240,25 @@ function toSubscriptionResponse({ subscription }) {
   const currency = lines[0]?.currency ?? config.billing.supportedCurrency;
 
   return {
-    subscription_id: subscription.id,
-    company_id: subscription.companyId,
+    subscriptionId: subscription.id,
+    companyId: subscription.companyId,
     status: subscription.status,
-    ...(config.billing.exposeStripeIds
-      ? { stripe_subscription_id: subscription.stripeSubscriptionId ?? null }
-      : {}),
-    current_period_start: iso(subscription.currentPeriodStart),
-    current_period_end: iso(subscription.currentPeriodEnd),
-    cancel_at_period_end: Boolean(subscription.cancelAtPeriodEnd),
-    canceled_at: iso(subscription.canceledAt),
+    currentPeriodStart: iso(subscription.currentPeriodStart),
+    currentPeriodEnd: iso(subscription.currentPeriodEnd),
+    cancelAtPeriodEnd: Boolean(subscription.cancelAtPeriodEnd),
+    canceledAt: iso(subscription.canceledAt),
     currency,
-    recurring_total_amount: lines.reduce((sum, l) => sum + l.total_amount, 0),
+    recurringTotalAmountMinor: lines.reduce((sum, l) => sum + l.totalAmountMinor, 0),
     services: toServiceStatuses({ subscription }),
     lines,
+    ...(config.billing.exposeStripeIds
+      ? {
+          stripe: {
+            subscriptionId: subscription.stripeSubscriptionId ?? null,
+            checkoutSessionId: subscription.stripeCheckoutSessionId ?? null,
+          },
+        }
+      : {}),
   };
 }
 
@@ -242,28 +266,40 @@ function toSubscriptionResponse({ subscription }) {
 function toPayment(payment) {
   const currency = (payment.currency || '').toUpperCase();
   return {
-    payment_id: payment.id,
-    amount_paid: money.decimalToMinor(payment.amountPaid, currency),
+    paymentId: payment.id,
+    amountPaidMinor: money.decimalToMinor(payment.amountPaid, currency),
+    amountRefundedMinor: payment.amountRefunded
+      ? money.decimalToMinor(payment.amountRefunded, currency)
+      : 0,
     currency,
     status: payment.status,
-    paid_at: iso(payment.paidAt),
-    created_at: iso(payment.createdAt),
-    failure_reason: payment.failureReason ?? null,
+    paidAt: iso(payment.paidAt),
+    refundedAt: iso(payment.refundedAt),
+    createdAt: iso(payment.createdAt),
+    failureReason: payment.failureReason ?? null,
     ...(config.billing.exposeStripeIds
       ? {
-          stripe_invoice_id: payment.stripeInvoiceId ?? null,
-          stripe_payment_intent_id: payment.stripePaymentIntentId ?? null,
+          stripe: {
+            invoiceId: payment.stripeInvoiceId ?? null,
+            paymentIntentId: payment.stripePaymentIntentId ?? null,
+          },
         }
       : {}),
   };
 }
 
 /** A page of payment history plus the cursor the client needs to ask for more. */
-function toPaymentsResponse({ payments, total, limit, offset, companyId }) {
+function toPaymentsResponse({ payments, total, limit, offset, companyId, sort, order }) {
   return {
-    company_id: companyId,
+    companyId,
     payments: payments.map(toPayment),
-    pagination: { total, limit, offset, has_more: offset + payments.length < total },
+    pagination: {
+      total,
+      limit,
+      offset,
+      hasMore: offset + payments.length < total,
+      ...(sort ? { sort, order } : {}),
+    },
   };
 }
 

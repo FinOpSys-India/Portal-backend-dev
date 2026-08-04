@@ -253,6 +253,7 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
         employeeCount: input.employeeCount,
         lastYearRevenue: input.lastYearRevenue,
         revenueCurrency: input.revenueCurrency,
+        // Ownership comes from the verified token, never from the request.
         ownerUserId: userId,
         status: 'ONBOARDING',
       });
@@ -345,6 +346,240 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
   }
 }
 
+/* ------------------------------ company reads ---------------------------- */
+
+/**
+ * Describe the caller's relationship to a company, so the frontend can decide
+ * which actions to render without re-deriving the authorization rules. Those
+ * rules live here; a client that reimplements them is a client that will
+ * eventually disagree with the server about what a user may do.
+ */
+async function accessRoleFor(caller, company) {
+  if (isAdmin(caller)) return 'ADMIN';
+  if (company.ownerUserId === caller.id) return 'OWNER';
+  if (company.accountingManagerUserId === caller.id) return 'ACCOUNTING_MANAGER';
+  const assignment = await repo.findActiveAssignmentForUser(prisma, {
+    companyId: company.id,
+    userId: caller.id,
+  });
+  return assignment ? 'SPECIALIST' : null;
+}
+
+/**
+ * GET /companies — every live company the caller can reach.
+ *
+ * This endpoint is what makes the rest of the company and billing API usable at
+ * all. `companyId` was previously returned exactly once, by the onboarding call
+ * that created it, and there was no way to look it up again — so after a page
+ * refresh the frontend could not address a company it had just created, and a
+ * user who owns several had no way to enumerate them.
+ */
+async function listCompanies({ userId, requestId, query }) {
+  const caller = await loadCaller(userId);
+  const admin = isAdmin(caller);
+
+  const [rows, total] = await Promise.all([
+    repo.listCompaniesForUser(prisma, { userId, isAdmin: admin, ...query }),
+    repo.countCompaniesForUser(prisma, { userId, isAdmin: admin, ...query }),
+  ]);
+
+  const companies = [];
+  for (const company of rows) {
+    companies.push(
+      dto.toCompanyDetail({
+        company,
+        address: company.addresses?.[0]?.address ?? null,
+        accessRole: await accessRoleFor(caller, company),
+      })
+    );
+  }
+
+  logEvent({
+    event: 'company.list.read',
+    status: 'success',
+    requestId,
+    userId,
+    detail: `${rows.length}/${total}`,
+  });
+
+  return { companies, total };
+}
+
+/** GET /companies/:companyId — one company, with its primary address. */
+async function getCompany({ userId, requestId, companyId }) {
+  const caller = await loadCaller(userId);
+  const company = await repo.findCompanyDetail(prisma, companyId);
+  if (!company) throw companyNotFound();
+  await assertReadAccess(caller, company);
+
+  logEvent({ event: 'company.read', status: 'success', requestId, userId, companyId });
+
+  return dto.toCompanyDetail({
+    company,
+    address: company.addresses?.[0]?.address ?? null,
+    accessRole: await accessRoleFor(caller, company),
+  });
+}
+
+/* ----------------------------- company update ---------------------------- */
+
+/**
+ * PATCH /companies/:companyId — correct company details after onboarding.
+ *
+ * Previously a company was immutable once created: a typo in the billing email,
+ * a moved office, or a changed head count had no route at all. Requires manage
+ * access (owner or admin), same as the team writes.
+ *
+ * The address is REPLACED in place rather than merged field by field. A partial
+ * address update is how you end up with a new street on an old postcode, and
+ * this address ends up on Stripe invoices.
+ */
+async function updateCompany({ userId, requestId, companyId, input }) {
+  const caller = await loadCaller(userId);
+  const company = await loadCompany(companyId);
+  assertManageAccess(caller, company);
+
+  // The email uniqueness rule spans two tables and is only checked when the
+  // value actually changes — re-submitting the current address must not collide
+  // with the company's own row.
+  if (input.companyEmail && input.companyEmail.toLowerCase() !== company.companyEmail.toLowerCase()) {
+    await assertCompanyEmailAvailable(input.companyEmail);
+  }
+
+  const { address, ...companyFields } = input;
+
+  try {
+    const updated = await prisma.$transaction(async (tx) => {
+      if (address) {
+        const existing = await repo.findPrimaryAddress(tx, companyId);
+        if (existing) {
+          await repo.updateAddress(tx, existing.id, {
+            line1: address.line1,
+            line2: address.line2,
+            city: address.city,
+            state: address.state,
+            postalCode: address.postalCode,
+            country: address.country,
+            countryCode: address.countryCode,
+          });
+        } else {
+          // A company onboarded before the address link existed, or one whose
+          // link was lost. Create and attach rather than failing the update.
+          const created = await repo.createAddress(tx, {
+            line1: address.line1,
+            line2: address.line2,
+            city: address.city,
+            state: address.state,
+            postalCode: address.postalCode,
+            country: address.country,
+            countryCode: address.countryCode,
+          });
+          await repo.createCompanyAddress(tx, {
+            companyId,
+            addressId: created.id,
+            addressType: 'BUSINESS',
+            isPrimary: true,
+          });
+        }
+      }
+
+      if (Object.keys(companyFields).length) {
+        await repo.updateCompany(tx, companyId, companyFields);
+      }
+
+      return repo.findCompanyDetail(tx, companyId);
+    });
+
+    logEvent({
+      event: 'company.updated',
+      status: 'success',
+      requestId,
+      userId,
+      companyId,
+      detail: Object.keys(input).join(','),
+    });
+
+    return dto.toCompanyDetail({
+      company: updated,
+      address: updated.addresses?.[0]?.address ?? null,
+      accessRole: await accessRoleFor(caller, updated),
+    });
+  } catch (err) {
+    // The partial functional unique index is the real guarantee; translate it
+    // back into the same 409 the pre-check would have raised.
+    if (isCompanyEmailConflict(err)) throw companyEmailInUse('company');
+    throw err;
+  }
+}
+
+/**
+ * DELETE /companies/:companyId — soft delete.
+ *
+ * A tombstone, not a real delete: subscriptions, payments and assignments all
+ * reference this row and the billing history has to survive. Every read already
+ * filters on `deletedAt`, so the company disappears from the API immediately.
+ *
+ * Refused while a subscription is still live. Archiving a company that is being
+ * charged would leave a Stripe subscription billing a customer for something
+ * they can no longer see — cancel first, deliberately, so the money stops.
+ */
+async function deleteCompany({ userId, requestId, companyId }) {
+  const caller = await loadCaller(userId);
+  const company = await loadCompany(companyId);
+  assertManageAccess(caller, company);
+
+  const active = await prisma.companySubscription.findFirst({
+    where: { companyId, status: { in: ['ACTIVE', 'PAST_DUE', 'UNPAID'] } },
+    select: { id: true, status: true },
+  });
+  if (active) {
+    throw new ApiError(409, 'Cancel the active subscription before archiving this company.', {
+      code: 'SUBSCRIPTION_STILL_ACTIVE',
+      details: { companySubscriptionId: active.id, status: active.status },
+    });
+  }
+
+  const deleted = await repo.softDeleteCompany(prisma, companyId, new Date());
+
+  logEvent({ event: 'company.archived', status: 'success', requestId, userId, companyId });
+
+  return { company: dto.toCompany(deleted) };
+}
+
+/* ----------------------------- user directory ---------------------------- */
+
+/**
+ * GET /users — the directory behind the assignment pickers.
+ *
+ * Assigning an accounting manager or a specialist requires a `userId`, and until
+ * now nothing exposed one, so those screens could not be built. Restricted to
+ * callers who can actually act on the result: an ADMIN, or a company owner (who
+ * needs it to staff their own companies). It returns names, emails and roles of
+ * ACTIVE users only — never a password hash, never login-security columns.
+ */
+async function listUsers({ userId, requestId, query }) {
+  const caller = await loadCaller(userId);
+
+  if (!isAdmin(caller) && !hasOwnerRole(caller)) {
+    throw new ApiError(403, 'You do not have permission to browse users.', { code: 'FORBIDDEN' });
+  }
+
+  const [rows, total] = await Promise.all([
+    repo.listDirectoryUsers(prisma, query),
+    repo.countDirectoryUsers(prisma, query),
+  ]);
+
+  logEvent({
+    event: 'user.directory.read',
+    status: 'success',
+    requestId,
+    userId,
+    detail: `${rows.length}/${total}`,
+  });
+
+  return { users: rows.map(dto.toDirectoryUser), total };
+}
+
 /* ----------------------- accounting manager assignment ------------------- */
 
 /**
@@ -355,7 +590,30 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
 async function assignAccountingManager({ userId, requestId, companyId, managerUserId }) {
   const caller = await loadCaller(userId);
   const company = await loadCompany(companyId);
-  assertManageAccess(caller, company);
+
+  /*
+   * ADMIN only — deliberately narrower than every other company write.
+   *
+   * An accounting manager is staff, not someone the customer employs: they get
+   * read access to the company's team and are the internal point of contact for
+   * its books. Letting a company owner attach any user holding that role to
+   * their own company would let a customer grant one of your staff access on
+   * their own initiative. Who serves which account is an internal staffing
+   * decision, so it is made by an admin.
+   */
+  if (!isAdmin(caller)) {
+    logEvent({
+      event: 'company.accounting_manager.denied',
+      status: 'failure',
+      requestId,
+      userId,
+      companyId,
+      errorCode: 'ADMIN_ROLE_REQUIRED',
+    });
+    throw new ApiError(403, 'Only an administrator can assign an accounting manager.', {
+      code: 'ADMIN_ROLE_REQUIRED',
+    });
+  }
 
   const manager = await repo.findUserWithRole(prisma, managerUserId);
   if (!manager) throw targetUserNotFound();
@@ -468,14 +726,29 @@ async function getTeam({ userId, companyId }) {
   return dto.toTeam({ company, assignments });
 }
 
-/** GET /companies/:companyId/specialists — flat list of active assignments. */
-async function listSpecialists({ userId, companyId }) {
+/** GET /companies/:companyId/specialists — paginated list of assignments. */
+async function listSpecialists({ userId, companyId, query }) {
   const caller = await loadCaller(userId);
   const company = await loadCompany(companyId, { withPeople: true });
   await assertReadAccess(caller, company);
 
-  const assignments = await repo.listActiveAssignments(prisma, companyId);
-  return { company_id: company.id, specialists: assignments.map(dto.toAssignment) };
+  const [assignments, total] = await Promise.all([
+    repo.listAssignmentsPage(prisma, companyId, query),
+    repo.countAssignments(prisma, companyId, query),
+  ]);
+
+  return {
+    companyId: company.id,
+    specialists: assignments.map(dto.toAssignment),
+    pagination: {
+      total,
+      limit: query.limit,
+      offset: query.offset,
+      hasMore: query.offset + assignments.length < total,
+      sort: query.sort,
+      order: query.order,
+    },
+  };
 }
 
 /** DELETE /companies/:companyId/specialists/:assignmentId — soft-remove one. */
@@ -511,6 +784,11 @@ async function removeSpecialist({ userId, requestId, companyId, assignmentId }) 
 
 module.exports = {
   onboardCompany,
+  listCompanies,
+  getCompany,
+  updateCompany,
+  deleteCompany,
+  listUsers,
   assignAccountingManager,
   assignSpecialists,
   getTeam,

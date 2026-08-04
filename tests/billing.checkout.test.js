@@ -205,13 +205,15 @@ describe('price option coverage', () => {
       });
 
     expect(res.status).toBe(201);
-    expect(res.body.data.pricing_summary.bookkeeping).toMatchObject({
-      price_id: priceId,
+    expect(res.body.data.pricingSummary.bookkeeping).toMatchObject({
       quantity: 1,
-      unit_amount: amount,
-      total_amount: amount,
+      unitAmountMinor: amount,
+      totalAmountMinor: amount,
+      // Stripe ids are grouped under one key that is present in full or absent
+      // in full, so a client can never come to depend on half of them.
+      stripe: { priceId },
     });
-    expect(res.body.data.pricing_summary.grand_total_amount).toBe(amount);
+    expect(res.body.data.pricingSummary.grandTotalAmountMinor).toBe(amount);
 
     const [args] = mockStripe.checkout.sessions.create.mock.calls[0];
     expect(args.line_items).toEqual([{ price: priceId, quantity: 1 }]);
@@ -234,7 +236,10 @@ describe('price option coverage', () => {
       });
 
     expect(res.status).toBe(201);
-    expect(res.body.data.pricing_summary.taxes).toMatchObject({ price_id: priceId, unit_amount: amount });
+    expect(res.body.data.pricingSummary.taxes).toMatchObject({
+      unitAmountMinor: amount,
+      stripe: { priceId },
+    });
   });
 });
 
@@ -255,14 +260,14 @@ describe('service combinations', () => {
       });
 
     expect(res.status).toBe(201);
-    const { payroll, grand_total_amount } = res.body.data.pricing_summary;
+    const { payroll, grandTotalAmountMinor } = res.body.data.pricingSummary;
 
     // 2900 + (12 x 1500) + (4 x 1000) = 2900 + 18000 + 4000 = 24900
-    expect(payroll.base).toMatchObject({ quantity: 1, unit_amount: 2900, total_amount: 2900 });
-    expect(payroll.employees).toMatchObject({ quantity: 12, unit_amount: 1500, total_amount: 18000 });
-    expect(payroll.contractors).toMatchObject({ quantity: 4, unit_amount: 1000, total_amount: 4000 });
-    expect(payroll.total_amount).toBe(24900);
-    expect(grand_total_amount).toBe(24900);
+    expect(payroll.base).toMatchObject({ quantity: 1, unitAmountMinor: 2900, totalAmountMinor: 2900 });
+    expect(payroll.employees).toMatchObject({ quantity: 12, unitAmountMinor: 1500, totalAmountMinor: 18000 });
+    expect(payroll.contractors).toMatchObject({ quantity: 4, unitAmountMinor: 1000, totalAmountMinor: 4000 });
+    expect(payroll.totalAmountMinor).toBe(24900);
+    expect(grandTotalAmountMinor).toBe(24900);
 
     const [args] = mockStripe.checkout.sessions.create.mock.calls[0];
     expect(args.line_items).toEqual([
@@ -287,10 +292,13 @@ describe('service combinations', () => {
     const [args] = mockStripe.checkout.sessions.create.mock.calls[0];
     expect(args.line_items.map((l) => l.price)).toEqual(['price_pay_base', 'price_pay_contractor']);
     // Still reported, as an explicit zero, so the client can render a stable table.
-    expect(res.body.data.pricing_summary.payroll.employees).toEqual({
+    expect(res.body.data.pricingSummary.payroll.employees).toEqual({
+      // The plan id is carried through even on a zeroed component, so the row
+      // stays identifiable when the client renders it.
+      optionId: 'payroll_standard',
       quantity: 0,
-      unit_amount: 0,
-      total_amount: 0,
+      unitAmountMinor: 0,
+      totalAmountMinor: 0,
     });
   });
 
@@ -340,7 +348,7 @@ describe('service combinations', () => {
       });
 
     expect(res.status).toBe(201);
-    expect(res.body.data.selected_services).toEqual(['bookkeeping', 'payroll', 'taxes']);
+    expect(res.body.data.selectedServices).toEqual(['bookkeeping', 'payroll', 'taxes']);
     expect(mockStripe.checkout.sessions.create).toHaveBeenCalledTimes(1);
 
     const [args] = mockStripe.checkout.sessions.create.mock.calls[0];
@@ -353,7 +361,7 @@ describe('service combinations', () => {
     ]);
 
     // 24900 (bookkeeping) + 24900 (payroll) + 23300 (tax)
-    expect(res.body.data.pricing_summary.grand_total_amount).toBe(73100);
+    expect(res.body.data.pricingSummary.grandTotalAmountMinor).toBe(73100);
   });
 
   it('rejects a request that selects nothing', async () => {
@@ -459,7 +467,7 @@ describe('client cannot supply pricing', () => {
     // Rejected outright rather than silently dropped, so a probe gets an answer
     // rather than a false sense that it worked.
     expect(res.status).toBe(400);
-    expect(res.body.error.details.unknown).toContain('user_id');
+    expect(res.body.error.details.unknown).toContain('userId');
   });
 
   it('rejects an unknown bookkeeping option id', async () => {
@@ -786,7 +794,7 @@ describe('duplicate requests', () => {
 
     expect(second.status).toBe(201);
     expect(second.headers['idempotent-replay']).toBe('true');
-    expect(second.body.data.checkout_session_id).toBe('cs_test_123');
+    expect(second.body.data.checkoutSessionId).toBe('cs_test_123');
     expect(mockStripe.checkout.sessions.create).not.toHaveBeenCalled();
   });
 
@@ -808,7 +816,7 @@ describe('duplicate requests', () => {
       .send(checkoutBody());
 
     expect(second.status).toBe(201);
-    expect(second.body.data.checkout_session_id).toBe('cs_test_456');
+    expect(second.body.data.checkoutSessionId).toBe('cs_test_456');
   });
 
   it('rejects an Idempotency-Key reused with a different selection', async () => {
@@ -816,7 +824,7 @@ describe('duplicate requests', () => {
       id: 1,
       requestHash: 'a-different-payload',
       responseStatus: 201,
-      responseBody: { data: { checkout_session_id: 'cs_old' } },
+      responseBody: { data: { checkoutSessionId: 'cs_old' } },
     });
 
     const res = await request(app)
@@ -951,9 +959,9 @@ describe('records written before redirect', () => {
     const res = await request(app).post('/api/billing/checkout').set('Authorization', auth()).send(checkoutBody());
 
     expect(res.status).toBe(201);
-    expect(res.body.data.pricing_summary.bookkeeping).not.toHaveProperty('price_id');
-    expect(res.body.data.pricing_summary.bookkeeping).not.toHaveProperty('product_id');
-    expect(res.body.data.pricing_summary.bookkeeping.unit_amount).toBe(24900);
+    expect(res.body.data.pricingSummary.bookkeeping).not.toHaveProperty('price_id');
+    expect(res.body.data.pricingSummary.bookkeeping).not.toHaveProperty('stripe');
+    expect(res.body.data.pricingSummary.bookkeeping.unitAmountMinor).toBe(24900);
   });
 });
 
@@ -972,13 +980,13 @@ describe('GET /billing/plans', () => {
     const res = await request(app).get('/api/billing/plans').set('Authorization', auth());
 
     expect(res.status).toBe(200);
-    expect(res.body.data.bookkeeping.map((p) => p.option_id)).toEqual([
+    expect(res.body.data.bookkeeping.map((p) => p.optionId)).toEqual([
       'bookkeeping_option_1',
       'bookkeeping_option_2',
       'bookkeeping_option_3',
       'bookkeeping_option_4',
     ]);
-    expect(res.body.data.taxes.map((p) => p.option_id)).toEqual([
+    expect(res.body.data.taxes.map((p) => p.optionId)).toEqual([
       'tax_option_1',
       'tax_option_2',
       'tax_option_3',
@@ -988,7 +996,7 @@ describe('GET /billing/plans', () => {
       'contractors',
       'employees',
     ]);
-    expect(res.body.data.payroll[0].components.employees.quantity_label).toBe('Number of W-2 Employees');
+    expect(res.body.data.payroll[0].components.employees.quantityLabel).toBe('Number of W-2 Employees');
   });
 
   it('requires authentication', async () => {

@@ -359,7 +359,15 @@ async function replayIfPossible({ userId, requestId, companyId, key, requestHash
     });
   }
 
-  const sessionId = existing.responseBody?.data?.checkout_session_id;
+  /*
+   * Read both spellings. The response DTO now emits `checkoutSessionId`, but
+   * idempotency records written by the previous version are still in the table
+   * with `checkout_session_id` — and failing to find the id there would silently
+   * turn a legitimate replay into a second Checkout Session for a customer who
+   * merely clicked twice.
+   */
+  const sessionId =
+    existing.responseBody?.data?.checkoutSessionId ?? existing.responseBody?.data?.checkout_session_id;
   if (!sessionId) return null;
 
   try {

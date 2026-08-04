@@ -402,7 +402,11 @@ describe('POST /api/auth/password-reset/confirm — set the new password', () =>
 
     // Sessions cut, in-flight login challenges killed, ticket consumed.
     expect(mockPrisma.refreshToken.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ data: { revokedAt: expect.any(Date) } })
+      expect.objectContaining({
+        // The reason is recorded alongside the timestamp so a revoked session can
+        // be told apart from one the user ended deliberately.
+        data: { revokedAt: expect.any(Date), revokedReason: 'password_reset' },
+      })
     );
     expect(mockPrisma.loginChallenge.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: { invalidatedAt: expect.any(Date) } })

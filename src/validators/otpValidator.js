@@ -1,47 +1,35 @@
 'use strict';
 
-const ApiError = require('../utils/ApiError');
+const common = require('./common');
 
 /**
- * Validation for POST /api/auth/otp, the single endpoint that handles both
- * OTP verification and OTP resend. Strict: unknown fields are rejected, and the
+ * Validation for POST /auth/otp, the single endpoint that handles both OTP
+ * verification and OTP resend. Strict: unknown fields are rejected, and the
  * allowed fields depend on the action (an OTP may only accompany `verify`).
  */
 
 const ACTIONS = ['verify', 'resend'];
-// crypto.randomUUID() output; matched case-insensitively.
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Exactly six digits. Validated as a string so a leading zero survives; the OTP
 // is never parsed as a number, which would drop it.
 const OTP_PATTERN = /^[0-9]{6}$/;
-
-function validateAction(value, fields) {
-  if (typeof value !== 'string' || !ACTIONS.includes(value)) {
-    fields.action = 'action must be either "verify" or "resend".';
-    return null;
-  }
-  return value;
-}
-
-function validateChallengeId(value, fields) {
-  if (typeof value !== 'string' || !UUID_PATTERN.test(value)) {
-    fields.challengeId = 'A valid challengeId is required.';
-    return null;
-  }
-  return value;
-}
 
 /**
  * Validate an OTP request body. Returns { action, challengeId, otp? }. Throws a
  * 400 VALIDATION_ERROR with per-field messages; the submitted OTP is never
  * echoed back in an error.
  */
-function validateOtpRequest(body) {
+function validateOtpRequest(body = {}) {
   const fields = {};
   const input = body && typeof body === 'object' ? body : {};
 
-  const action = validateAction(input.action, fields);
-  const challengeId = validateChallengeId(input.challengeId, fields);
+  const action = typeof input.action === 'string' && ACTIONS.includes(input.action) ? input.action : null;
+  if (!action) {
+    fields.action = 'action must be either "verify" or "resend".';
+  }
+
+  if (typeof input.challengeId !== 'string' || !common.UUID_PATTERN.test(input.challengeId)) {
+    fields.challengeId = 'A valid challengeId is required.';
+  }
 
   // Only the fields relevant to the resolved action are permitted. Anything else
   // — a stray `otp` on a resend, an `email` trying to redirect delivery, a typo'd
@@ -63,14 +51,11 @@ function validateOtpRequest(body) {
     }
   }
 
-  if (Object.keys(fields).length) {
-    throw new ApiError(400, 'The submitted information is invalid.', {
-      code: 'VALIDATION_ERROR',
-      fields,
-    });
-  }
+  if (Object.keys(fields).length) common.fail(fields);
 
-  return action === 'verify' ? { action, challengeId, otp } : { action, challengeId };
+  return action === 'verify'
+    ? { action, challengeId: input.challengeId, otp }
+    : { action, challengeId: input.challengeId };
 }
 
-module.exports = { validateOtpRequest };
+module.exports = { validateOtpRequest, OTP_PATTERN, ACTIONS };
