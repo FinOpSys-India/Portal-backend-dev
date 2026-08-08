@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('path');
+
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -29,13 +31,15 @@ function durationToSeconds(value) {
  * jsonwebtoken would reject at signing time.
  */
 /*
- * 15 minutes. The previous default was '615m' — over ten hours — which was not a
- * short-lived token by any reading, and left a leaked one useful for most of a
- * working day. It was only survivable because there was no refresh endpoint;
- * now that /auth/refresh exists, the access token can be as short as it should
- * always have been and the refresh token carries the session.
+ * 8 hours — one working day, so a signed-in user is not asked to re-authenticate
+ * partway through a shift. This is a deliberate trade: an access token is
+ * stateless and cannot be revoked before it expires, so a leaked one stays
+ * useful for the whole window. What bounds the damage is /auth/refresh (rotated,
+ * revocable, hashed at rest) and the freshness check in requireAuth, which
+ * rejects any token predating the last password change. Shorten this to '15m'
+ * via ACCESS_TOKEN_TTL for a deployment that wants the tighter posture.
  */
-const DEFAULT_ACCESS_TOKEN_TTL = '15m';
+const DEFAULT_ACCESS_TOKEN_TTL = '8h';
 
 function resolveAccessTokenTtl(raw) {
   const ttl = String(raw ?? '').trim() || DEFAULT_ACCESS_TOKEN_TTL;
@@ -225,6 +229,104 @@ const config = {
       `${process.env.FRONTEND_URL || 'http://localhost:5173'}/billing`,
     // Page size cap for payment history.
     maxPageSize: parseInt(process.env.BILLING_MAX_PAGE_SIZE, 10) || 100,
+    /*
+     * The background reconcile sweep — the safety net under a lost webhook.
+     *
+     * Every path that writes a subscription's Stripe ids depends on something
+     * outside this process staying up: the webhook needs a listener to be
+     * running, and the self-heal in getCheckoutStatus needs the browser to come
+     * back to the success page. Miss both — a dev machine with no `stripe
+     * listen`, a customer who closed the tab — and a PAID subscription sits at
+     * INCOMPLETE forever, because Stripe stops retrying and nothing else ever
+     * asks.
+     *
+     * This sweep is the thing that always asks. It re-runs the same
+     * reconcileFromCheckoutSession the success page would have triggered, so
+     * there is one definition of repair rather than two.
+     */
+    reconcileSweep: {
+      // Off under test: it would spawn a timer and hit the Stripe API.
+      enabled: process.env.BILLING_RECONCILE_SWEEP_ENABLED
+        ? process.env.BILLING_RECONCILE_SWEEP_ENABLED === 'true'
+        : process.env.NODE_ENV !== 'test',
+      intervalSeconds: parseInt(process.env.BILLING_RECONCILE_SWEEP_INTERVAL_SECONDS, 10) || 300,
+      /*
+       * Only sessions younger than this are considered. A Checkout Session
+       * expires after 24h, so an older INCOMPLETE row is an abandoned checkout —
+       * a normal, permanent state — and re-reading it from Stripe every five
+       * minutes forever would be pure API burn.
+       */
+      lookbackHours: parseInt(process.env.BILLING_RECONCILE_SWEEP_LOOKBACK_HOURS, 10) || 48,
+      // Bound on one pass, so a backlog cannot turn into a burst of API calls.
+      batchSize: parseInt(process.env.BILLING_RECONCILE_SWEEP_BATCH_SIZE, 10) || 25,
+    },
+  },
+  /*
+   * Uploaded files — today just profile pictures.
+   *
+   * The database stores a KEY ("avatars/18/9f3c2a.jpg"); everything needed to
+   * turn that into bytes on disk and into a URL a browser can fetch lives here,
+   * so the two are defined once and cannot drift.
+   *
+   * `dir` is deliberately outside `src/`: nodemon watches the source tree, and
+   * writing an upload into it would restart the server on every avatar change.
+   * It is served read-only by express.static at `publicPath` (see app.js).
+   *
+   * MOVING TO S3/R2 LATER is a change to this block plus the two fs calls in
+   * userService — the stored keys stay valid, because a key is not a URL.
+   */
+  uploads: {
+    dir: process.env.UPLOAD_DIR || path.join(__dirname, '..', '..', 'uploads'),
+    // Mount path of the static file server. Must not collide with apiPrefix.
+    publicPath: process.env.UPLOAD_PUBLIC_PATH || '/uploads',
+    /*
+     * Origin prepended to publicPath when building `avatarUrl`. Absolute rather
+     * than relative because the frontend runs on a different origin (5173) than
+     * this API, so a bare "/uploads/..." would resolve against the wrong host.
+     */
+    publicBaseUrl:
+      process.env.UPLOAD_PUBLIC_BASE_URL ||
+      `http://localhost:${parseInt(process.env.PORT, 10) || 3000}`,
+    // 2 MB. An avatar is displayed at ~256px; anything larger is a phone camera
+    // original that will be downscaled to nothing in the browser anyway. Enforced
+    // by multer, which aborts the stream at the limit rather than buffering it.
+    maxAvatarBytes: parseInt(process.env.UPLOAD_MAX_AVATAR_BYTES, 10) || 2 * 1024 * 1024,
+    // How long a browser may cache an avatar. Long is safe: every upload gets a
+    // new random filename, so a changed picture is a changed URL.
+    cacheMaxAgeSeconds: parseInt(process.env.UPLOAD_CACHE_MAX_AGE_SECONDS, 10) || 86400,
+
+    /*
+     * Project documents live in a DIFFERENT root, and that is the single most
+     * important line in this block.
+     *
+     * `dir` above is handed to express.static and served to anyone who knows the
+     * URL — deliberately, because an <img src> cannot send an Authorization
+     * header (see app.js). A project document is a company's bank statement or
+     * payroll register. Writing one under `dir` would publish it, and no amount
+     * of care in the service layer would undo that: the static handler runs
+     * before the router and never sees a token.
+     *
+     * So documents get their own tree, nothing serves it statically, and the
+     * only way to read a byte out of it is GET
+     * /projects/:projectId/documents/:documentId/download — which authorizes
+     * the caller against the project's company first.
+     */
+    documentsDir:
+      process.env.UPLOAD_DOCUMENTS_DIR || path.join(__dirname, '..', '..', 'private-uploads'),
+    /*
+     * 25 MB per file. A scanned year of bank statements is the realistic upper
+     * end of what this feature carries; anything larger is a video or a mistake.
+     * Enforced by multer, which aborts the stream at the limit rather than
+     * letting the whole file land first.
+     */
+    maxDocumentBytes: parseInt(process.env.UPLOAD_MAX_DOCUMENT_BYTES, 10) || 25 * 1024 * 1024,
+    /*
+     * Files accepted in ONE request. A cap is needed because the per-file limit
+     * says nothing about the total: without this, one request could carry a
+     * thousand 25 MB files. Ten matches what a person drags onto a form in one
+     * go; more than that is several requests, which the rate limiter then sees.
+     */
+    maxDocumentsPerRequest: parseInt(process.env.UPLOAD_MAX_DOCUMENTS_PER_REQUEST, 10) || 10,
   },
   db: {
     // When set (e.g. Supabase/Neon), the connection string takes precedence

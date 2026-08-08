@@ -106,6 +106,12 @@ model User {
   phone    String? @map("phone") @db.VarChar(30)
   jobTitle String? @map("job_title") @db.VarChar(150)
 
+  /// Storage key of the profile picture ("avatars/18/9f3c2a.jpg"), never a URL —
+  /// see db/schema/15_add_user_avatar.sql. The client-facing `avatarUrl` is built
+  /// from it in dto/userDto; this value stays internal so the host, the mount
+  /// path, and one day the CDN can all change without touching stored data.
+  avatarKey String? @map("avatar_key") @db.VarChar(512)
+
   // Login-security fields. failedLoginAttempts/lockedUntil back the password
   // attempt limiter; the last_login_* columns are written only after a fully
   // completed (password + OTP) login. The IP is stored as a keyed hash, never
@@ -144,6 +150,25 @@ model User {
   ownedCompanies        Company[]                     @relation("CompanyOwner")
   managedCompanies      Company[]                     @relation("CompanyAccountingManager")
   specialistAssignments CompanySpecialistAssignment[] @relation("AssignmentSpecialist")
+
+  // The companies this user is the standing specialist for, per service line.
+  bookkeepingCompanies Company[] @relation("CompanyBookkeepingSpecialist")
+  payrollCompanies     Company[] @relation("CompanyPayrollSpecialist")
+  taxCompanies         Company[] @relation("CompanyTaxSpecialist")
+
+  // The companies this user is a TEAMMATE on, as opposed to ownedCompanies
+  // above. A CUSTOMER/TEAM user reaches a company only through here.
+  companyMemberships CompanyMember[] @relation("CompanyMemberUser")
+
+  // Projects. `createdProjects` are the ones this user opened (an accounting
+  // manager or a customer); `assignedProjects` are the ones auto-staffed to them
+  // as the company's standing specialist for that service line. Two relations
+  // because the two roles are independent — the creator is never the specialist.
+  createdProjects  Project[] @relation("ProjectCreatedBy")
+  assignedProjects Project[] @relation("ProjectSpecialist")
+
+  uploadedProjectDocuments ProjectDocument[] @relation("ProjectDocumentUploader")
+
   idempotencyKeys       IdempotencyKey[]
 
   @@map("users")
@@ -229,6 +254,17 @@ model Invitation {
   /// re-sending it.
   tokenHash      String           @unique @map("token_hash") @db.VarChar(64)
 
+  /// The job title from the invite form, carried through to `users.job_title` at
+  /// sign-up so the invitee never re-enters it. Nullable: invitations predating
+  /// db/schema/16 have none.
+  jobTitle       String?          @map("job_title") @db.VarChar(150)
+
+  /// SUPERSEDED by the `companies` relation below, and mapped only so this model
+  /// still describes the table truthfully. The teammate form targets SEVERAL
+  /// companies at once, which one column cannot hold; nothing writes this any
+  /// more, and db/schema/16 backfilled its values into invitation_companies.
+  companyId      Int?             @map("company_id")
+
   status         InvitationStatus @default(PENDING)
   expiresAt      DateTime         @map("expires_at") @db.Timestamptz(6)
   acceptedUserId Int?             @map("accepted_user_id")
@@ -241,8 +277,55 @@ model Invitation {
   // Composite FK: same guarantee as on User.
   specificRole SpecificRole? @relation(fields: [specificRoleId, roleId], references: [id, roleId])
 
+  /// The companies this invitation is for — a set, because the teammate form
+  /// lets an owner pick several at once.
+  companies InvitationCompany[]
+
   @@index([email])
   @@map("invitations")
+}
+
+/// One company an invitation is for — the INTENT, before the invitee accepts.
+///
+/// Its counterpart is CompanyMember, the FACT after they accept. Sign-up copies
+/// one into the other (services/authService.signup); keeping the two apart is
+/// what stops a pending invitation from reading as membership.
+model InvitationCompany {
+  invitationId Int      @map("invitation_id")
+  companyId    Int      @map("company_id")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  invitation Invitation @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@id([invitationId, companyId])
+  @@index([companyId])
+  @@map("invitation_companies")
+}
+
+/// A teammate on a company: the customer-side membership link.
+///
+/// The table has existed in the database all along but was absent from this
+/// schema, so no code could reach it — which is why several comments elsewhere
+/// still say a CUSTOMER/TEAM user has no company link. It does; this is it.
+///
+/// Distinct from `companies.owner_user_id`, which is OWNERSHIP: exactly one
+/// user, with write access to the company itself. A member is one of many and
+/// holds no such rights — this only says they belong to the account.
+model CompanyMember {
+  id        Int      @id @default(autoincrement())
+  companyId Int      @map("company_id")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company Company @relation(fields: [companyId], references: [id])
+  user    User    @relation("CompanyMemberUser", fields: [userId], references: [id])
+
+  // One membership per (company, user) — what makes re-accepting or re-inviting
+  // idempotent instead of listing a person twice on the roster.
+  @@unique([companyId, userId])
+  @@index([userId])
+  @@map("company_members")
 }
 
 /// A short-lived, single-use email-OTP challenge. Two flows use it, told apart
@@ -416,6 +499,20 @@ model Company {
   revenueCurrency         String        @map("revenue_currency") @db.Char(3)
   ownerUserId             Int           @map("owner_user_id")
   accountingManagerUserId Int?          @map("accounting_manager_user_id")
+
+  /// The company's standing specialist for each of the three service lines.
+  ///
+  /// Separate nullable columns rather than rows in
+  /// company_specialist_assignments because they answer a different question:
+  /// this is "who is the ONE bookkeeping/payroll/tax specialist on this account
+  /// right now", which the admin grid renders as three columns. The assignment
+  /// table remains the record of specialist WORK — many per company, keyed by
+  /// specialization, with an unassigned_at history — and neither replaces the
+  /// other.
+  bookkeepingSpecialistUserId Int? @map("bookkeeping_specialist_user_id")
+  payrollSpecialistUserId     Int? @map("payroll_specialist_user_id")
+  taxSpecialistUserId         Int? @map("tax_specialist_user_id")
+
   status                  CompanyStatus @default(ONBOARDING)
   onboardingCompleted     Boolean       @default(false) @map("onboarding_completed")
 
@@ -435,10 +532,23 @@ model Company {
   // so removing the manager's user account just clears the link.
   accountingManager User? @relation("CompanyAccountingManager", fields: [accountingManagerUserId], references: [id], onDelete: SetNull)
 
+  // Same shape as the manager link: one optional user per service line, cleared
+  // rather than blocked when that user's account goes away.
+  bookkeepingSpecialist User? @relation("CompanyBookkeepingSpecialist", fields: [bookkeepingSpecialistUserId], references: [id], onDelete: SetNull)
+  payrollSpecialist     User? @relation("CompanyPayrollSpecialist", fields: [payrollSpecialistUserId], references: [id], onDelete: SetNull)
+  taxSpecialist         User? @relation("CompanyTaxSpecialist", fields: [taxSpecialistUserId], references: [id], onDelete: SetNull)
+
   addresses             CompanyAddress[]
   specialistAssignments CompanySpecialistAssignment[]
   subscriptions         CompanySubscription[]
   payments              CompanyPayment[]
+
+  // The customer-side roster: teammates who belong to this account but do not
+  // own it, and the invitations still outstanding for it.
+  members               CompanyMember[]
+  pendingInvitations    InvitationCompany[]
+
+  projects              Project[]
 
   @@index([ownerUserId])
   @@index([accountingManagerUserId])
@@ -595,6 +705,7 @@ model ServicePlan {
   specialization Specialization? @relation(fields: [specializationId], references: [id], onDelete: Restrict)
 
   subscriptionItems CompanySubscriptionItem[]
+  projects          Project[]
 
   @@index([specializationId])
   @@index([stripeProductId])
@@ -818,4 +929,127 @@ enum AssignmentStatus {
   INACTIVE
 
   @@map("assignment_status")
+}
+
+/// A unit of work opened against one company, for one purchased service, with a
+/// deadline. Created only by an ACCOUNTING_MANAGER or a CUSTOMER — that rule is
+/// enforced in the service layer, where the role is already loaded from the
+/// verified token; a database CHECK cannot reach users.role_id.
+model Project {
+  id           Int      @id @default(autoincrement())
+  companyId    Int      @map("company_id")
+  projectName  String   @map("project_name") @db.VarChar(255)
+
+  /// A DATE, not a timestamp. A deadline is the calendar day the user picked;
+  /// storing a time zone would make "31 Dec" entered in IST render as 30 Dec to
+  /// a viewer in New York — a wrong answer to the question being asked.
+  deadlineDate DateTime @map("deadline_date") @db.Date
+
+  /// Which service this project is for. The form offers only the plans the
+  /// company actually bought (see repositories — the read joins
+  /// company_subscription_items), so a project cannot exist for a service
+  /// nobody is paying for.
+  servicePlanId Int     @map("service_plan_id")
+
+  /// Auto-assigned at insert from the company's standing specialist for this
+  /// plan's specialization — bookkeeping plan reads
+  /// companies.bookkeeping_specialist_user_id, and so on.
+  ///
+  /// Nullable on purpose: a company can be unstaffed on that line, and FA_Q has
+  /// no specialist column at all (see config/serviceCatalog). Refusing the
+  /// project would block real work; NULL is a truthful "unstaffed" an admin
+  /// screen can surface and fill in.
+  ///
+  /// STORED rather than derived on read: reassigning the company's specialist
+  /// next quarter must not rewrite who owned a project that closed last
+  /// quarter. Same reasoning as CompanySubscriptionItem.unitAmount.
+  assignedSpecialistUserId Int? @map("assigned_specialist_user_id")
+
+  createdByUserId Int           @map("created_by_user_id")
+  status          ProjectStatus @default(TODO)
+  description     String?
+
+  /// How far along the work is, 0–100, as the progress bar renders it.
+  ///
+  /// NUMERIC(5,2) rather than an integer, so half a percent is expressible; a
+  /// CHECK constraint in the database pins it to the 0–100 range, which Prisma
+  /// cannot state in-schema. NOT NULL with a default of 0 — a project that has
+  /// not started is at zero, which is a fact, not a missing value.
+  ///
+  /// Deliberately INDEPENDENT of `status`. The two answer different questions
+  /// ("what phase is this in" versus "how much of it is done") and a derived
+  /// percentage could only ever report the three values the enum has. Nothing
+  /// forces them to agree, so a project can sit at ACTIVE / 90 without a rule
+  /// having to be invented for it.
+  progressBar Decimal @default(0) @map("progress_bar") @db.Decimal(5, 2)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft delete, matching Company. A project referenced by documents should
+  /// leave the lists without vanishing from history.
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  // RESTRICT on company and plan: neither may be hard-deleted out from under a
+  // project's history. Companies are soft-deleted anyway, so this only blocks
+  // a true DELETE.
+  company     Company     @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  servicePlan ServicePlan @relation(fields: [servicePlanId], references: [id], onDelete: Restrict)
+
+  // SetNull: removing a staff account clears the assignment rather than
+  // blocking the delete or taking the project with it.
+  assignedSpecialist User? @relation("ProjectSpecialist", fields: [assignedSpecialistUserId], references: [id], onDelete: SetNull)
+  createdBy          User  @relation("ProjectCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  documents ProjectDocument[]
+
+  @@index([companyId])
+  @@index([assignedSpecialistUserId])
+  @@index([createdByUserId])
+  @@index([servicePlanId])
+  @@index([status, deadlineDate])
+  @@map("projects")
+}
+
+/// One file attached to a project. A table rather than an array column on
+/// Project: each file carries its own metadata (who uploaded it, when, how big,
+/// what type) and the set is unbounded.
+///
+/// The column split follows what middlewares/uploadAvatar already writes — a
+/// GENERATED storage key we control, plus the client's filename kept for display
+/// only. `originalName` is echoed back in the list and used as the
+/// Content-Disposition name on download; it is never joined to a filesystem
+/// path, because it is attacker-controlled.
+model ProjectDocument {
+  id           Int    @id @default(autoincrement())
+  projectId    Int    @map("project_id")
+  /// The path we generated, e.g. "projects/42/9f3c…b1.pdf". Unique, so a
+  /// retried upload cannot register the same bytes twice.
+  fileKey      String @unique @map("file_key") @db.VarChar(512)
+  originalName String @map("original_name") @db.VarChar(255)
+  mimeType     String @map("mime_type") @db.VarChar(150)
+  sizeBytes    BigInt @map("size_bytes")
+
+  uploadedByUserId Int? @map("uploaded_by_user_id")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  // CASCADE: a document means nothing without its project. Ordinary removal is
+  // the soft delete above, which leaves these rows alone.
+  project    Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  // SetNull: deleting a staff account loses the attribution, not the file.
+  uploadedBy User?   @relation("ProjectDocumentUploader", fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+  @@index([uploadedByUserId])
+  @@map("project_documents")
+}
+
+enum ProjectStatus {
+  TODO
+  ACTIVE
+  COMPLETED
+
+  @@map("project_status")
 }

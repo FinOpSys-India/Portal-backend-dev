@@ -38,6 +38,10 @@ function auth({ userId = OWNER_ID, role = 'CUSTOMER', specificRole = 'OWNER' } =
   return `Bearer ${signAccessToken({ userId, email: 'u@finopsys.ai', role, specificRole })}`;
 }
 
+function managerAuth() {
+  return auth({ userId: MANAGER_ID, role: 'ACCOUNTING_MANAGER', specificRole: null });
+}
+
 function person(id, first, last, role, specificRole = null) {
   return { id, firstName: first, lastName: last, status: 'ACTIVE', role: { code: role }, specificRole: specificRole ? { code: specificRole } : null };
 }
@@ -189,12 +193,18 @@ describe('POST /companies/:id/specialists', () => {
     { id: 2, specializationCode: 'PAYROLL', specializationName: 'Payroll', isActive: true },
   ];
 
+  /*
+   * Staffing specialists belongs to the company's OWN accounting manager — not
+   * the owner, not an admin — so the caller here is MANAGER_ID and the company
+   * names them as its manager.
+   */
   function stageSpecialistOk() {
     stageUsers({
+      [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER'),
       [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER'),
       [SPECIALIST_ID]: person(SPECIALIST_ID, 'Jane', 'Doe', 'SPECIALIST'),
     });
-    mockPrisma.company.findFirst.mockResolvedValue(company());
+    mockPrisma.company.findFirst.mockResolvedValue(company({ accountingManagerUserId: MANAGER_ID }));
     mockPrisma.specialization.findMany.mockResolvedValue(specs);
     mockPrisma.companySpecialistAssignment.create.mockImplementation(({ data }) =>
       Promise.resolve({
@@ -216,7 +226,7 @@ describe('POST /companies/:id/specialists', () => {
 
     const res = await request(app)
       .post(`/api/companies/${COMPANY_ID}/specialists`)
-      .set('Authorization', auth())
+      .set('Authorization', managerAuth())
       .send({ specialist_user_id: SPECIALIST_ID, specialization_codes: ['BOOKKEEPING', 'PAYROLL'] });
 
     expect(res.status).toBe(201);
@@ -235,7 +245,7 @@ describe('POST /companies/:id/specialists', () => {
 
     const res = await request(app)
       .post(`/api/companies/${COMPANY_ID}/specialists`)
-      .set('Authorization', auth())
+      .set('Authorization', managerAuth())
       .send({ specialist_user_id: SPECIALIST_ID, specialization_codes: ['BOOKKEEPING', 'PAYROLL'] });
 
     expect(res.status).toBe(201);
@@ -251,7 +261,7 @@ describe('POST /companies/:id/specialists', () => {
 
     const res = await request(app)
       .post(`/api/companies/${COMPANY_ID}/specialists`)
-      .set('Authorization', auth())
+      .set('Authorization', managerAuth())
       .send({ specialist_user_id: SPECIALIST_ID, specialization_codes: ['BOOKKEEPING', 'NOPE'] });
 
     expect(res.status).toBe(400);
@@ -262,14 +272,14 @@ describe('POST /companies/:id/specialists', () => {
 
   it('rejects a user without the SPECIALIST role (422)', async () => {
     stageUsers({
-      [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER'),
+      [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER'),
       [SPECIALIST_ID]: person(SPECIALIST_ID, 'Jane', 'Doe', 'CUSTOMER', 'TEAM'),
     });
-    mockPrisma.company.findFirst.mockResolvedValue(company());
+    mockPrisma.company.findFirst.mockResolvedValue(company({ accountingManagerUserId: MANAGER_ID }));
 
     const res = await request(app)
       .post(`/api/companies/${COMPANY_ID}/specialists`)
-      .set('Authorization', auth())
+      .set('Authorization', managerAuth())
       .send({ specialist_user_id: SPECIALIST_ID, specialization_codes: ['BOOKKEEPING'] });
 
     expect(res.status).toBe(422);
@@ -277,9 +287,12 @@ describe('POST /companies/:id/specialists', () => {
   });
 
   it('rejects an empty specialization_codes array (400)', async () => {
+    // Rejected by the validator before any query, but requireAuth still looks
+    // the caller up.
+    stageUsers({ [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER') });
     const res = await request(app)
       .post(`/api/companies/${COMPANY_ID}/specialists`)
-      .set('Authorization', auth())
+      .set('Authorization', managerAuth())
       .send({ specialist_user_id: SPECIALIST_ID, specialization_codes: [] });
     expect(res.status).toBe(400);
     expect(res.body.error.fields.specializationCodes).toBeDefined();
@@ -334,8 +347,8 @@ describe('GET /companies/:id/team', () => {
 
 describe('DELETE /companies/:id/specialists/:assignmentId', () => {
   it('soft-removes an active assignment (200)', async () => {
-    stageUsers({ [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER') });
-    mockPrisma.company.findFirst.mockResolvedValue(company());
+    stageUsers({ [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER') });
+    mockPrisma.company.findFirst.mockResolvedValue(company({ accountingManagerUserId: MANAGER_ID }));
     mockPrisma.companySpecialistAssignment.findFirst.mockResolvedValue({
       id: 44, companyId: COMPANY_ID, specialistUserId: SPECIALIST_ID, specializationId: 1, assignmentStatus: 'ACTIVE',
     });
@@ -345,7 +358,7 @@ describe('DELETE /companies/:id/specialists/:assignmentId', () => {
       specialist: { id: SPECIALIST_ID, firstName: 'Jane', lastName: 'Doe' }, specialization: { specializationCode: 'BOOKKEEPING' },
     });
 
-    const res = await request(app).delete(`/api/companies/${COMPANY_ID}/specialists/44`).set('Authorization', auth());
+    const res = await request(app).delete(`/api/companies/${COMPANY_ID}/specialists/44`).set('Authorization', managerAuth());
 
     expect(res.status).toBe(200);
     expect(res.body.data.assignment.assignmentStatus).toBe('INACTIVE');
@@ -355,11 +368,11 @@ describe('DELETE /companies/:id/specialists/:assignmentId', () => {
   });
 
   it('returns 404 for an assignment not on this company', async () => {
-    stageUsers({ [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER') });
-    mockPrisma.company.findFirst.mockResolvedValue(company());
+    stageUsers({ [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER') });
+    mockPrisma.company.findFirst.mockResolvedValue(company({ accountingManagerUserId: MANAGER_ID }));
     mockPrisma.companySpecialistAssignment.findFirst.mockResolvedValue(null);
 
-    const res = await request(app).delete(`/api/companies/${COMPANY_ID}/specialists/44`).set('Authorization', auth());
+    const res = await request(app).delete(`/api/companies/${COMPANY_ID}/specialists/44`).set('Authorization', managerAuth());
 
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe('ASSIGNMENT_NOT_FOUND');

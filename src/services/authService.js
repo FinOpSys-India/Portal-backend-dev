@@ -16,6 +16,7 @@ const {
   maskEmail,
 } = require('../utils/otp');
 const { sendOtpEmail } = require('./emailService');
+const adminEvents = require('./adminEventService');
 
 const LOGIN_PURPOSE = 'LOGIN_EMAIL_OTP';
 
@@ -95,10 +96,15 @@ async function signup({ invitationToken, email, firstName, lastName, password })
       email: true,
       roleId: true,
       specificRoleId: true,
+      jobTitle: true,
       status: true,
       expiresAt: true,
       role: { select: { code: true } },
       specificRole: { select: { code: true } },
+      // The companies this invitation was for. They become memberships below —
+      // this is the step that turns the invite's INTENT into the fact the
+      // teammate list reads.
+      companies: { select: { companyId: true } },
     },
   });
 
@@ -136,7 +142,7 @@ async function signup({ invitationToken, email, firstName, lastName, password })
     }
 
     // Email comes from the invitation (immutable); names come from the request.
-    // Role and specific role are inherited from the invitation.
+    // Role, specific role and job title are inherited from the invitation.
     const created = await tx.user.create({
       data: {
         email: invitation.email,
@@ -145,10 +151,33 @@ async function signup({ invitationToken, email, firstName, lastName, password })
         passwordHash,
         roleId: invitation.roleId,
         specificRoleId: invitation.specificRoleId,
+        // Carried across so a teammate never re-types what the inviter already
+        // entered on the form. Null for invitations that named none.
+        jobTitle: invitation.jobTitle ?? null,
         status: 'ACTIVE',
       },
       select: USER_PUBLIC_FIELDS,
     });
+
+    /*
+     * Attach the new account to every company the invitation named.
+     *
+     * Inside the same transaction as the user and the invitation state change,
+     * on purpose: a teammate who exists but is on no company is invisible to the
+     * screen that invited them, and there would be nothing in the row to say the
+     * membership step had been skipped. Either all three commit or none do.
+     *
+     * skipDuplicates because (company_id, user_id) is unique and the desired end
+     * state is "this person is a member" — a row that already says so is not an
+     * error worth failing a sign-up over.
+     */
+    const companyIds = (invitation.companies ?? []).map((link) => link.companyId);
+    if (companyIds.length) {
+      await tx.companyMember.createMany({
+        data: companyIds.map((companyId) => ({ companyId, userId: created.id })),
+        skipDuplicates: true,
+      });
+    }
 
     // Link the invitation to the account it created, completing the record.
     await tx.invitation.update({
@@ -169,6 +198,22 @@ async function signup({ invitationToken, email, firstName, lastName, password })
   });
 
   logger.info(`User ${user.id} signed up from invitation ${invitation.id}.`);
+
+  /*
+   * An accepted invitation is how a new ACTIVE user first appears, so it is also
+   * how a new assignable accounting manager first appears. Announced after the
+   * transaction has committed, so an admin with the management screen open can
+   * assign the person who has just finished signing up without reloading.
+   *
+   * The role comes from the invitation the row was created from — the same value
+   * that was written to `role_id` — because the create() above selects ids, not
+   * joined role codes.
+   */
+  adminEvents.userChanged({
+    ...user,
+    role: { code: invitation.role.code },
+    specificRole: invitation.specificRole ? { code: invitation.specificRole.code } : null,
+  });
 
   const accessToken = signAccessToken({
     userId: user.id,

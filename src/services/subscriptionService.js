@@ -11,6 +11,7 @@ const money = require('../utils/money');
 const repo = require('../repositories/billingRepository');
 const { authorizeCompany } = require('./billingAccess');
 const planCatalog = require('./planCatalogService');
+const adminEvents = require('./adminEventService');
 const dto = require('../dto/billingDto');
 
 /**
@@ -266,6 +267,17 @@ async function updatePayrollCounts({ userId, requestId, companyId, employeeCount
   });
 
   const refreshed = await repo.findCurrentSubscriptionForCompany(prisma, companyId);
+
+  // Payroll head counts are a column on the admin table. Broadcast only when
+  // something actually moved — a no-op PATCH is not a change to announce.
+  if (applied.length) {
+    adminEvents.companyServicesChanged({
+      companyId,
+      subscriptionId: subscription.id,
+      status: refreshed?.status ?? subscription.status,
+    });
+  }
+
   return {
     changed: applied.length > 0,
     changes: applied,
@@ -409,6 +421,15 @@ async function addServices({ userId, requestId, companyId, selections, selectedS
   });
 
   const refreshed = await repo.findCurrentSubscriptionForCompany(prisma, companyId);
+
+  // A service was added: the company's Active Services cell is now wrong on
+  // every open admin screen.
+  adminEvents.companyServicesChanged({
+    companyId,
+    subscriptionId: subscription.id,
+    status: refreshed?.status ?? subscription.status,
+  });
+
   return {
     added,
     pricingSummary: dto.toPricingSummary({
@@ -488,6 +509,13 @@ async function cancelSubscription({ userId, requestId, companyId, atPeriodEnd })
   });
 
   const refreshed = await repo.findCurrentSubscriptionForCompany(prisma, companyId);
+
+  adminEvents.companyServicesChanged({
+    companyId,
+    subscriptionId: subscription.id,
+    status: refreshed?.status ?? subscription.status,
+  });
+
   return {
     alreadyScheduled: false,
     immediate: !atPeriodEnd,

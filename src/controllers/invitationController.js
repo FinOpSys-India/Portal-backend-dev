@@ -3,6 +3,7 @@
 const asyncHandler = require('../middlewares/asyncHandler');
 const {
   validateCreateInvitation,
+  validateCreateTeammateInvitation,
   validateInvitationListQuery,
 } = require('../validators/invitationValidator');
 const { parseId } = require('../validators/common');
@@ -40,6 +41,31 @@ const createInvitation = asyncHandler(async (req, res) => {
     // dropped it — and it is the only way to tell that a 201 did not actually
     // reach the invitee.
     data: { invitation: dto.toInvitation(invitation), emailSent },
+  });
+});
+
+/**
+ * POST /invitations/teammates
+ *
+ * The owner's "add a teammate" form: one invitation covering one or more of the
+ * caller's companies, carrying a job title. The companies are authorised against
+ * the caller in the service — never trusted from the body.
+ */
+const createTeammateInvitation = asyncHandler(async (req, res) => {
+  const input = validateCreateTeammateInvitation(req.body);
+
+  const { invitation, emailSent, statusCode } = await invitationService.createTeammateInvitation({
+    inviterUserId: req.user.id,
+    requestId: req.id,
+    input,
+  });
+
+  return res.status(statusCode).json({
+    success: true,
+    message: emailSent
+      ? 'Teammate invited and email sent successfully.'
+      : 'Teammate invited, but the email could not be sent. Use resend to try again.',
+    data: { invitation: dto.toTeammateInvitation(invitation), emailSent },
   });
 });
 
@@ -109,4 +135,10 @@ const resendInvitation = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { createInvitation, listInvitations, revokeInvitation, resendInvitation };
+module.exports = {
+  createInvitation,
+  createTeammateInvitation,
+  listInvitations,
+  revokeInvitation,
+  resendInvitation,
+};

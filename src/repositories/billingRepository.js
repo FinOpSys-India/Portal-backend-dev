@@ -90,6 +90,35 @@ async function findCurrentSubscriptionForCompany(client, companyId) {
   });
 }
 
+/**
+ * Subscriptions that look like a webhook never landed.
+ *
+ * The three symptoms are the ones needsReconcile() checks in checkoutService,
+ * kept in the same order: status stuck at INCOMPLETE, no Stripe subscription
+ * linked, or a billed line with no Stripe item id (which happens on its own when
+ * checkout.session.completed arrives after the events that stamp the high-water
+ * mark, and quietly breaks every later head-count change).
+ *
+ * A row with no checkout session id is excluded outright — there is nothing to
+ * reconcile FROM. `createdAt` bounds the scan to sessions that could still be
+ * live; anything older is an abandoned checkout, not a lost delivery.
+ */
+function listSubscriptionsNeedingReconcile(client, { since, take }) {
+  return client.companySubscription.findMany({
+    where: {
+      stripeCheckoutSessionId: { not: null },
+      createdAt: { gte: since },
+      OR: [
+        { status: 'INCOMPLETE' },
+        { stripeSubscriptionId: null },
+        { items: { some: { quantity: { gt: 0 }, stripeSubscriptionItemId: null } } },
+      ],
+    },
+    include: { items: { include: { servicePlan: true } } },
+    orderBy: { createdAt: 'asc' },
+    take,
+  });
+}
 
 /* ------------------------- subscription items ----------------------------- */
 
@@ -193,6 +222,7 @@ module.exports = {
   findSubscriptionByStripeId,
   findActiveSubscriptionForCompany,
   findCurrentSubscriptionForCompany,
+  listSubscriptionsNeedingReconcile,
   createSubscriptionItem,
   updateSubscriptionItem,
   findPaymentByInvoiceId,

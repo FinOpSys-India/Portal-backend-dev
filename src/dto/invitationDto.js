@@ -44,6 +44,30 @@ function toInvitation(invitation) {
   };
 }
 
+/**
+ * A teammate invitation: everything above, plus the two fields only the teammate
+ * form collects.
+ *
+ * A separate mapper rather than two optional keys on `toInvitation`, so the
+ * existing invitation endpoints keep byte-for-byte the response they had. A
+ * staff invitation has no job title and no companies; reporting them as
+ * `null` / `[]` everywhere would add two permanently-empty fields to every
+ * response that a client then has to learn to ignore.
+ */
+function toTeammateInvitation(invitation) {
+  return {
+    ...toInvitation(invitation),
+    jobTitle: invitation.jobTitle ?? null,
+    // Flattened out of the join rows — a client wants the companies, not the
+    // link table they arrived through.
+    companies: (invitation.companies ?? []).map(({ company }) => ({
+      companyId: company.id,
+      companyName: company.companyName,
+      status: company.status,
+    })),
+  };
+}
+
 function toInvitationList({ rows, total, limit, offset, sort, order }) {
   return {
     invitations: rows.map(toInvitation),
@@ -58,4 +82,4 @@ function toInvitationList({ rows, total, limit, offset, sort, order }) {
   };
 }
 
-module.exports = { toInvitation, toInvitationList };
+module.exports = { toInvitation, toTeammateInvitation, toInvitationList };

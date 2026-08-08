@@ -29,6 +29,11 @@ const FIELD_ALLOWLIST = [
   'specialistUserId',
   'specializationCode',
   'assignmentId',
+  // Project context. Both are identifiers or counts — a project id and how many
+  // rows an operation touched. The project NAME is deliberately absent: it is
+  // free text a customer typed, which is exactly what this allowlist keeps out.
+  'projectId',
+  'projectCount',
   'idempotent',
   /*
    * Billing / Stripe context. All of these are identifiers, counts, or integer

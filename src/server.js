@@ -4,6 +4,7 @@ const app = require('./app');
 const config = require('./config');
 const { connectDatabase, disconnectDatabase } = require('./config/prisma');
 const { verifyEmailConnection } = require('./services/emailService');
+const reconcileSweep = require('./services/billingReconcileSweep');
 const logger = require('./utils/logger');
 
 const server = app.listen(config.port, () => {
@@ -27,12 +28,19 @@ verifyEmailConnection()
   .then(() => logger.info('SMTP connection verified'))
   .catch((err) => logger.warn(`SMTP unavailable, invitation emails will fail: ${err.message}`));
 
+/*
+ * Repair subscriptions whose webhook never arrived. Started here rather than in
+ * app.js so importing the app in a test does not spawn a timer that calls Stripe.
+ */
+reconcileSweep.startSweep();
+
 // Graceful shutdown: stop accepting connections, then release the pool.
 let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info(`${signal} received, shutting down gracefully...`);
+  reconcileSweep.stopSweep();
 
   server.close(async () => {
     logger.info('HTTP server closed');

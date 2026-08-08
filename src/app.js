@@ -153,6 +153,43 @@ app.use(cookieParser());
  */
 app.use(normalizeRequest);
 
+/*
+ * Uploaded files — today, profile pictures.
+ *
+ * The database stores a key ("avatars/18/9f3c2a.jpg"); this is what turns that
+ * key back into bytes a browser can render. Read-only and outside API_PREFIX,
+ * because these are not API resources: there is no envelope, no authentication,
+ * and no JSON — just a file.
+ *
+ * Unauthenticated on purpose. An <img src> cannot carry an Authorization header,
+ * so gating this would mean either cookies (which the API deliberately does not
+ * use for authorization) or signed URLs — real work that buys nothing here,
+ * since the filename is 32 random hex characters and is therefore unguessable
+ * and unenumerable. Anything genuinely confidential must not be served from here.
+ *
+ * `index` and `redirect` are off so a directory can never be listed or probed by
+ * trailing slash; `dotfiles: 'ignore'` so nothing beginning with a dot is served.
+ */
+app.use(
+  config.uploads.publicPath,
+  express.static(config.uploads.dir, {
+    index: false,
+    redirect: false,
+    dotfiles: 'ignore',
+    // Safe to cache hard: every upload gets a new random filename, so a changed
+    // picture is a changed URL and a cached one is never stale.
+    maxAge: config.uploads.cacheMaxAgeSeconds * 1000,
+    setHeaders(res) {
+      // These files are user-supplied. Telling the browser never to sniff a
+      // content type is what keeps a crafted "image" from being interpreted as
+      // something executable, and the attachment-free CSP below stops any
+      // inline content from running against this origin.
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+    },
+  })
+);
+
 app.get('/', (req, res) => {
   res.json({ success: true, message: 'Portal backend API' });
 });

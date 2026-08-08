@@ -20,7 +20,7 @@ const mockPrisma = {
   user: { findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   company: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
   companySpecialistAssignment: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
-  companySubscription: { findFirst: jest.fn() },
+  companySubscription: { findFirst: jest.fn(), findMany: jest.fn() },
   address: { create: jest.fn(), update: jest.fn() },
   companyAddress: { findFirst: jest.fn(), create: jest.fn() },
   $queryRaw: jest.fn(async () => [{ ok: 1 }]),
@@ -109,6 +109,10 @@ beforeEach(() => {
   mockPrisma.user.findUnique.mockResolvedValue(callerUser());
   mockPrisma.company.findFirst.mockResolvedValue(companyRow());
   mockPrisma.companySpecialistAssignment.findFirst.mockResolvedValue(null);
+  // Every company read now carries active services, the billing date and the
+  // team. Default to "nothing bought, nobody staffed"; the tests that care opt in.
+  mockPrisma.companySubscription.findMany.mockResolvedValue([]);
+  mockPrisma.companySpecialistAssignment.findMany.mockResolvedValue([]);
 });
 
 /* -------------------------------------------------------------------------- */
@@ -184,6 +188,81 @@ describe('GET /api/companies', () => {
     expect(JSON.stringify(res.body)).not.toMatch(/"[a-z]+_[a-z]/);
   });
 
+  it('gives a CUSTOMER their company info, plans, billing date and active services', async () => {
+    /*
+     * The same enriched row the admin table gets. A customer looking at their own
+     * company asks the same questions — what am I paying for, when does it renew,
+     * who works on it — and the answer must not depend on which endpoint asked.
+     * The caller here is CUSTOMER/OWNER, not an admin.
+     */
+    mockPrisma.company.findMany.mockResolvedValue([companyRow()]);
+    mockPrisma.company.count.mockResolvedValue(1);
+    mockPrisma.companySubscription.findMany.mockResolvedValue([
+      {
+        id: 7001,
+        companyId: COMPANY_ID,
+        status: 'ACTIVE',
+        currentPeriodStart: new Date('2026-07-30T05:09:21Z'),
+        currentPeriodEnd: new Date('2026-08-30T05:09:21Z'),
+        cancelAtPeriodEnd: false,
+        items: [
+          {
+            quantity: 1,
+            servicePlan: {
+              planCode: 'BOOKKEEPING_GROWTH', planName: 'Bookkeeping Growth', isAddOn: false,
+              quantityEnabled: false, quantityLabel: null,
+              specialization: { id: 1, specializationCode: 'BOOKKEEPING', specializationName: 'Bookkeeping' },
+            },
+          },
+          {
+            quantity: 4,
+            servicePlan: {
+              planCode: 'PAYROLL_W2_EMPLOYEE', planName: 'W-2 Employee Add-On', isAddOn: true,
+              quantityEnabled: true, quantityLabel: 'Number of W-2 Employees',
+              specialization: { id: 2, specializationCode: 'PAYROLL', specializationName: 'Payroll' },
+            },
+          },
+        ],
+      },
+    ]);
+    mockPrisma.companySpecialistAssignment.findMany.mockResolvedValue([
+      {
+        id: 8001, companyId: COMPANY_ID, specialistUserId: 22,
+        specialist: { id: 22, firstName: 'Grace', lastName: 'Hopper', email: 'grace@finopsys.ai' },
+        specialization: { specializationCode: 'BOOKKEEPING', specializationName: 'Bookkeeping' },
+      },
+    ]);
+
+    const res = await request(app).get('/api/companies').set('Authorization', auth());
+    const [company] = res.body.data.companies;
+
+    expect(res.status).toBe(200);
+    expect(company.accessRole).toBe('OWNER');
+
+    // The plan it is on, per service.
+    const bookkeeping = company.activeServices.find((s) => s.specializationCode === 'BOOKKEEPING');
+    expect(bookkeeping).toMatchObject({ planCode: 'BOOKKEEPING_GROWTH', planName: 'Bookkeeping Growth' });
+
+    // Payroll head counts, named by the catalog's own label.
+    const payroll = company.activeServices.find((s) => s.specializationCode === 'PAYROLL');
+    expect(payroll.addOns[0]).toMatchObject({
+      component: 'employees',
+      quantityLabel: 'Number of W-2 Employees',
+      quantity: 4,
+    });
+
+    // Billing date.
+    expect(company.billing.currentPeriodEnd).toBe('2026-08-30T05:09:21.000Z');
+
+    // Team.
+    expect(company.teamMembers.specialists[0]).toMatchObject({ userId: 22, firstName: 'Grace' });
+    expect(company.teamMemberCount).toBe(2); // owner + one specialist
+
+    // Still no snake_case, and still no credential material.
+    expect(JSON.stringify(res.body)).not.toMatch(/"[a-z]+_[a-z]/);
+    expect(JSON.stringify(res.body)).not.toContain('passwordHash');
+  });
+
   it('scopes the query to companies the caller can actually reach', async () => {
     mockPrisma.company.findMany.mockResolvedValue([]);
     mockPrisma.company.count.mockResolvedValue(0);
@@ -200,6 +279,32 @@ describe('GET /api/companies', () => {
       { specialistAssignments: { some: { specialistUserId: USER_ID, assignmentStatus: 'ACTIVE' } } },
     ]);
     expect(args.where.deletedAt).toBeNull();
+  });
+
+  it('keeps the access filter when the caller searches', async () => {
+    /*
+     * Both the access scope and the search want the key `OR`, so spreading them
+     * into one object made the second REPLACE the first — a non-admin who typed
+     * anything into the search box lost their scoping and matched every company
+     * in the database. They are combined with AND now.
+     */
+    mockPrisma.company.findMany.mockResolvedValue([]);
+    mockPrisma.company.count.mockResolvedValue(0);
+
+    await request(app).get('/api/companies?search=aero').set('Authorization', auth());
+
+    const [args] = mockPrisma.company.findMany.mock.calls[0];
+    expect(args.where.AND).toHaveLength(2);
+    const [scope, search] = args.where.AND;
+    expect(scope.OR).toEqual([
+      { ownerUserId: USER_ID },
+      { accountingManagerUserId: USER_ID },
+      { specialistAssignments: { some: { specialistUserId: USER_ID, assignmentStatus: 'ACTIVE' } } },
+    ]);
+    expect(search.OR).toEqual([
+      { companyName: { contains: 'aero', mode: 'insensitive' } },
+      { companyEmail: { contains: 'aero', mode: 'insensitive' } },
+    ]);
   });
 
   it('does not filter by owner for an ADMIN', async () => {

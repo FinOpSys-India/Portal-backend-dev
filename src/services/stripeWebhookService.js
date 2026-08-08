@@ -9,6 +9,7 @@ const money = require('../utils/money');
 const { logEvent } = require('../utils/auditLog');
 const repo = require('../repositories/billingRepository');
 const companyRepo = require('../repositories/companyRepository');
+const adminEvents = require('./adminEventService');
 
 /**
  * Stripe webhook processing — the ONLY place a service is ever activated.
@@ -528,6 +529,19 @@ async function handleCheckoutCompleted(event, { requestId }) {
     }
   });
 
+  /*
+   * The company has just started paying for something, so its Active Services
+   * and Billing Date have changed. Published after the transaction above has
+   * committed — a webhook that announced services a rollback then discarded
+   * would leave every open admin screen showing a subscription that does not
+   * exist.
+   */
+  adminEvents.companyServicesChanged({
+    companyId,
+    subscriptionId: subscription.id,
+    status: stale ? subscription.status : status,
+  });
+
   logEvent({
     event: 'billing.subscription.activated',
     status: 'success',
@@ -639,6 +653,14 @@ async function handleSubscriptionLifecycle(event, { requestId }) {
     cancelAtPeriodEnd: Boolean(stripeSubscription.cancel_at_period_end),
     canceledAt: toDate(stripeSubscription.canceled_at),
     lastStripeEventAt: eventCreatedAt(event),
+  });
+
+  // past_due, cancelled, renewed: all of them change what the admin table shows
+  // in Active Services and Billing Date.
+  adminEvents.companyServicesChanged({
+    companyId: subscription.companyId,
+    subscriptionId: subscription.id,
+    status: nextStatus,
   });
 
   logEvent({

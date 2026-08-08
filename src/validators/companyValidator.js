@@ -38,11 +38,29 @@ const MAX = {
 };
 
 /**
+ * The subdivisions of the CUSTOMER role, as seeded in `specific_roles`: OWNER
+ * (holds the company) and TEAM (a teammate on it).
+ *
+ * Listed here only to bound a query-string FILTER. Which sub-role an invitation
+ * actually grants is never decided from this list — the id comes from the client
+ * and is resolved and cross-checked against the database in the service, so a
+ * new sub-role added to the table works without editing this file.
+ */
+const CUSTOMER_SPECIFIC_ROLES = ['OWNER', 'TEAM'];
+
+/**
  * Upper bound on head count. Previously unbounded here while the billing side
  * capped the same concept at 5000, so `employeeCount: 999999999` was accepted at
  * onboarding and rejected at checkout.
  */
 const MAX_EMPLOYEE_COUNT = 1_000_000;
+
+/**
+ * Upper bound on a single specialist-assignment submission. There are four
+ * specializations in the catalog, so anything beyond that cannot be a real
+ * staffing decision — this only stops a client looping.
+ */
+const MAX_SPECIALIST_ASSIGNMENTS = 20;
 
 // Kept in sync with the CompanyType enum in schema.prisma.
 const COMPANY_TYPES = new Set([
@@ -239,6 +257,79 @@ function validateSpecialistAssignment(body = {}) {
   return { specialistUserId, specializationCodes: normalised };
 }
 
+/**
+ * Validate PUT /admin/companies/:companyId/specialists.
+ *
+ *   { assignments: [ { specializationCode, specialistUserId }, … ] }
+ *
+ * The whole staffing of the company's active services is submitted at once, so
+ * the shape checked here is a LIST of one specialist per service. Two rules are
+ * enforced on the payload itself because they are answerable without touching
+ * the database, and reaching a transaction only to reject a plainly malformed
+ * body wastes a connection:
+ *
+ *   - the same service may not appear twice (which specialist would win?)
+ *   - the same specialist may not appear twice. A user holds exactly ONE specific
+ *     role, so they can only ever be eligible for one service; the same person
+ *     against two services is a client bug every time, and saying so precisely
+ *     beats letting it fail later as a role mismatch.
+ *
+ * Everything that needs the database — is the service active, does this user
+ * exist, are they active, do they hold the role this service requires, is every
+ * active service covered — is the service layer's job, and is checked inside the
+ * write transaction.
+ */
+function validateSpecialistAssignments(body = {}) {
+  common.rejectUnknown(body, ['assignments']);
+  common.requireFields(body, ['assignments']);
+
+  const rows = body.assignments;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw common.fieldError('assignments', 'assignments must be a non-empty array.', 'Select a specialist for each service.');
+  }
+  if (rows.length > MAX_SPECIALIST_ASSIGNMENTS) {
+    throw common.fieldError('assignments', `assignments cannot exceed ${MAX_SPECIALIST_ASSIGNMENTS} entries.`, 'Too many assignments.');
+  }
+
+  const seenServices = new Set();
+  const seenSpecialists = new Set();
+  const out = [];
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      throw common.fieldError('assignments', 'Each assignment must be an object.', 'Invalid assignment.');
+    }
+    common.rejectUnknown(row, ['specializationCode', 'specialistUserId'], 'assignment');
+    common.requireFields(row, ['specializationCode', 'specialistUserId']);
+
+    const specializationCode = common
+      .str(row.specializationCode, 'specializationCode', { max: common.LIMITS.specializationCode })
+      .toUpperCase();
+    const specialistUserId = common.parseId(row.specialistUserId, 'specialistUserId');
+
+    if (seenServices.has(specializationCode)) {
+      throw new ApiError(400, 'Each service may be assigned only once.', {
+        code: 'VALIDATION_ERROR',
+        fields: { assignments: 'One specialist per service.' },
+        details: { duplicateSpecializationCode: specializationCode },
+      });
+    }
+    if (seenSpecialists.has(specialistUserId)) {
+      throw new ApiError(400, 'The same specialist cannot be assigned to two services.', {
+        code: 'VALIDATION_ERROR',
+        fields: { assignments: 'Choose a different specialist for each service.' },
+        details: { duplicateSpecialistUserId: specialistUserId },
+      });
+    }
+    seenServices.add(specializationCode);
+    seenSpecialists.add(specialistUserId);
+
+    out.push({ specializationCode, specialistUserId });
+  }
+
+  return out;
+}
+
 /** `?limit=&offset=&sort=&order=` for GET /companies. */
 const COMPANY_SORTABLE = ['createdAt', 'companyName', 'status', 'updatedAt'];
 
@@ -285,6 +376,147 @@ function validateUserListQuery(query = {}) {
   return { ...page, role, search };
 }
 
+/**
+ * `?search=&includeInactive=&limit=&offset=&sort=&order=` for
+ * GET /admin/accounting-managers.
+ *
+ * Note what is NOT sortable: `companyCount`. Ordering by the size of a joined
+ * collection needs the count computed in the database, and the count this
+ * endpoint reports deliberately excludes soft-deleted companies — a filter the
+ * ORM cannot apply to a relation-count sort. Offering the option would mean the
+ * order and the numbers displayed beside it came from two different definitions
+ * of "how many", which is worse than not offering it. Sort by name and read the
+ * counts.
+ */
+function validateAccountingManagerListQuery(query = {}) {
+  common.rejectUnknown(
+    query,
+    ['limit', 'offset', 'sort', 'order', 'search', 'includeInactive'],
+    'query string'
+  );
+
+  const page = common.pagination(query, {
+    defaultLimit: 25,
+    maxLimit: 100,
+    sortable: ['firstName', 'lastName', 'email', 'createdAt'],
+    defaultSort: 'firstName',
+  });
+
+  const search = query.search === undefined || query.search === null || query.search === ''
+    ? null
+    : common.str(query.search, 'search', { max: 255, required: false });
+
+  return {
+    ...page,
+    // Ascending by name is what a directory should default to; `pagination`
+    // defaults to descending, which is right for dated lists and wrong here.
+    order: query.order === undefined || query.order === null || query.order === '' ? 'asc' : page.order,
+    search,
+    includeInactive: common.boolean(query.includeInactive, 'includeInactive', { defaultValue: false }),
+  };
+}
+
+/**
+ * `?companyId=&search=&includeInactive=&limit=&offset=&sort=&order=` — the query
+ * contract shared by the people directories: GET /specialists and GET /customers.
+ *
+ * One function rather than two identical ones, because the two endpoints must
+ * accept the same filter under the same name: a client that learns
+ * `?companyId=&search=` on one of them has learned it on both, and a divergence
+ * between them would be a bug nobody notices until a screen silently stops
+ * filtering.
+ *
+ * `companyId` is the global company filter the frontend applies across screens.
+ * It is validated here only as a SHAPE; whether the caller may see that company —
+ * and whether they are even allowed to omit it — is decided in the service,
+ * against the database. A filter must never be a way to reach data the caller
+ * could not otherwise reach.
+ */
+function validateScopedDirectoryQuery(query = {}) {
+  common.rejectUnknown(
+    query,
+    ['limit', 'offset', 'sort', 'order', 'search', 'includeInactive', 'companyId'],
+    'query string'
+  );
+
+  const page = common.pagination(query, {
+    defaultLimit: 25,
+    maxLimit: 100,
+    sortable: ['firstName', 'lastName', 'email', 'createdAt'],
+    defaultSort: 'firstName',
+  });
+
+  const search = query.search === undefined || query.search === null || query.search === ''
+    ? null
+    : common.str(query.search, 'search', { max: 255, required: false });
+
+  return {
+    ...page,
+    order: query.order === undefined || query.order === null || query.order === '' ? 'asc' : page.order,
+    search,
+    includeInactive: common.boolean(query.includeInactive, 'includeInactive', { defaultValue: false }),
+    companyId:
+      query.companyId === undefined || query.companyId === null || query.companyId === ''
+        ? null
+        : common.parseId(query.companyId, 'companyId'),
+  };
+}
+
+/**
+ * `?companyId=&search=&specificRole=&includeInactive=&limit=&offset=&sort=&order=`
+ * for GET /teammates.
+ *
+ * `companyId` is the global company filter the frontend applies across screens,
+ * and here it is REQUIRED rather than optional. A teammate roster is a property
+ * of one company; there is no meaningful unscoped version of it, and returning a
+ * merged list across an owner's companies would silently mix people who cannot
+ * see each other's accounts.
+ *
+ * Required as a SHAPE rule, so it is checked here. Whether the caller may see
+ * that particular company is a different question entirely, decided in the
+ * service against the database — a filter must never be a way to reach data the
+ * caller could not otherwise reach.
+ *
+ * `specificRole` is constrained to the CUSTOMER subdivisions. It exists so the
+ * screen can ask for TEAM specifically; left off, the answer is every teammate
+ * on the roster, which is the same set unless a company gains other customer
+ * sub-roles later.
+ */
+function validateTeammateListQuery(query = {}) {
+  common.rejectUnknown(
+    query,
+    ['companyId', 'limit', 'offset', 'sort', 'order', 'search', 'specificRole', 'includeInactive'],
+    'query string'
+  );
+  common.requireFields(query, ['companyId']);
+
+  const page = common.pagination(query, {
+    defaultLimit: 25,
+    maxLimit: 100,
+    sortable: ['firstName', 'lastName', 'email', 'createdAt'],
+    defaultSort: 'firstName',
+  });
+
+  const search =
+    query.search === undefined || query.search === null || query.search === ''
+      ? null
+      : common.str(query.search, 'search', { max: 255, required: false });
+
+  return {
+    ...page,
+    companyId: common.parseId(query.companyId, 'companyId'),
+    // A name-sorted list reads A-Z; the shared pagination helper defaults to
+    // descending, which is right for dates and wrong here.
+    order: query.order === undefined || query.order === null || query.order === '' ? 'asc' : page.order,
+    search,
+    specificRole:
+      query.specificRole === undefined || query.specificRole === null || query.specificRole === ''
+        ? null
+        : common.enumValue(query.specificRole, 'specificRole', CUSTOMER_SPECIFIC_ROLES),
+    includeInactive: common.boolean(query.includeInactive, 'includeInactive', { defaultValue: false }),
+  };
+}
+
 /** `?limit=&offset=` for GET /companies/:companyId/specialists. */
 function validateSpecialistListQuery(query = {}) {
   common.rejectUnknown(query, ['limit', 'offset', 'sort', 'order', 'includeInactive'], 'query string');
@@ -302,10 +534,19 @@ function validateSpecialistListQuery(query = {}) {
 module.exports = {
   validateCompanyOnboarding,
   validateCompanyUpdate,
+  // Exported for validators/userValidator: a user's own address and a company's
+  // address are the same real-world thing and must obey the same rules (real ISO
+  // country code, postcode that matches it, canonical US state). Two copies of
+  // that logic would be two rules the moment either is touched.
+  validateAddress,
   validateAccountingManagerAssignment,
   validateSpecialistAssignment,
+  validateSpecialistAssignments,
   validateCompanyListQuery,
   validateUserListQuery,
+  validateAccountingManagerListQuery,
+  validateScopedDirectoryQuery,
+  validateTeammateListQuery,
   validateSpecialistListQuery,
   parseId: common.parseId,
   COMPANY_TYPES,

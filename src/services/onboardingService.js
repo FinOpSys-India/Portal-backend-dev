@@ -4,16 +4,19 @@ const { prisma } = require('../config/prisma');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { signAccessToken } = require('../utils/tokens');
+const adminEvents = require('./adminEventService');
 
 /**
  * Post-signup onboarding.
  *
  * The user has already authenticated (they hold a valid access token) and their
- * `users` row already exists from sign-up, so onboarding here PROVISIONS that
- * user rather than creating them from scratch: it assigns the default owner
- * role, creates the customer account, links the two, and later accepts the
- * profile form. Every entry point takes the user id from the verified token —
- * never from the request body.
+ * `users` row already exists from sign-up, so onboarding here finishes off that
+ * user rather than creating them from scratch: it accepts the profile form and
+ * reports how far through the flow they are. Every entry point takes the user id
+ * from the verified token — never from the request body.
+ *
+ * The `customers` table this once created is gone (db/schema/13_drop_customers);
+ * a company belongs directly to its owner, so there is no account row to make.
  *
  * "OWNER" is modelled with the existing role hierarchy, not a new top-level
  * role: the seed already defines the SpecificRole `OWNER` under the top-level
@@ -24,6 +27,17 @@ const { signAccessToken } = require('../utils/tokens');
 
 const OWNER_ROLE_CODE = 'CUSTOMER'; // top-level Role
 const OWNER_SPECIFIC_ROLE_CODE = 'OWNER'; // SpecificRole under CUSTOMER
+
+/*
+ * The one subscription state that counts as paid for onboarding purposes.
+ *
+ * Deliberately just ACTIVE. INCOMPLETE is a checkout that was started and never
+ * finished, which is precisely the state the payment step exists to move them
+ * out of. PAST_DUE, UNPAID and CANCELED all describe a subscription that once
+ * worked and has since lapsed — a billing problem for an established account to
+ * resolve, not an onboarding step to repeat, but also not something to call paid.
+ */
+const PAID_SUBSCRIPTION_STATUS = 'ACTIVE';
 
 /** Columns needed to build an onboarding-status view of a user. */
 const STATUS_SELECT = {
@@ -36,19 +50,68 @@ const STATUS_SELECT = {
   status: true,
   role: { select: { code: true } },
   specificRole: { select: { code: true } },
+  /*
+   * The owner's last two steps, answered by one relation rather than two extra
+   * queries, so the status cannot report a user, their companies and their
+   * billing from three different moments.
+   *
+   * Soft-deleted companies are excluded: an owner whose only company was deleted
+   * has the company step to do again. `take: 1` on the subscriptions makes this
+   * an existence check — nothing here needs the row, only whether one is there.
+   */
+  ownedCompanies: {
+    where: { deletedAt: null },
+    select: {
+      id: true,
+      subscriptions: {
+        where: { status: PAID_SUBSCRIPTION_STATUS },
+        select: { id: true },
+        take: 1,
+      },
+    },
+  },
 };
 
 /**
  * Shape a fetched user (with role and specificRole) into the onboarding status
  * returned to the frontend. `onboarding.complete` is the one flag the client can
  * gate the app on; the sub-flags let it drive which step to show.
+ *
+ * WHAT THE FLAGS MEAN, and why they differ by role:
+ *
+ * Sign-up is invitation-only (authService.signup requires an invitationToken),
+ * so every user arrives already holding the role their invitation named. That
+ * makes the onboarding path depend on who they are:
+ *
+ *   owner (CUSTOMER/OWNER) — invited to run an account. Three steps: fill in the
+ *     profile, create the first company, and pay for it. All three, because
+ *     everything an owner sees hangs off a company and every company hangs off a
+ *     subscription — an unpaid company is a shell with no services attached.
+ *   everyone else (CUSTOMER/TEAM, SPECIALIST/*, ACCOUNTING_MANAGER, ADMIN) —
+ *     joins an account that already exists, paid for by whoever owns it. They
+ *     have no company to create and no bill to settle; the profile is their only
+ *     step.
+ *
+ * So `companyCreated` and `paymentComplete` are reported for everyone (they are
+ * facts, and false is truthful for a teammate) but only GATE the owner. Folding
+ * them into `complete` unconditionally would strand every non-owner outside the
+ * portal forever, since they have no endpoint that would ever make them true.
  */
 function buildStatus(user) {
-  // Provisioned == holds the owner role pair. There is no separate account row
-  // to look for: a company is owned by its user directly.
-  const accountProvisioned =
+  const isOwner =
     user.role?.code === OWNER_ROLE_CODE && user.specificRole?.code === OWNER_SPECIFIC_ROLE_CODE;
   const profileComplete = Boolean(user.firstName && user.lastName && user.phone && user.jobTitle);
+
+  const companies = user.ownedCompanies ?? [];
+  const companyCreated = companies.length > 0;
+  /*
+   * ANY owned company being paid up is enough. An owner adding a second company
+   * later is an established customer partway through a purchase, not someone
+   * back at the start of onboarding — requiring every company to be paid would
+   * throw them out of the portal the moment they created one.
+   */
+  const paymentComplete = companies.some((c) => c.subscriptions.length > 0);
+
   return {
     user: {
       id: user.id,
@@ -62,9 +125,20 @@ function buildStatus(user) {
       status: user.status,
     },
     onboarding: {
-      accountProvisioned,
+      isOwner,
       profileComplete,
-      complete: accountProvisioned && profileComplete,
+      companyCreated,
+      paymentComplete,
+      complete: isOwner
+        ? profileComplete && companyCreated && paymentComplete
+        : profileComplete,
+      /*
+       * Retained for clients still reading the old field name. It always meant
+       * "holds the owner role pair", which is now `isOwner`; it was never a step
+       * anyone could complete, since the role arrives with the invitation.
+       * @deprecated read `isOwner`.
+       */
+      accountProvisioned: isOwner,
     },
   };
 }
@@ -121,6 +195,17 @@ async function getStatus(userId) {
  * already holds the owner pair gets their current status back unchanged
  * (created: false).
  *
+ * ONLY a user holding NO role can be promoted here. Sign-up is invitation-only
+ * (authService.signup requires an invitationToken and copies the invitation's
+ * role onto the new user), so in practice everyone already has one and this
+ * endpoint is a no-op for owners and a 403 for everyone else. That is
+ * deliberate: without the check, the route's sole remaining effect was to let
+ * ANY authenticated user — a teammate, a specialist, an accounting manager —
+ * make themselves the owner of a customer account and collect a fresh token
+ * carrying the claim, since the route is guarded by requireAuth alone. The role
+ * a user holds is decided by whoever invited them, and it is not theirs to
+ * change by calling an endpoint.
+ *
  * @param {{ userId: number }} params
  * @returns {Promise<{ status: object, created: boolean, accessToken: string|null }>}
  */
@@ -138,6 +223,21 @@ async function provision({ userId }) {
     return { status: buildStatus(existing), created: false, accessToken: null };
   }
 
+  /*
+   * Some other role is already assigned. Refuse rather than overwrite: this is a
+   * privilege escalation attempt if the caller meant it, and a client bug if
+   * they did not, and both deserve to be told rather than silently granted.
+   * Logged at warn because a legitimate client has no reason to send this.
+   */
+  if (previousRole !== null) {
+    logger.warn(
+      `Onboarding: refused to promote user ${userId} (${previousRole}/${previousSpecificRole ?? '—'}) to owner.`
+    );
+    throw new ApiError(403, 'Your account role is already set and cannot be changed here.', {
+      code: 'ROLE_ALREADY_ASSIGNED',
+    });
+  }
+
   const { roleId, specificRoleId } = await resolveOwnerRole();
 
   try {
@@ -149,6 +249,15 @@ async function provision({ userId }) {
     const status = buildStatus(user);
 
     logger.info(`Onboarding: provisioned user ${userId} as OWNER.`);
+
+    /*
+     * A role change is exactly the transition the admin manager picker cares
+     * about: whoever this user was a moment ago, they are a CUSTOMER/OWNER now
+     * and are therefore no longer assignable as an accounting manager. Announced
+     * after the write has committed, so an open admin screen drops the option
+     * instead of offering someone the backend would now refuse.
+     */
+    adminEvents.userChanged(user);
 
     /*
      * Hand back a REPLACEMENT access token whenever this call changed the role.
@@ -203,6 +312,10 @@ async function submitProfile({ userId, profile }) {
       select: STATUS_SELECT,
     });
     logger.info(`Onboarding: profile submitted for user ${userId}.`);
+
+    // The name shown next to every company this user manages just changed.
+    adminEvents.userChanged(user);
+
     return buildStatus(user);
   } catch (err) {
     // update on a missing row throws P2025 — the token's subject is gone.

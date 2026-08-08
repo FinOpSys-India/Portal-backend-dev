@@ -109,6 +109,68 @@ const PAYROLL_PLANS = {
   },
 };
 
+/**
+ * Which kind of specialist a service needs: `specializations.specialization_code`
+ * -> `specific_roles.code` (under the SPECIALIST top-level role).
+ *
+ * This is the ONE link in the chain the database does not encode as a foreign
+ * key. Everything else is already joined for us — `service_plans.specialization_id`
+ * says which service a purchased plan belongs to, and the composite FK on `users`
+ * guarantees a specific role belongs to its role — but nothing relates a
+ * specialization row to the specific role that serves it. The seeded names line
+ * up exactly (`SPECIALIST_3` is "Bookkeeping Specialist", and BOOKKEEPING is
+ * "Bookkeeping"), and matching on a display name would work today; it is not
+ * something to decide an authorization question with, because a rename in the
+ * admin UI would silently re-point who may be assigned to a company's books.
+ *
+ * So the mapping is stated here, next to the other DB-to-code bridges, rather
+ * than inferred. If it ever needs to be editable without a deploy, the natural
+ * home is a `specialist_specific_role_id` column on `specializations` — a real
+ * FK, and the same shape as this table.
+ */
+const SPECIALIZATION_SPECIALIST_ROLE = {
+  BOOKKEEPING: 'SPECIALIST_3',
+  PAYROLL: 'SPECIALIST_1',
+  TAX: 'SPECIALIST_2',
+  FA_Q: 'SPECIALIST_4',
+};
+
+/**
+ * The specific role that may be assigned for a specialization, or null when the
+ * specialization has no specialist kind (which is not something to guess at —
+ * the caller decides whether that is a configuration error or simply a service
+ * nobody staffs).
+ */
+function specialistRoleForSpecialization(specializationCode) {
+  return SPECIALIZATION_SPECIALIST_ROLE[specializationCode] ?? null;
+}
+
+/**
+ * Where a service's STANDING specialist is recorded on `companies`:
+ * specialization_code -> the column added by db/schema/14.
+ *
+ * Those three columns and `company_specialist_assignments` answer different
+ * questions and neither replaces the other. The assignment table is the record
+ * of specialist WORK — many rows per company, with `unassigned_at` so history
+ * survives, and it deliberately permits two active rows for one specialization.
+ * A single nullable column is what "exactly one bookkeeping specialist on this
+ * account right now" means, and it is what the admin grid renders per line.
+ *
+ * Only three lines have a column. FA_Q has no column because nothing sellable
+ * maps to it, so a FA_Q assignment is recorded in the assignment table alone —
+ * `null` here means exactly that, not an error.
+ */
+const SPECIALIZATION_COMPANY_COLUMN = {
+  BOOKKEEPING: 'bookkeepingSpecialistUserId',
+  PAYROLL: 'payrollSpecialistUserId',
+  TAX: 'taxSpecialistUserId',
+};
+
+/** The `companies` column holding this service's standing specialist, or null. */
+function specialistColumnForSpecialization(specializationCode) {
+  return SPECIALIZATION_COMPANY_COLUMN[specializationCode] ?? null;
+}
+
 /** Every plan_code this file can ever resolve to — used for one batched lookup. */
 const ALL_PLAN_CODES = [
   ...Object.values(BOOKKEEPING_OPTIONS).map((o) => o.planCode),
@@ -148,6 +210,10 @@ function payrollPlanIds() {
 
 module.exports = {
   SERVICES,
+  SPECIALIZATION_SPECIALIST_ROLE,
+  specialistRoleForSpecialization,
+  SPECIALIZATION_COMPANY_COLUMN,
+  specialistColumnForSpecialization,
   BOOKKEEPING_OPTIONS,
   TAX_OPTIONS,
   PAYROLL_PLANS,

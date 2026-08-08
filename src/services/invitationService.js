@@ -6,6 +6,17 @@ const logger = require('../utils/logger');
 const { logEvent } = require('../utils/auditLog');
 const { generateInvitationToken } = require('../utils/tokens');
 const { sendInvitationEmail } = require('./emailService');
+const companyRepo = require('../repositories/companyRepository');
+
+/**
+ * The customer-side role codes this file needs by NAME rather than by id.
+ *
+ * Only two, and both only ever used to REFUSE something — never to decide what
+ * an invitation grants, which always comes from the ids the client sends and is
+ * resolved against the `roles` table in resolveRolePair.
+ */
+const CUSTOMER_ROLE_CODE = 'CUSTOMER';
+const OWNER_SPECIFIC_ROLE_CODE = 'OWNER';
 
 /**
  * Invitation lifecycle: create, list, revoke, resend.
@@ -39,6 +50,28 @@ const INVITATION_FIELDS = {
   role: { select: { code: true, name: true } },
   specificRole: { select: { code: true, name: true } },
   invitedBy: { select: { id: true, firstName: true, lastName: true, email: true } },
+};
+
+/**
+ * The teammate-invitation shape: the fields above PLUS the two the teammate form
+ * collects and nothing else does.
+ *
+ * Kept separate rather than folded into INVITATION_FIELDS so the existing
+ * invitation endpoints keep exactly the response they have always had. A staff
+ * invitation has no job title and targets no company, so returning
+ * `"jobTitle": null, "companies": []` on every one of them would be two fields
+ * that are permanently empty — noise that a client then has to learn to ignore.
+ *
+ * `companies` is named, not just id'd, so the screen can print "Acme Ltd, Beta
+ * Inc" without a second round trip.
+ */
+const TEAMMATE_INVITATION_FIELDS = {
+  ...INVITATION_FIELDS,
+  jobTitle: true,
+  companies: {
+    select: { company: { select: { id: true, companyName: true, status: true } } },
+    orderBy: { company: { companyName: 'asc' } },
+  },
 };
 
 /* -------------------------------------------------------------------------- */
@@ -154,7 +187,7 @@ function mintToken() {
  * and it can be resent. The row stays PENDING, which is precisely the marker for
  * "this one never reached the invitee".
  */
-async function deliver({ invitation, inviter, token, requestId }) {
+async function deliver({ invitation, inviter, token, requestId, fields = INVITATION_FIELDS }) {
   try {
     const frontendUrl = (process.env.FRONTEND_URL || '').replace(/\/+$/, '');
     await sendInvitationEmail({
@@ -180,7 +213,7 @@ async function deliver({ invitation, inviter, token, requestId }) {
   const updated = await prisma.invitation.update({
     where: { id: invitation.id },
     data: { status: 'SENT' },
-    select: INVITATION_FIELDS,
+    select: fields,
   });
   return { emailSent: true, invitation: updated };
 }
@@ -198,7 +231,7 @@ async function deliver({ invitation, inviter, token, requestId }) {
  * mis-click cannot spam the invitee with a second email. Use the explicit resend
  * endpoint for that, which reuses the SAME token rather than minting a new one.
  */
-async function createInvitation({ inviterUserId, requestId, input }) {
+async function createInvitation({ inviterUserId, requestId, input, fields = INVITATION_FIELDS }) {
   const inviter = await loadInviter(inviterUserId);
   const { role, specificRole } = await resolveRolePair(input);
 
@@ -249,6 +282,7 @@ async function createInvitation({ inviterUserId, requestId, input }) {
         email: input.email,
         firstName: input.firstName,
         lastName: input.lastName,
+        jobTitle: input.jobTitle ?? null,
         roleId: role.id,
         specificRoleId: specificRole?.id ?? null,
         invitedById: inviter.id,
@@ -256,8 +290,14 @@ async function createInvitation({ inviterUserId, requestId, input }) {
         // is then unrecoverable.
         tokenHash,
         expiresAt,
+        // Written in the SAME statement as the invitation, so an invitation can
+        // never exist with its target companies missing. The ids were checked
+        // against the caller's ownership before the transaction opened.
+        ...(input.companyIds?.length
+          ? { companies: { create: input.companyIds.map((companyId) => ({ companyId })) } }
+          : {}),
       },
-      select: INVITATION_FIELDS,
+      select: fields,
     });
   });
 
@@ -269,8 +309,118 @@ async function createInvitation({ inviterUserId, requestId, input }) {
     detail: role.code,
   });
 
-  const result = await deliver({ invitation, inviter, token: rawToken, requestId });
+  const result = await deliver({ invitation, inviter, token: rawToken, requestId, fields });
   return { ...result, statusCode: 201 };
+}
+
+/* -------------------------------------------------------------------------- */
+/* create — teammate                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Resolve `companyIds` to the ones the caller may actually invite onto, or throw
+ * naming the ones they may not.
+ *
+ * OWNERSHIP, with no exception — not even for an ADMIN. Adding people to a
+ * customer's account is the customer's decision, not an internal one, and the
+ * portal already splits authority that way elsewhere: an admin appoints the
+ * accounting manager, the manager staffs the specialists, the owner runs their
+ * own team. An admin who could invite teammates would be creating customer-side
+ * users on an account nobody asked them to touch.
+ *
+ * This runs BEFORE the invitation is created rather than as a filter afterwards.
+ * An invitation that quietly covered fewer companies than the form submitted
+ * would be worse than a rejection, because nothing would tell the owner.
+ *
+ * A soft-deleted or ARCHIVED company is reported the same way as one the caller
+ * does not own. Not an oversight: to someone who does not own it, "archived" and
+ * "not yours" must be indistinguishable, or the error becomes a way to probe
+ * which company ids exist.
+ */
+async function resolveInvitableCompanies({ caller, companyIds }) {
+  const allowed = await companyRepo.listOwnedCompanyIds(prisma, {
+    ownerUserId: caller.id,
+    companyIds,
+  });
+
+  const allowedSet = new Set(allowed);
+  const rejected = companyIds.filter((id) => !allowedSet.has(id));
+
+  if (rejected.length) {
+    throw new ApiError(403, `You cannot invite anyone to ${rejected.length === 1 ? 'this company' : 'these companies'}.`, {
+      code: 'COMPANY_ACCESS_DENIED',
+      fields: { companyIds: 'Select companies you own.' },
+      details: { rejectedCompanyIds: rejected },
+    });
+  }
+
+  // Returned in the caller's order rather than the database's, so the response
+  // lists the companies in the order the form submitted them.
+  return companyIds;
+}
+
+/**
+ * Invite a teammate onto one or more of the caller's OWN companies.
+ *
+ * The difference from `createInvitation` is entirely about scope, not mechanism:
+ * the token, the replace-in-place rules, the email and the audit trail are the
+ * same code below. What this adds is
+ *
+ *   - the companies must be the caller's own — see resolveInvitableCompanies,
+ *   - the role pair is constrained to a customer-side, non-owner role, and
+ *   - a job title is carried on the invitation.
+ *
+ * On the role pair: the ids come from the client, as they do everywhere else,
+ * but two things are enforced here that the generic endpoint does not. The role
+ * must be CUSTOMER — this form adds people to a customer account, not staff to
+ * the portal — and the specific role must NOT be OWNER. Without that second
+ * check, an owner could use their own invite form to mint another OWNER, which
+ * is a privilege escalation dressed as a teammate: ownership carries write
+ * access to the company and the right to invite further people.
+ *
+ * Note there is no admin path. An ADMIN reaching this endpoint owns no company
+ * and so can invite onto none — the ownership check refuses them by the same
+ * rule that refuses one owner reaching into another's account, rather than by a
+ * separate role test that could drift away from it.
+ */
+async function createTeammateInvitation({ inviterUserId, requestId, input }) {
+  const caller = await prisma.user.findUnique({
+    where: { id: inviterUserId },
+    select: { id: true, status: true },
+  });
+  if (!caller) {
+    throw new ApiError(401, 'Your account could not be found.', { code: 'USER_NOT_FOUND' });
+  }
+
+  const companyIds = await resolveInvitableCompanies({ caller, companyIds: input.companyIds });
+
+  const { role, specificRole } = await resolveRolePair(input);
+
+  if (role.code !== CUSTOMER_ROLE_CODE) {
+    throw new ApiError(400, 'A teammate must be invited with the customer role.', {
+      code: 'VALIDATION_ERROR',
+      fields: { roleId: 'Select the customer role.' },
+    });
+  }
+  if (specificRole?.code === OWNER_SPECIFIC_ROLE_CODE) {
+    throw new ApiError(403, 'An owner cannot be added through the teammate form.', {
+      code: 'SPECIFIC_ROLE_NOT_ALLOWED',
+      fields: { specificRoleId: 'Select a teammate role.' },
+    });
+  }
+
+  // Everything above is a precondition; the invitation itself, its token, its
+  // email and its audit entry are the shared path. `createInvitation` re-resolves
+  // the role pair — cheap, and it keeps that function correct on its own terms
+  // rather than depending on a caller having done it first.
+  return createInvitation({
+    inviterUserId,
+    requestId,
+    input: { ...input, companyIds },
+    // The only place the wider shape is used: a teammate invitation is the only
+    // one that HAS a job title and companies to report.
+    fields: TEAMMATE_INVITATION_FIELDS,
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -481,6 +631,7 @@ async function expireStaleInvitations() {
 
 module.exports = {
   createInvitation,
+  createTeammateInvitation,
   listInvitations,
   revokeInvitation,
   resendInvitation,

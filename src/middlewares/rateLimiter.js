@@ -133,6 +133,17 @@ const companyLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 60, label:
 const billingLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 20, label: 'Billing' });
 
 /*
+ * The caller's own profile: phone/address edits and avatar upload/removal.
+ *
+ * Authenticated, so the exposure is bounded to a real account — but the avatar
+ * route is the only endpoint in the API that writes files, and each call can
+ * write megabytes and orphan the previous file. The cap is what stops a looping
+ * client (or a bored account holder) from filling the disk, which no amount of
+ * per-request size limiting would prevent on its own.
+ */
+const profileLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 30, label: 'Profile' });
+
+/*
  * Token refresh. Unauthenticated by nature — an expired access token is exactly
  * when this is called — and every hit writes (revoke the old row, insert the new
  * one), so it is both a guessing surface and a write amplifier.
@@ -145,6 +156,28 @@ const billingLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 20, label:
  */
 const refreshLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 60, label: 'Refresh' });
 
+/*
+ * Project creation and edits. Authenticated and transactional, and each create
+ * resolves the company's subscription and staffing before it writes — the same
+ * shape as the company routes, so it gets the same generous cap. A form-driven
+ * session issues a handful of calls; a looping client is what this stops.
+ */
+const projectLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 60, label: 'Project' });
+
+/*
+ * Project document uploads.
+ *
+ * Tighter than projectLimiter even though both are authenticated, because this
+ * is the only endpoint in the API where one call can write hundreds of megabytes
+ * — up to ten files at 25 MB each. The per-file and per-request caps bound one
+ * request; this is what bounds the sequence of them, and it is the only thing
+ * standing between a looping client and a full disk.
+ *
+ * It runs BEFORE the multipart parser on the route, so a throttled caller is
+ * refused without a single byte being written.
+ */
+const documentLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 40, label: 'Document upload' });
+
 module.exports = {
   invitationLimiter,
   authLimiter,
@@ -154,5 +187,8 @@ module.exports = {
   onboardingLimiter,
   companyLimiter,
   billingLimiter,
+  profileLimiter,
   refreshLimiter,
+  projectLimiter,
+  documentLimiter,
 };

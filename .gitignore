@@ -3,9 +3,12 @@ node_modules/
 
 # Environment
 #
-# Every .env variant is ignored, EXCEPT .env.example, which is the committed
-# template and must therefore contain placeholders only — never a real key.
-#
+# Every .env variant is ignored, .env.example included. It was once tracked as
+# the committed template, and listing it here did not protect it: .gitignore has
+# no effect on a file already in the index, so it went on being committed — with
+# a live SMTP password and Stripe keys in it. It was untracked in b0f06b5 and
+# stays ignored.
+
 # .env.example used to be listed here as if that protected it. It did not: git
 # had already begun tracking the file, and .gitignore has no effect on a file
 # already in the index. It went on being committed — with a live SMTP password
@@ -18,17 +21,27 @@ API_INTEGRATION.md
 CHANGELOG_API.md
 openapi.yaml
 
-.gitignore
+# .gitignore
 # Logs
 logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.vercel/
 
 # Build output
 dist/
 build/
+
+# Uploaded files (profile pictures). User data, not source: the folder is
+# recreated on demand by the upload middleware, and the database holds the keys.
+uploads/
+
+# Project documents. Same reasoning, plus one more: these are clients' financial
+# records, and they are stored outside uploads/ precisely so nothing serves them
+# statically. A copy in the repository would undo that in the worst possible way.
+private-uploads/
 
 # OS / editor
 .DS_Store
