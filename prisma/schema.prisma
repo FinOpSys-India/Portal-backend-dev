@@ -1,0 +1,1055 @@
+// Prisma schema — a DESCRIPTION of the Finopsys Portal database, not its owner.
+//
+// The database schema is managed BY HAND: tables are created and altered by
+// running the SQL in db/schema/ yourself. This file exists so the Prisma Client
+// can be generated with the right models; it does not drive the database and
+// there are no migrations.
+//
+// After a hand-made schema change, bring this file back in line —
+//   npm run db:pull       rewrite this file FROM the live database
+//   npm run db:generate   rebuild the client
+// If it drifts from the real tables, queries fail at runtime against columns
+// that do not exist. See db/README.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// The connection URL is supplied at runtime (prisma.config.js for the CLI,
+// src/config/prisma.js for the app), so it is deliberately absent here.
+datasource db {
+  provider = "postgresql"
+}
+
+/// Top-level role. ADMIN and ACCOUNTING_MANAGER stand alone; SPECIALIST and
+/// CUSTOMER are subdivided further by SpecificRole.
+model Role {
+  id        Int      @id @default(autoincrement())
+  code      String   @unique @db.VarChar(50)
+  name      String   @db.VarChar(100)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  specificRoles SpecificRole[]
+  users         User[]
+  invitations   Invitation[]
+
+  @@map("roles")
+}
+
+/// Subdivision of a Role (e.g. SPECIALIST -> Tax Specialist).
+///
+/// The @@unique([id, roleId]) below is not redundant with the primary key: it
+/// is the target of the composite foreign keys on User and Invitation, which
+/// is what prevents a record from pairing a role with a specific role that
+/// belongs to a different role.
+model SpecificRole {
+  id        Int      @id @default(autoincrement())
+  roleId    Int      @map("role_id")
+  code      String   @db.VarChar(50)
+  name      String   @db.VarChar(100)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  users       User[]
+  invitations Invitation[]
+
+  @@unique([roleId, code])
+  @@unique([id, roleId])
+  @@map("specific_roles")
+}
+
+model Address {
+  id          Int      @id @default(autoincrement())
+  line1       String   @db.VarChar(255)
+  line2       String?  @db.VarChar(255)
+  city        String   @db.VarChar(120)
+  state       String?  @db.VarChar(120)
+  postalCode  String?  @map("postal_code") @db.VarChar(20)
+  country     String   @db.VarChar(100)
+  // ISO 3166-1 alpha-2 (e.g. "US"). Added for the company onboarding form, which
+  // collects a country code alongside the country name. Nullable so existing
+  // address rows created before this column stay valid.
+  countryCode String?  @map("country_code") @db.VarChar(2)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  users            User[]
+  companyAddresses CompanyAddress[]
+
+  @@map("addresses")
+}
+
+/// A portal user. Created as INVITED with no passwordHash; the accept-invitation
+/// flow sets the password and moves them to ACTIVE.
+///
+/// The email column is stored already normalised (trimmed + lower-cased by the
+/// application before every write) and is uniquely indexed, so it doubles as the
+/// canonical lookup key for login — there is no separate email_normalized column.
+model User {
+  id             Int        @id @default(autoincrement())
+  firstName      String     @map("first_name") @db.VarChar(100)
+  lastName       String     @map("last_name") @db.VarChar(100)
+  email          String     @unique @db.VarChar(255)
+  passwordHash   String?    @map("password_hash") @db.VarChar(255)
+  roleId         Int        @map("role_id")
+  specificRoleId Int?       @map("specific_role_id")
+  addressId      Int?       @map("address_id")
+  status         UserStatus @default(INVITED)
+  hibernatedAt   DateTime?  @map("hibernated_at") @db.Timestamptz(6)
+
+  // Onboarding profile — collected from the post-signup onboarding form. Both
+  // nullable because the user row exists (INVITED/ACTIVE) before the form is
+  // submitted; firstName/lastName live above and are set at sign-up.
+  phone    String? @map("phone") @db.VarChar(30)
+  jobTitle String? @map("job_title") @db.VarChar(150)
+
+  /// Storage key of the profile picture ("avatars/18/9f3c2a.jpg"), never a URL —
+  /// see db/schema/15_add_user_avatar.sql. The client-facing `avatarUrl` is built
+  /// from it in dto/userDto; this value stays internal so the host, the mount
+  /// path, and one day the CDN can all change without touching stored data.
+  avatarKey String? @map("avatar_key") @db.VarChar(512)
+
+  // Login-security fields. failedLoginAttempts/lockedUntil back the password
+  // attempt limiter; the last_login_* columns are written only after a fully
+  // completed (password + OTP) login. The IP is stored as a keyed hash, never
+  // in the clear.
+  failedLoginAttempts Int       @default(0) @map("failed_login_attempts")
+  lockedUntil         DateTime? @map("locked_until") @db.Timestamptz(6)
+  lastLoginAt         DateTime? @map("last_login_at") @db.Timestamptz(6)
+  lastLoginIpHash     String?   @map("last_login_ip_hash") @db.VarChar(64)
+
+  // Set every time the password is changed (currently: the reset flow). Kept as
+  // an audit trail of when the credential last rotated, and the natural anchor
+  // for a future "reject access tokens issued before this instant" check — the
+  // reset flow revokes refresh tokens, but an already-issued access token stays
+  // valid for the rest of its short TTL.
+  passwordChangedAt DateTime? @map("password_changed_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  role    Role     @relation(fields: [roleId], references: [id])
+  address Address? @relation(fields: [addressId], references: [id])
+
+  // Composite FK: guarantees specificRole (when set) belongs to role.
+  specificRole SpecificRole? @relation(fields: [specificRoleId, roleId], references: [id, roleId])
+
+  sentInvitations      Invitation[]          @relation("InvitedBy")
+  acceptedInvitation   Invitation[]          @relation("AcceptedUser")
+  refreshTokens        RefreshToken[]
+  loginChallenges      LoginChallenge[]
+  passwordResetTickets PasswordResetTicket[]
+
+  // Company relations (post-signup company onboarding). ownedCompanies is a
+  // one-to-many — a user may own several companies; managedCompanies is the set
+  // they are accounting manager for; specialistAssignments is their per-company
+  // specialist work.
+  ownedCompanies        Company[]                     @relation("CompanyOwner")
+  managedCompanies      Company[]                     @relation("CompanyAccountingManager")
+  specialistAssignments CompanySpecialistAssignment[] @relation("AssignmentSpecialist")
+
+  // The companies this user is the standing specialist for, per service line.
+  bookkeepingCompanies Company[] @relation("CompanyBookkeepingSpecialist")
+  payrollCompanies     Company[] @relation("CompanyPayrollSpecialist")
+  taxCompanies         Company[] @relation("CompanyTaxSpecialist")
+
+  // The companies this user is a TEAMMATE on, as opposed to ownedCompanies
+  // above. A CUSTOMER/TEAM user reaches a company only through here.
+  companyMemberships CompanyMember[] @relation("CompanyMemberUser")
+
+  // Projects. `createdProjects` are the ones this user opened (an accounting
+  // manager or a customer); `assignedProjects` are the ones auto-staffed to them
+  // as the company's standing specialist for that service line. Two relations
+  // because the two roles are independent — the creator is never the specialist.
+  createdProjects  Project[] @relation("ProjectCreatedBy")
+  assignedProjects Project[] @relation("ProjectSpecialist")
+
+  uploadedProjectDocuments ProjectDocument[] @relation("ProjectDocumentUploader")
+
+  idempotencyKeys       IdempotencyKey[]
+
+  @@map("users")
+}
+
+/// A refresh token issued at sign-in / sign-up. Only the SHA-256 hash of the
+/// token is stored — the raw value is shown to the client once and never
+/// persisted, so a database leak cannot be replayed as a session. A row is
+/// revoked (revokedAt set) on logout or rotation rather than deleted, which
+/// keeps an audit trail of when a session ended.
+///
+/// ROTATION + REUSE DETECTION (implemented — see services/refreshTokenService).
+///
+/// Each refresh token is single-use. Presenting one revokes it and mints its
+/// successor in the same `familyId`, with `replacedById` pointing at the
+/// successor. A token that already has a `replacedById` is by definition one
+/// that has been used before — and since the legitimate client discarded it the
+/// moment it was rotated, seeing it again means a copy is in circulation.
+///
+/// The response to that is to revoke the WHOLE family, not just the replayed
+/// row. We cannot tell whether the replay came from the thief or the victim, so
+/// keeping either session alive risks keeping the attacker's. Forcing both to
+/// log in again is the only outcome that is certainly safe.
+model RefreshToken {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  tokenHash String    @unique @map("token_hash") @db.VarChar(255)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+
+  /// Shared by every token descended from one login. Indexed, because the
+  /// reuse-detection path revokes by family.
+  familyId String? @map("family_id") @db.Uuid
+
+  /// The token this one was rotated into. NULL means "current".
+  replacedById Int? @map("replaced_by_id")
+
+  /// Why the session ended: 'rotated', 'logout', 'logout_all',
+  /// 'password_reset', 'reuse_detected'. A short machine string, never free text.
+  revokedReason String? @map("revoked_reason") @db.VarChar(50)
+
+  /// Keyed hashes of the issuing context, never the values in the clear.
+  createdIpHash String?   @map("created_ip_hash") @db.VarChar(64)
+  userAgentHash String?   @map("user_agent_hash") @db.VarChar(64)
+  lastUsedAt    DateTime? @map("last_used_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  replacedBy RefreshToken?  @relation("TokenRotation", fields: [replacedById], references: [id], onDelete: SetNull)
+  replaces   RefreshToken[] @relation("TokenRotation")
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// A pending or completed invitation. The token is what the invitee presents
+/// on the accept-invitation link.
+///
+/// Rows are created PENDING and only move to SENT once the invitation email is
+/// actually delivered, so a PENDING row that is not brand new means the mail
+/// failed and needs resending.
+model Invitation {
+  id             Int              @id @default(autoincrement())
+  email          String           @db.VarChar(255)
+  firstName      String           @map("first_name") @db.VarChar(100)
+  lastName       String           @map("last_name") @db.VarChar(100)
+  roleId         Int              @map("role_id")
+  specificRoleId Int?             @map("specific_role_id")
+  invitedById    Int              @map("invited_by")
+
+  /// SHA-256 of the invitation token. The raw value is emailed to the invitee
+  /// and never persisted — it is a real credential, since holding it completes a
+  /// sign-up as the invited person with that invitation's role and email
+  /// address. It used to be stored in the clear, alone among the secrets in this
+  /// schema.
+  ///
+  /// The consequence to know about: the server cannot reproduce the raw token,
+  /// so "resend" mints a fresh one and supersedes the previous link rather than
+  /// re-sending it.
+  tokenHash      String           @unique @map("token_hash") @db.VarChar(64)
+
+  /// The job title from the invite form, carried through to `users.job_title` at
+  /// sign-up so the invitee never re-enters it. Nullable: invitations predating
+  /// db/schema/16 have none.
+  jobTitle       String?          @map("job_title") @db.VarChar(150)
+
+  /// SUPERSEDED by the `companies` relation below, and mapped only so this model
+  /// still describes the table truthfully. The teammate form targets SEVERAL
+  /// companies at once, which one column cannot hold; nothing writes this any
+  /// more, and db/schema/16 backfilled its values into invitation_companies.
+  companyId      Int?             @map("company_id")
+
+  status         InvitationStatus @default(PENDING)
+  expiresAt      DateTime         @map("expires_at") @db.Timestamptz(6)
+  acceptedUserId Int?             @map("accepted_user_id")
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  role         Role  @relation(fields: [roleId], references: [id])
+  invitedBy    User  @relation("InvitedBy", fields: [invitedById], references: [id])
+  acceptedUser User? @relation("AcceptedUser", fields: [acceptedUserId], references: [id])
+
+  // Composite FK: same guarantee as on User.
+  specificRole SpecificRole? @relation(fields: [specificRoleId, roleId], references: [id, roleId])
+
+  /// The companies this invitation is for — a set, because the teammate form
+  /// lets an owner pick several at once.
+  companies InvitationCompany[]
+
+  @@index([email])
+  @@map("invitations")
+}
+
+/// One company an invitation is for — the INTENT, before the invitee accepts.
+///
+/// Its counterpart is CompanyMember, the FACT after they accept. Sign-up copies
+/// one into the other (services/authService.signup); keeping the two apart is
+/// what stops a pending invitation from reading as membership.
+model InvitationCompany {
+  invitationId Int      @map("invitation_id")
+  companyId    Int      @map("company_id")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  invitation Invitation @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@id([invitationId, companyId])
+  @@index([companyId])
+  @@map("invitation_companies")
+}
+
+/// A teammate on a company: the customer-side membership link.
+///
+/// The table has existed in the database all along but was absent from this
+/// schema, so no code could reach it — which is why several comments elsewhere
+/// still say a CUSTOMER/TEAM user has no company link. It does; this is it.
+///
+/// Distinct from `companies.owner_user_id`, which is OWNERSHIP: exactly one
+/// user, with write access to the company itself. A member is one of many and
+/// holds no such rights — this only says they belong to the account.
+model CompanyMember {
+  id        Int      @id @default(autoincrement())
+  companyId Int      @map("company_id")
+  userId    Int      @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company Company @relation(fields: [companyId], references: [id])
+  user    User    @relation("CompanyMemberUser", fields: [userId], references: [id])
+
+  // One membership per (company, user) — what makes re-accepting or re-inviting
+  // idempotent instead of listing a person twice on the roster.
+  @@unique([companyId, userId])
+  @@index([userId])
+  @@map("company_members")
+}
+
+/// A short-lived, single-use email-OTP challenge. Two flows use it, told apart
+/// by `purpose`:
+///   - LOGIN_EMAIL_OTP: issued after a password is verified. The user is NOT
+///     logged in while this row is open — it only proves "the right password was
+///     entered; now prove control of the mailbox".
+///   - PASSWORD_RESET_EMAIL_OTP: issued when a forgotten-password request names a
+///     known, active account. Proving control of the mailbox is the ONLY thing
+///     this establishes; it does not log anyone in and does not by itself permit
+///     a password change — verifying it mints a PasswordResetTicket, and that
+///     ticket is what the confirm step consumes.
+///
+/// The plain OTP is never stored: otpDigest holds HMAC-SHA256(OTP_SECRET,
+/// challengeId + ":" + otp). Single-use and single-consumer under concurrency
+/// are enforced by conditional updates (used_at IS NULL AND invalidated_at IS
+/// NULL AND expires_at > now), so of two racing verify/resend requests exactly
+/// one affects the row.
+///
+/// Only one challenge per (user, purpose) is meant to be active at a time; a new
+/// login or reset request invalidates the previous ones for that purpose in the
+/// same transaction. The two purposes are independent — starting a password
+/// reset does not disturb an in-flight login challenge.
+///
+/// FUTURE:
+///   - Partial unique index enforcing one active challenge per (user_id,
+///     purpose) at the DB level (WHERE used_at IS NULL AND invalidated_at IS
+///     NULL). Prisma cannot express it in-schema; add it as raw SQL in a
+///     migration to make the "one active challenge" rule a hard guarantee.
+///   - Cleanup job: a scheduled task to delete/archive expired, used, and
+///     invalidated challenges past a retention window so this table does not
+///     grow unbounded. (Same job should prune expired/revoked refresh_tokens
+///     and used/expired password_reset_tickets.)
+model LoginChallenge {
+  id             String            @id @db.Uuid
+  userId         Int               @map("user_id")
+  purpose        ChallengePurpose  @default(LOGIN_EMAIL_OTP)
+  otpDigest      String            @map("otp_digest") @db.VarChar(64)
+  expiresAt      DateTime          @map("expires_at") @db.Timestamptz(6)
+  failedAttempts Int               @default(0) @map("failed_attempts")
+  resendCount    Int               @default(0) @map("resend_count")
+  lastSentAt     DateTime          @map("last_sent_at") @db.Timestamptz(6)
+  usedAt         DateTime?         @map("used_at") @db.Timestamptz(6)
+  invalidatedAt  DateTime?         @map("invalidated_at") @db.Timestamptz(6)
+  deliveryStatus OtpDeliveryStatus @default(QUEUED) @map("delivery_status")
+  requestIpHash  String?           @map("request_ip_hash") @db.VarChar(64)
+  userAgentHash  String?           @map("user_agent_hash") @db.VarChar(64)
+  createdAt      DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("login_challenges")
+}
+
+/// Permission to set a new password, minted only when a PASSWORD_RESET_EMAIL_OTP
+/// challenge is verified successfully. It exists so the "set the new password"
+/// request carries proof that the OTP step actually passed: without it that
+/// endpoint would have to trust a client-supplied user id or re-accept the OTP,
+/// either of which lets anyone who can guess an email set someone's password.
+///
+/// Like a refresh token, only the SHA-256 hash of the ticket is stored — the raw
+/// value is returned to the client once and never persisted, so a database leak
+/// cannot be replayed into a password change. Single-use is enforced by a
+/// conditional update on used_at, so two racing confirm requests cannot both
+/// succeed.
+///
+/// Deliberately short-lived (PASSWORD_RESET_TICKET_TTL_SECONDS, default 10 min):
+/// long enough to type a password, short enough that a ticket left in a browser
+/// history or proxy log is worthless by the time anyone finds it.
+model PasswordResetTicket {
+  id     String @id @db.Uuid
+  userId Int    @map("user_id")
+
+  /// The challenge this ticket was minted from. Unique, so one verified OTP can
+  /// never yield two tickets. Not a foreign key on purpose: challenges are
+  /// prunable by the cleanup job, and losing the challenge row must not
+  /// invalidate (or cascade-delete) a ticket that is still in use.
+  challengeId String @unique @map("challenge_id") @db.Uuid
+
+  tokenHash String    @unique @map("token_hash") @db.VarChar(64)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(6)
+
+  /// Keyed hashes of the requesting IP / user agent, never the values in the
+  /// clear — same treatment as LoginChallenge, for after-the-fact investigation
+  /// of a suspicious reset.
+  requestIpHash String? @map("request_ip_hash") @db.VarChar(64)
+  userAgentHash String? @map("user_agent_hash") @db.VarChar(64)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("password_reset_tickets")
+}
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  HIBERNATED
+
+  @@map("user_status")
+}
+
+/// Purpose an OTP challenge is bound to. A challenge minted for one purpose must
+/// never be accepted by another flow: a LOGIN_EMAIL_OTP code must not be usable
+/// to reset a password, and a PASSWORD_RESET_EMAIL_OTP code must not complete a
+/// login. Every read of a challenge checks `purpose` before anything else, so a
+/// challenge id from the wrong flow is rejected exactly like an unknown one.
+enum ChallengePurpose {
+  LOGIN_EMAIL_OTP
+  PASSWORD_RESET_EMAIL_OTP
+
+  @@map("challenge_purpose")
+}
+
+/// Delivery state of the OTP email tied to a challenge.
+enum OtpDeliveryStatus {
+  QUEUED
+  DELIVERED
+  FAILED
+
+  @@map("otp_delivery_status")
+}
+
+enum InvitationStatus {
+  PENDING
+  SENT
+  ACCEPTED
+  EXPIRED
+  REVOKED
+
+  @@map("invitation_status")
+}
+
+/// A company (tenant) created through the post-signup company onboarding flow.
+/// Owned directly by the user who created it: a single user may own MANY
+/// companies, so owner_user_id is indexed but NOT unique. Address fields never
+/// live here — they are held in the shared `addresses` table and linked through
+/// CompanyAddress.
+///
+/// `status` tracks lifecycle (ONBOARDING -> ACTIVE …); `onboardingCompleted` is
+/// the boolean the client gates on. `deletedAt` is a soft-delete tombstone — every
+/// read filters it out, so a "deleted" company keeps its history for audit.
+///
+/// employee_count >= 0 and last_year_revenue >= 0 are enforced by CHECK
+/// constraints added in the migration (Prisma cannot express CHECKs in-schema).
+model Company {
+  id                      Int           @id @default(autoincrement())
+  companyName             String        @map("company_name") @db.VarChar(255)
+  companyType             CompanyType   @map("company_type")
+  /// Unique across live companies, and never a registered user's login email.
+  ///
+  /// NOT marked `@unique`: the real index is functional and partial
+  /// (lower(company_email) WHERE deleted_at IS NULL — see db/schema/09), which
+  /// Prisma cannot express. Declaring a plain `@unique` here would generate a
+  /// findUnique that misdescribes both halves of it, so lookups go through
+  /// companyRepository.findCompanyByEmail instead. The cross-table half of the
+  /// rule lives in companyService.assertCompanyEmailAvailable.
+  companyEmail            String        @map("company_email") @db.VarChar(255)
+  companyPhone            String        @map("company_phone") @db.VarChar(30)
+  employeeCount           Int           @map("employee_count")
+  // Money is NUMERIC, never floating point: 18 digits with 2 decimals holds any
+  // realistic annual revenue without rounding error.
+  lastYearRevenue         Decimal       @map("last_year_revenue") @db.Decimal(18, 2)
+  revenueCurrency         String        @map("revenue_currency") @db.Char(3)
+  ownerUserId             Int           @map("owner_user_id")
+  accountingManagerUserId Int?          @map("accounting_manager_user_id")
+
+  /// The company's standing specialist for each of the three service lines.
+  ///
+  /// Separate nullable columns rather than rows in
+  /// company_specialist_assignments because they answer a different question:
+  /// this is "who is the ONE bookkeeping/payroll/tax specialist on this account
+  /// right now", which the admin grid renders as three columns. The assignment
+  /// table remains the record of specialist WORK — many per company, keyed by
+  /// specialization, with an unassigned_at history — and neither replaces the
+  /// other.
+  bookkeepingSpecialistUserId Int? @map("bookkeeping_specialist_user_id")
+  payrollSpecialistUserId     Int? @map("payroll_specialist_user_id")
+  taxSpecialistUserId         Int? @map("tax_specialist_user_id")
+
+  status                  CompanyStatus @default(ONBOARDING)
+  onboardingCompleted     Boolean       @default(false) @map("onboarding_completed")
+
+  /// The company's Stripe Customer. Billing is per COMPANY, not per user: one
+  /// user owns many companies and each pays for its own service, so a per-user
+  /// customer would merge their billing. Nullable — created lazily at the first
+  /// checkout — and unique, since a Stripe Customer maps to exactly one company.
+  stripeCustomerId String? @unique @map("stripe_customer_id") @db.VarChar(255)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  // RESTRICT: a user who still owns a company cannot be deleted out from under it.
+  owner             User      @relation("CompanyOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  // At most one accounting manager per company (single nullable column). SetNull
+  // so removing the manager's user account just clears the link.
+  accountingManager User? @relation("CompanyAccountingManager", fields: [accountingManagerUserId], references: [id], onDelete: SetNull)
+
+  // Same shape as the manager link: one optional user per service line, cleared
+  // rather than blocked when that user's account goes away.
+  bookkeepingSpecialist User? @relation("CompanyBookkeepingSpecialist", fields: [bookkeepingSpecialistUserId], references: [id], onDelete: SetNull)
+  payrollSpecialist     User? @relation("CompanyPayrollSpecialist", fields: [payrollSpecialistUserId], references: [id], onDelete: SetNull)
+  taxSpecialist         User? @relation("CompanyTaxSpecialist", fields: [taxSpecialistUserId], references: [id], onDelete: SetNull)
+
+  addresses             CompanyAddress[]
+  specialistAssignments CompanySpecialistAssignment[]
+  subscriptions         CompanySubscription[]
+  payments              CompanyPayment[]
+
+  // The customer-side roster: teammates who belong to this account but do not
+  // own it, and the invitations still outstanding for it.
+  members               CompanyMember[]
+  pendingInvitations    InvitationCompany[]
+
+  projects              Project[]
+
+  @@index([ownerUserId])
+  @@index([accountingManagerUserId])
+  @@index([status])
+  @@map("companies")
+}
+
+/// Join between a company and a row in the shared `addresses` table. A company
+/// may have several addresses of different types; at most one may be the primary
+/// (enforced by a partial unique index added in the migration:
+/// UNIQUE (company_id) WHERE is_primary).
+model CompanyAddress {
+  id          Int                @id @default(autoincrement())
+  companyId   Int                @map("company_id")
+  addressId   Int                @map("address_id")
+  addressType CompanyAddressType @default(BUSINESS) @map("address_type")
+  isPrimary   Boolean            @default(false) @map("is_primary")
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  // RESTRICT: the address row outlives the mapping; deleting a linked address is
+  // blocked so a company is never left pointing at nothing.
+  address Address @relation(fields: [addressId], references: [id], onDelete: Restrict)
+
+  // The same address cannot be linked to the same company twice under one type.
+  @@unique([companyId, addressId, addressType])
+  @@index([companyId])
+  @@index([addressId])
+  @@map("company_addresses")
+}
+
+/// Lookup catalog of accounting specializations a specialist can be assigned to a
+/// company for. Seeded with the four business specializations (see prisma/seed.js).
+/// Distinct from the SPECIALIST SpecificRole hierarchy: that classifies the user,
+/// this classifies the per-company assignment.
+model Specialization {
+  id                 Int      @id @default(autoincrement())
+  specializationCode String   @unique @map("specialization_code") @db.VarChar(50)
+  specializationName String   @map("specialization_name") @db.VarChar(100)
+  isActive           Boolean  @default(true) @map("is_active")
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  assignments  CompanySpecialistAssignment[]
+  // The sellable Stripe products for this service, one per pricing tier.
+  servicePlans ServicePlan[]
+
+  @@map("specializations")
+}
+
+/// A specialist assigned to a company for one specialization. Many-to-many across
+/// three axes: a company has many specialists (and many for the SAME
+/// specialization), a specialist serves many companies, and a specialist may hold
+/// several specializations at one company.
+///
+/// A partial unique index (added in the migration) forbids two ACTIVE rows for the
+/// same (company, specialist, specialization); removing an assignment is a soft
+/// delete (status INACTIVE + unassigned_at) so the slot frees up and the history
+/// is kept.
+model CompanySpecialistAssignment {
+  id               Int              @id @default(autoincrement())
+  companyId        Int              @map("company_id")
+  specialistUserId Int              @map("specialist_user_id")
+  specializationId Int              @map("specialization_id")
+  assignmentStatus AssignmentStatus @default(ACTIVE) @map("assignment_status")
+  assignedAt       DateTime         @default(now()) @map("assigned_at") @db.Timestamptz(6)
+  unassignedAt     DateTime?        @map("unassigned_at") @db.Timestamptz(6)
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime         @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company        Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  specialist     User           @relation("AssignmentSpecialist", fields: [specialistUserId], references: [id], onDelete: Cascade)
+  specialization Specialization @relation(fields: [specializationId], references: [id], onDelete: Restrict)
+
+  @@index([companyId])
+  @@index([specialistUserId])
+  @@index([specializationId])
+  @@map("company_specialist_assignments")
+}
+
+/// Idempotency ledger for POST /onboarding/company. Keyed on (user_id,
+/// idempotency_key): the first request stores its full response here inside the
+/// same transaction that creates the company, so a retry with the same header
+/// replays the stored response instead of creating a second company. request_hash
+/// pins the key to one payload — reusing a key with a different body is rejected.
+model IdempotencyKey {
+  id             Int      @id @default(autoincrement())
+  idempotencyKey String   @map("idempotency_key") @db.VarChar(255)
+  userId         Int      @map("user_id")
+  method         String   @db.VarChar(10)
+  path           String   @db.VarChar(255)
+  requestHash    String   @map("request_hash") @db.VarChar(64)
+  responseStatus Int      @map("response_status")
+  responseBody   Json     @map("response_body")
+  companyId      Int?     @map("company_id")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId])
+  @@map("idempotency_keys")
+}
+
+/// A sellable Stripe Price, mirrored locally so the catalog can be joined and
+/// filtered without calling Stripe on every page load.
+///
+/// `planCode` is OUR identifier and the ONLY thing the frontend sends. The
+/// Stripe price id is resolved from it server-side — accepting a price id or an
+/// amount from the request body would let a client subscribe to a premium tier
+/// at basic pricing.
+///
+/// `amount` is a DISPLAY CACHE, not the truth: Stripe owns pricing, and editing
+/// a price in the dashboard changes what is really charged. Re-sync this table
+/// when pricing changes, and never compute a receipt from it (see
+/// CompanySubscriptionItem.unitAmount and CompanyPayment.amountPaid).
+///
+/// amount >= 0 is enforced by a CHECK constraint in the migration.
+model ServicePlan {
+  id               Int             @id @default(autoincrement())
+  /// Which of the four services this sells (BOOKKEEPING, PAYROLL, TAX, FA_Q).
+  /// Nullable so a bundle or add-on that maps to no single service still fits.
+  specializationId Int?            @map("specialization_id")
+  planCode         String          @unique @map("plan_code") @db.VarChar(50)
+  planName         String          @map("plan_name") @db.VarChar(150)
+  stripeProductId  String          @map("stripe_product_id") @db.VarChar(255)
+  stripePriceId    String          @unique @map("stripe_price_id") @db.VarChar(255)
+  amount           Decimal         @db.Decimal(18, 2)
+  currency         String          @db.Char(3)
+  billingInterval  BillingInterval @default(MONTH) @map("billing_interval")
+  isActive         Boolean         @default(true) @map("is_active")
+
+  /// Quantity-based add-on flags. These four columns already exist in the
+  /// database (added by the service_plans ALTER that seeded the catalog); they
+  /// are declared here so Prisma can read them — this is a model/database sync,
+  /// not a schema change.
+  ///
+  /// `isAddOn` marks a component sold alongside a base plan rather than on its
+  /// own (the 1099-contractor and W-2-employee payroll lines). `quantityEnabled`
+  /// says the line is billed per unit, and `quantityLabel` is the wording the
+  /// frontend puts next to the counter ("Number of W-2 Employees").
+  /// `displayOrder` fixes the order tiers are listed in, so the catalog does not
+  /// reshuffle when a plan is re-seeded.
+  isAddOn         Boolean @default(false) @map("is_add_on")
+  quantityEnabled Boolean @default(false) @map("quantity_enabled")
+  quantityLabel   String? @map("quantity_label") @db.VarChar(100)
+  displayOrder    Int     @default(0) @map("display_order")
+
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  specialization Specialization? @relation(fields: [specializationId], references: [id], onDelete: Restrict)
+
+  subscriptionItems CompanySubscriptionItem[]
+  projects          Project[]
+
+  @@index([specializationId])
+  @@index([stripeProductId])
+  @@index([isActive])
+  @@map("service_plans")
+}
+
+/// A company's Stripe subscription. One subscription carries one line item per
+/// service bought, which is how "Bookkeeping + Payroll" becomes a single
+/// renewal date rather than two unrelated charges.
+///
+/// A partial unique index in the migration — UNIQUE (company_id) WHERE status =
+/// 'ACTIVE' — allows at most one live subscription per company while still
+/// letting a cancelled company subscribe again. A plain unique on company_id
+/// would have made cancellation permanent.
+///
+/// Rows are created INCOMPLETE before the redirect to Stripe, so an abandoned
+/// checkout is visible instead of invisible; the webhook promotes them.
+model CompanySubscription {
+  id        Int @id @default(autoincrement())
+  companyId Int @map("company_id")
+
+  /// Null until the checkout completes and the webhook reports the real id.
+  stripeSubscriptionId    String? @unique @map("stripe_subscription_id") @db.VarChar(255)
+  /// The Checkout Session this row was created for — how the completed webhook
+  /// finds the row it belongs to.
+  stripeCheckoutSessionId String? @unique @map("stripe_checkout_session_id") @db.VarChar(255)
+
+  status             SubscriptionStatus @default(INCOMPLETE)
+  currentPeriodStart DateTime?          @map("current_period_start") @db.Timestamptz(6)
+  currentPeriodEnd   DateTime?          @map("current_period_end") @db.Timestamptz(6)
+  cancelAtPeriodEnd  Boolean            @default(false) @map("cancel_at_period_end")
+  canceledAt         DateTime?          @map("canceled_at") @db.Timestamptz(6)
+
+  /// `created` of the newest Stripe event whose STATE has been applied to this
+  /// row. Stripe retries can deliver an older event after a newer one, and
+  /// without a high-water mark a stale `past_due` landing after `active` would
+  /// silently mark a paying company unpaid. Any event older than this is skipped.
+  ///
+  /// Only handlers that own subscription state stamp it. Invoice receipts are
+  /// deliberately written regardless of order — dropping one would lose a payment
+  /// record, and `company_payments.stripe_invoice_id` already makes them idempotent.
+  lastStripeEventAt DateTime? @map("last_stripe_event_at") @db.Timestamptz(6)
+
+  createdAt          DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  // RESTRICT: a company with billing history cannot be deleted out from under it.
+  company Company @relation(fields: [companyId], references: [id], onDelete: Restrict)
+
+  items    CompanySubscriptionItem[]
+  payments CompanyPayment[]
+
+  @@index([companyId])
+  @@index([status])
+  @@map("company_subscriptions")
+}
+
+/// One service on a subscription. `unitAmount` is deliberately duplicated from
+/// ServicePlan.amount rather than joined: raising a price must never rewrite
+/// what an existing subscriber is recorded as paying.
+///
+/// quantity >= 0 and unitAmount >= 0 are enforced by CHECK constraints in the
+/// migration.
+model CompanySubscriptionItem {
+  id                       Int      @id @default(autoincrement())
+  companySubscriptionId    Int      @map("company_subscription_id")
+  servicePlanId            Int      @map("service_plan_id")
+  stripeSubscriptionItemId String?  @unique @map("stripe_subscription_item_id") @db.VarChar(255)
+  quantity                 Int      @default(1)
+  unitAmount               Decimal  @map("unit_amount") @db.Decimal(18, 2)
+  currency                 String   @db.Char(3)
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  subscription CompanySubscription @relation(fields: [companySubscriptionId], references: [id], onDelete: Cascade)
+  servicePlan  ServicePlan         @relation(fields: [servicePlanId], references: [id], onDelete: Restrict)
+
+  // The same plan cannot appear twice on one subscription.
+  @@unique([companySubscriptionId, servicePlanId])
+  @@index([companySubscriptionId])
+  @@index([servicePlanId])
+  @@map("company_subscription_items")
+}
+
+/// The immutable record of money actually charged — one row per Stripe invoice.
+/// `amountPaid` is copied from the invoice and never recalculated from the plan
+/// catalog, so a historical receipt stays true after a price change.
+///
+/// The unique on stripeInvoiceId is what makes the recurring-invoice webhooks
+/// idempotent: Stripe may deliver the same invoice event more than once.
+model CompanyPayment {
+  id                    Int  @id @default(autoincrement())
+  companyId             Int  @map("company_id")
+  companySubscriptionId Int? @map("company_subscription_id")
+
+  stripeInvoiceId String? @unique @map("stripe_invoice_id") @db.VarChar(255)
+  /// Unique via a PARTIAL index (WHERE stripe_payment_intent_id IS NOT NULL), so
+  /// the many NULLs on invoice-settled rows do not collide. Subscription payments
+  /// dedupe on the invoice id; this is what makes a one-time `mode: 'payment'`
+  /// checkout — which has a PaymentIntent and no invoice — equally idempotent.
+  stripePaymentIntentId String? @unique @map("stripe_payment_intent_id") @db.VarChar(255)
+
+  amountPaid    Decimal       @default(0) @map("amount_paid") @db.Decimal(18, 2)
+
+  /// Tracked separately from `amountPaid` rather than by mutating it. The record
+  /// of what was charged must stay true — a receipt that silently rewrites
+  /// itself is not a receipt — and a PARTIAL refund has to be expressible
+  /// without destroying the original figure. A CHECK constraint keeps this at or
+  /// below `amountPaid`, because the refund webhooks can arrive out of order.
+  amountRefunded Decimal   @default(0) @map("amount_refunded") @db.Decimal(18, 2)
+  refundedAt     DateTime? @map("refunded_at") @db.Timestamptz(6)
+
+  /// The Stripe Charge. Refund and dispute events identify the payment by charge
+  /// rather than by invoice, so without this column they could not be matched
+  /// back to a row at all.
+  stripeChargeId String? @map("stripe_charge_id") @db.VarChar(255)
+
+  currency      String        @db.Char(3)
+  status        PaymentStatus @default(PENDING)
+  paidAt        DateTime?     @map("paid_at") @db.Timestamptz(6)
+  /// Stripe's decline reason, e.g. 'card_declined'. Short and non-sensitive —
+  /// never a card number or customer PII.
+  failureReason String?       @map("failure_reason") @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company      Company              @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  // SET NULL: a payment outlives the subscription it renewed.
+  subscription CompanySubscription? @relation(fields: [companySubscriptionId], references: [id], onDelete: SetNull)
+
+  @@index([companyId])
+  @@index([companySubscriptionId])
+  @@index([status])
+  @@index([paidAt])
+  @@index([stripeChargeId])
+  @@map("company_payments")
+}
+
+/// Webhook idempotency ledger. Stripe retries delivery until it receives a 2xx,
+/// so the same event WILL arrive more than once. The handler inserts the id
+/// first and stops on conflict — the same trick as IdempotencyKey, three columns
+/// wide.
+model StripeEvent {
+  id            Int       @id @default(autoincrement())
+  stripeEventId String    @unique @map("stripe_event_id") @db.VarChar(255)
+  eventType     String    @map("event_type") @db.VarChar(100)
+  processedAt   DateTime? @map("processed_at") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([eventType])
+  @@map("stripe_events")
+}
+
+enum CompanyStatus {
+  ONBOARDING
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+
+  @@map("company_status")
+}
+
+enum BillingInterval {
+  MONTH
+  YEAR
+
+  @@map("billing_interval")
+}
+
+/// Mirrors Stripe's subscription.status so a webhook can be applied by mapping
+/// the value straight across.
+enum SubscriptionStatus {
+  INCOMPLETE
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+
+  @@map("subscription_status")
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+
+  @@map("payment_status")
+}
+
+/// Legal structure of a company. OTHER is the catch-all so the enum never blocks
+/// a legitimate onboarding; the validator maps unknown form values to OTHER only
+/// when explicitly configured to.
+enum CompanyType {
+  SOLE_PROPRIETORSHIP
+  PARTNERSHIP
+  LIMITED_LIABILITY_COMPANY
+  C_CORPORATION
+  S_CORPORATION
+  NON_PROFIT
+  OTHER
+
+  @@map("company_type")
+}
+
+enum CompanyAddressType {
+  BUSINESS
+  BILLING
+  MAILING
+  REGISTERED
+  OTHER
+
+  @@map("company_address_type")
+}
+
+enum AssignmentStatus {
+  ACTIVE
+  INACTIVE
+
+  @@map("assignment_status")
+}
+
+/// A unit of work opened against one company, for one purchased service, with a
+/// deadline. Created only by an ACCOUNTING_MANAGER or a CUSTOMER — that rule is
+/// enforced in the service layer, where the role is already loaded from the
+/// verified token; a database CHECK cannot reach users.role_id.
+model Project {
+  id           Int      @id @default(autoincrement())
+  companyId    Int      @map("company_id")
+  projectName  String   @map("project_name") @db.VarChar(255)
+
+  /// A DATE, not a timestamp. A deadline is the calendar day the user picked;
+  /// storing a time zone would make "31 Dec" entered in IST render as 30 Dec to
+  /// a viewer in New York — a wrong answer to the question being asked.
+  deadlineDate DateTime @map("deadline_date") @db.Date
+
+  /// Which service this project is for. The form offers only the plans the
+  /// company actually bought (see repositories — the read joins
+  /// company_subscription_items), so a project cannot exist for a service
+  /// nobody is paying for.
+  servicePlanId Int     @map("service_plan_id")
+
+  /// Auto-assigned at insert from the company's standing specialist for this
+  /// plan's specialization — bookkeeping plan reads
+  /// companies.bookkeeping_specialist_user_id, and so on.
+  ///
+  /// Nullable on purpose: a company can be unstaffed on that line, and FA_Q has
+  /// no specialist column at all (see config/serviceCatalog). Refusing the
+  /// project would block real work; NULL is a truthful "unstaffed" an admin
+  /// screen can surface and fill in.
+  ///
+  /// STORED rather than derived on read: reassigning the company's specialist
+  /// next quarter must not rewrite who owned a project that closed last
+  /// quarter. Same reasoning as CompanySubscriptionItem.unitAmount.
+  assignedSpecialistUserId Int? @map("assigned_specialist_user_id")
+
+  createdByUserId Int           @map("created_by_user_id")
+  status          ProjectStatus @default(TODO)
+  description     String?
+
+  /// How far along the work is, 0–100, as the progress bar renders it.
+  ///
+  /// NUMERIC(5,2) rather than an integer, so half a percent is expressible; a
+  /// CHECK constraint in the database pins it to the 0–100 range, which Prisma
+  /// cannot state in-schema. NOT NULL with a default of 0 — a project that has
+  /// not started is at zero, which is a fact, not a missing value.
+  ///
+  /// Deliberately INDEPENDENT of `status`. The two answer different questions
+  /// ("what phase is this in" versus "how much of it is done") and a derived
+  /// percentage could only ever report the three values the enum has. Nothing
+  /// forces them to agree, so a project can sit at ACTIVE / 90 without a rule
+  /// having to be invented for it.
+  progressBar Decimal @default(0) @map("progress_bar") @db.Decimal(5, 2)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft delete, matching Company. A project referenced by documents should
+  /// leave the lists without vanishing from history.
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  // RESTRICT on company and plan: neither may be hard-deleted out from under a
+  // project's history. Companies are soft-deleted anyway, so this only blocks
+  // a true DELETE.
+  company     Company     @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  servicePlan ServicePlan @relation(fields: [servicePlanId], references: [id], onDelete: Restrict)
+
+  // SetNull: removing a staff account clears the assignment rather than
+  // blocking the delete or taking the project with it.
+  assignedSpecialist User? @relation("ProjectSpecialist", fields: [assignedSpecialistUserId], references: [id], onDelete: SetNull)
+  createdBy          User  @relation("ProjectCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  documents ProjectDocument[]
+
+  @@index([companyId])
+  @@index([assignedSpecialistUserId])
+  @@index([createdByUserId])
+  @@index([servicePlanId])
+  @@index([status, deadlineDate])
+  @@map("projects")
+}
+
+/// One file attached to a project. A table rather than an array column on
+/// Project: each file carries its own metadata (who uploaded it, when, how big,
+/// what type) and the set is unbounded.
+///
+/// The column split follows what middlewares/uploadAvatar already writes — a
+/// GENERATED storage key we control, plus the client's filename kept for display
+/// only. `originalName` is echoed back in the list and used as the
+/// Content-Disposition name on download; it is never joined to a filesystem
+/// path, because it is attacker-controlled.
+model ProjectDocument {
+  id           Int    @id @default(autoincrement())
+  projectId    Int    @map("project_id")
+  /// The path we generated, e.g. "projects/42/9f3c…b1.pdf". Unique, so a
+  /// retried upload cannot register the same bytes twice.
+  fileKey      String @unique @map("file_key") @db.VarChar(512)
+  originalName String @map("original_name") @db.VarChar(255)
+  mimeType     String @map("mime_type") @db.VarChar(150)
+  sizeBytes    BigInt @map("size_bytes")
+
+  uploadedByUserId Int? @map("uploaded_by_user_id")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  // CASCADE: a document means nothing without its project. Ordinary removal is
+  // the soft delete above, which leaves these rows alone.
+  project    Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  // SetNull: deleting a staff account loses the attribution, not the file.
+  uploadedBy User?   @relation("ProjectDocumentUploader", fields: [uploadedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([projectId])
+  @@index([uploadedByUserId])
+  @@map("project_documents")
+}
+
+enum ProjectStatus {
+  TODO
+  ACTIVE
+  COMPLETED
+
+  @@map("project_status")
+}

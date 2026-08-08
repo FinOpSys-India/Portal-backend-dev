@@ -1,0 +1,64 @@
+{
+  "name": "portal-backend-dev",
+  "version": "1.0.0",
+  "description": "Node.js + Express backend for the FinOpSys Portal, with PostgreSQL accessed through Prisma.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "stripe:listen": "stripe listen --forward-to http://localhost:3000/api/billing/webhook",
+    "billing:reconcile": "node scripts/reconcile-billing.js",
+    "db:seed": "node prisma/seed.js",
+    "db:pull": "prisma db pull",
+    "db:generate": "prisma generate",
+    "db:studio": "prisma studio",
+    "postinstall": "prisma generate",
+    "test": "jest"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FinOpSys-India/Portal-backend-dev.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/FinOpSys-India/Portal-backend-dev/issues"
+  },
+  "homepage": "https://github.com/FinOpSys-India/Portal-backend-dev#readme",
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "@prisma/adapter-pg": "^7.8.0",
+    "@prisma/client": "^7.8.0",
+    "@supabase/ssr": "^0.12.4",
+    "@supabase/supabase-js": "^2.111.0",
+    "bcrypt": "^6.0.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.2.0",
+    "nodemailer": "^9.0.3",
+    "pg": "^8.22.0",
+    "prisma": "^7.8.0",
+    "stripe": "^22.3.2"
+  },
+  "devDependencies": {
+    "jest": "^30.4.2",
+    "nodemon": "^3.1.14",
+    "supertest": "^7.2.2"
+  },
+  "directories": {
+    "test": "tests"
+  }
+}
