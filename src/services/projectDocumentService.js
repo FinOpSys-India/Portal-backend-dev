@@ -164,9 +164,26 @@ function isKeyForProject(key, projectId) {
   return new RegExp(`^projects/${projectId}/[0-9a-f]{32}(\\.[a-z0-9]+)?$`).test(key);
 }
 
-/** The 501 both direct-transfer endpoints raise when there is nothing to sign. */
+/**
+ * Raised when the deployment has no object store to sign against.
+ *
+ * ALWAYS A MISCONFIGURATION IN A DEPLOYED ENVIRONMENT, never a state a caller
+ * can do anything about: documents live in Supabase, and if the credentials are
+ * absent the driver falls back to a local folder that a serverless host wipes
+ * between requests. So this is a 5xx and the client is told to try later, while
+ * the thing that actually needs fixing — which driver is active — is put in
+ * `details` where whoever is reading the logs will see it.
+ *
+ * The one legitimate way to reach it is running locally, or in tests, without
+ * SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY set.
+ */
 function directTransferUnavailable() {
-  return new ApiError(501, 'This deployment stores documents locally; upload them through the API instead.', {
+  logger.error(
+    'Document storage is not configured: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required ' +
+      `for uploads and downloads, and the active driver is "${config.storage.driver}".`
+  );
+
+  return new ApiError(503, 'Document storage is not available right now.', {
     code: 'DIRECT_TRANSFER_UNAVAILABLE',
     details: { driver: config.storage.driver },
   });
