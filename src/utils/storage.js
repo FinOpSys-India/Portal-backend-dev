@@ -244,12 +244,30 @@ async function signedUrl({ bucket, key, expiresIn, download }) {
 
   const { data, error } = await supabase()
     .storage.from(bucket)
-    .createSignedUrl(key, expiresIn || config.storage.signedUrlTtlSeconds, {
-      download: download || true,
-    });
+    .createSignedUrl(key, expiresIn || config.storage.signedUrlTtlSeconds);
 
   if (error || !data?.signedUrl) return null;
-  return data.signedUrl;
+
+  /*
+   * `download` IS APPENDED BY HAND rather than passed as the SDK's option, and
+   * that is not a preference — the option encodes the value twice. A file called
+   * "Jira (2).csv" came back as `download=Jira+%25282%2529.csv`, and since `%25`
+   * is an encoded `%`, the browser saved it as "Jira %282%29.csv". Every name
+   * containing a space, a bracket or an accent — which is most names a person
+   * types — arrived mangled.
+   *
+   * Encoding it once here produces `download=Jira%20(2).csv`, and Supabase
+   * answers with `Content-Disposition: attachment; filename=Jira%20(2).csv`,
+   * which is the name the user uploaded.
+   *
+   * An empty value is still meaningful: it asks for the attachment disposition
+   * using the object's own stored name. That is the fallback when no name is
+   * given, and it is why the parameter is appended either way — without it the
+   * browser would render the file in the tab instead of saving it, and a
+   * user-supplied HTML file rendering on any origin is exactly what the
+   * attachment header exists to prevent.
+   */
+  return `${data.signedUrl}&download=${download ? encodeURIComponent(download) : ''}`;
 }
 
 /**

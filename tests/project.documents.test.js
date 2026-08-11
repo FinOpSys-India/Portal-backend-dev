@@ -362,7 +362,7 @@ describe('direct upload: POST .../documents/upload-url and /confirm', () => {
 
       const res = await askFor([pdf()]);
 
-      expect(res.status).toBe(501);
+      expect(res.status).toBe(503);
       expect(res.body.error.code).toBe('DIRECT_TRANSFER_UNAVAILABLE');
     });
   });
@@ -794,7 +794,7 @@ describe('POST /projects/:projectId/documents/links', () => {
       .set('Authorization', ownerAuth())
       .send({});
 
-    expect(res.status).toBe(501);
+    expect(res.status).toBe(503);
     expect(res.body.error.code).toBe('DIRECT_TRANSFER_UNAVAILABLE');
   });
 });

@@ -2,6 +2,7 @@
 
 const express = require('express');
 
+const config = require('../config');
 const { prisma } = require('../config/prisma');
 const requireAuth = require('../middlewares/requireAuth');
 const requirePaidAccount = require('../middlewares/requirePaidAccount');
@@ -35,6 +36,21 @@ const router = express.Router();
  *
  * Unauthenticated on purpose (a probe holds no token) and deliberately terse: it
  * reports reachability and nothing about versions, hosts, or configuration.
+ *
+ * `storage` IS reported, and it is the one exception to that rule — for a reason
+ * worth stating, because it looks like configuration and configuration does not
+ * belong in an unauthenticated response.
+ *
+ * What it reports is a READINESS FACT, not a setting: "supabase" means documents
+ * will work, "local" means every upload and download will fail on a serverless
+ * host, because there is no durable disk there. That failure is otherwise
+ * invisible until a user tries to open a file and gets a 503 — the credentials
+ * are absent, the driver quietly falls back, and nothing says so. This makes it
+ * one request to check, before anyone notices the hard way.
+ *
+ * It leaks nothing: the answer is one of two words. Not the project URL, not the
+ * bucket names, and certainly not the key — only whether this deployment is
+ * wired up.
  */
 router.get('/health', async (req, res) => {
   const startedAt = Date.now();
@@ -43,7 +59,12 @@ router.get('/health', async (req, res) => {
     return res.status(200).json({
       success: true,
       message: 'Healthy.',
-      data: { status: 'ok', database: 'up', latencyMs: Date.now() - startedAt },
+      data: {
+        status: 'ok',
+        database: 'up',
+        storage: config.storage.driver,
+        latencyMs: Date.now() - startedAt,
+      },
     });
   } catch (err) {
     return res.status(503).json({
