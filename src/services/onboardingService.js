@@ -105,12 +105,22 @@ function buildStatus(user) {
   const companies = user.ownedCompanies ?? [];
   const companyCreated = companies.length > 0;
   /*
-   * ANY owned company being paid up is enough. An owner adding a second company
-   * later is an established customer partway through a purchase, not someone
-   * back at the start of onboarding — requiring every company to be paid would
-   * throw them out of the portal the moment they created one.
+   * EVERY owned company must be paid up, not merely one of them.
+   *
+   * `some` was the earlier rule and it left a hole big enough to drive the whole
+   * billing model through: once the first company was paid for, an owner could
+   * go on creating companies that were never billed while the portal went on
+   * reporting onboarding complete — so nothing ever routed them back to service
+   * selection. An unpaid company is a shell with no services attached, and a
+   * flag that calls the account finished is simply wrong about it.
+   *
+   * `companyCreated &&` is not redundant. `every` on an empty array is true, so
+   * without it a user who has created no company at all — every teammate, and
+   * an owner who has just signed up — would be reported as fully paid. That flag
+   * is read on its own to decide which step to show, so it has to be truthful by
+   * itself and not merely in combination with the one above it.
    */
-  const paymentComplete = companies.some((c) => c.subscriptions.length > 0);
+  const paymentComplete = companyCreated && companies.every((c) => c.subscriptions.length > 0);
 
   return {
     user: {
@@ -297,9 +307,43 @@ async function provision({ userId }) {
  * Submit the onboarding form (step 7): first name, last name, phone, job title.
  * Identity comes from the token; the body carries profile data only.
  *
+ * FIRST TIME ONLY, AND FOR OWNERS ONLY. Once an owner's four fields are set the
+ * endpoint is closed to them for good, because it is the only route that can
+ * write a name or a job title and leaving it open made those fields editable for
+ * the life of the account — which is exactly what `PATCH /users/me` deliberately
+ * refuses to allow (it accepts phone and address, nothing else). An open
+ * onboarding route was therefore a way round that rule rather than a separate
+ * feature.
+ *
+ * The lock is deliberately NOT extended to anyone else. An owner is the account
+ * holder, and their name is what appears against a company on every internal
+ * screen — pinning it at sign-up is the point. A teammate, specialist,
+ * accounting manager or admin is a person working in the portal, and freezing a
+ * colleague's own name and job title on the strength of one form submission is a
+ * customer-account rule applied where no customer account is involved.
+ *
+ * The guard asks `buildStatus` rather than re-deriving "is it filled in?" or
+ * re-checking the role pair by hand, so the condition that closes this endpoint
+ * and the `isOwner`/`profileComplete` flags the client reads from GET /onboarding
+ * cannot drift apart.
+ *
+ * The cost is that an OWNER whose name was typed wrongly at sign-up needs an
+ * administrator to correct it. That is the intended trade: an owner's name is
+ * set once, on purpose.
+ *
  * @param {{ userId: number, profile: { firstName: string, lastName: string, phone: string, jobTitle: string } }} params
  */
 async function submitProfile({ userId, profile }) {
+  const existing = await prisma.user.findUnique({ where: { id: userId }, select: STATUS_SELECT });
+  if (!existing) throw userNotFound();
+
+  const { isOwner, profileComplete } = buildStatus(existing).onboarding;
+  if (isOwner && profileComplete) {
+    throw new ApiError(409, 'Your profile has already been submitted.', {
+      code: 'PROFILE_ALREADY_SUBMITTED',
+    });
+  }
+
   try {
     const user = await prisma.user.update({
       where: { id: userId },

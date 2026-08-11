@@ -65,13 +65,23 @@ const MAX_YEAR = 2100;
  *     UTC by the spec, but `new Date(2026, 11, 31)` is not, and mixing the two
  *     is how a deadline ends up stored as the day before.
  *
- * PAST DATES ARE ACCEPTED, deliberately. A deadline that has already passed is
- * not a malformed input — it is an overdue filing being entered after the fact,
- * which is ordinary accounting work. Refusing it would block a real task to
- * enforce a rule nobody asked for; the table surfaces it by sorting deadlines
- * soonest-first.
+ * `mustBeFuture` adds the one business rule this function knows about: the
+ * deadline must fall strictly after today. It is applied when a project is
+ * CREATED, where a due date of today or earlier is a typo rather than a plan —
+ * nobody opens a piece of work that was already due.
+ *
+ * It is deliberately NOT applied on update. An existing project's deadline slides
+ * into the past simply by time passing, and any later edit — renaming it, moving
+ * it to IN_PROGRESS — would then be refused over a date the user never touched.
+ * Correcting an overdue project is exactly when the record most needs to be
+ * editable.
+ *
+ * "Today" is midnight UTC, matching how the value itself is pinned. For a caller
+ * far enough east that their local tomorrow is still UTC today, that rejects a
+ * date they would call valid; the alternative is trusting a client-sent timezone
+ * to relax a validation rule, which is worse.
  */
-function validateDeadline(value, field = 'deadlineDate') {
+function validateDeadline(value, field = 'deadlineDate', { mustBeFuture = false } = {}) {
   const invalid = (detail) =>
     new ApiError(400, `${field} must be a calendar date in YYYY-MM-DD form.`, {
       code: 'VALIDATION_ERROR',
@@ -100,7 +110,27 @@ function validateDeadline(value, field = 'deadlineDate') {
     throw invalid(`Enter a year between ${MIN_YEAR} and ${MAX_YEAR}.`);
   }
 
+  if (mustBeFuture && parsed.getTime() <= todayUtcMidnight()) {
+    throw new ApiError(400, `${field} must be a date after today.`, {
+      code: 'VALIDATION_ERROR',
+      fields: { [field]: 'Choose a date after today.' },
+    });
+  }
+
   return parsed;
+}
+
+/**
+ * Today at midnight UTC, as milliseconds.
+ *
+ * Truncating to the day is what makes the comparison a CALENDAR one: comparing
+ * against `Date.now()` would accept today's date whenever the request arrived
+ * after 00:00, so "no deadline of today" would hold only for the first instant
+ * of each day.
+ */
+function todayUtcMidnight() {
+  const now = new Date();
+  return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
 }
 
 /* -------------------------------------------------------------------------- */
@@ -182,7 +212,8 @@ function validateProjectCreate(body = {}) {
   return {
     companyId: common.parseId(body.companyId, 'companyId'),
     projectName: common.str(body.projectName, 'projectName', { max: LIMITS.projectName }),
-    deadlineDate: validateDeadline(body.deadlineDate),
+    // Creation only: a new project due today or earlier is a typo, not a plan.
+    deadlineDate: validateDeadline(body.deadlineDate, 'deadlineDate', { mustBeFuture: true }),
     servicePlanId,
     specializationId,
     serviceCode,

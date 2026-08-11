@@ -3,6 +3,8 @@
 const express = require('express');
 
 const { prisma } = require('../config/prisma');
+const requireAuth = require('../middlewares/requireAuth');
+const requirePaidAccount = require('../middlewares/requirePaidAccount');
 const invitationRoutes = require('./invitationRoutes');
 const authRoutes = require('./authRoutes');
 const onboardingRoutes = require('./onboardingRoutes');
@@ -15,6 +17,7 @@ const roleRoutes = require('./roleRoutes');
 const adminRoutes = require('./adminRoutes');
 const accountingManagerRoutes = require('./accountingManagerRoutes');
 const projectRoutes = require('./projectRoutes');
+const documentRoutes = require('./documentRoutes');
 const billingRoutes = require('./billingRoutes');
 
 /**
@@ -66,17 +69,32 @@ router.use('/specialists', specialistRoutes);
 // admin, one company's customers for anyone else.
 router.use('/customers', customerRoutes);
 // One company's teammate roster, named with the same global ?companyId= filter.
-router.use('/teammates', teammateRoutes);
+// Gated: managing a roster is account work, and an unpaid account has none.
+router.use('/teammates', requireAuth, requirePaidAccount, teammateRoutes);
 // The role catalog the invite forms read their roleId/specificRoleId from.
 router.use('/roles', roleRoutes);
 // Admin-only company account management + its real-time channel.
 router.use('/admin', adminRoutes);
 // The accounting manager's own accounts, in more detail than the admin table.
 router.use('/accounting-manager', accountingManagerRoutes);
+/*
+ * THE PAYWALL. An owner with an unpaid company reaches nothing below this line.
+ *
+ * requireAuth runs first because requirePaidAccount needs a verified req.user to
+ * ask about; the feature routers install it again themselves, which is harmless
+ * (a second verification of the same token) and keeps each router standalone.
+ *
+ * Only these three are gated. /billing, /onboarding, /companies and /users are
+ * deliberately left open — they are exactly what an unpaid owner needs in order
+ * to stop being one.
+ */
 // Projects, always scoped to one company by ?companyId= — the table, the form's
 // service list, and the specialist auto-assignment.
-router.use('/projects', projectRoutes);
-router.use('/invitations', invitationRoutes);
+router.use('/projects', requireAuth, requirePaidAccount, projectRoutes);
+// Every file on a company, across its projects. Gated with /projects, since it
+// reads the same records through a different door.
+router.use('/documents', requireAuth, requirePaidAccount, documentRoutes);
+router.use('/invitations', requireAuth, requirePaidAccount, invitationRoutes);
 // POST /billing/webhook is mounted in app.js instead — it needs the raw body,
 // so it must sit ahead of express.json(). Everything else is authenticated here.
 router.use('/billing', billingRoutes);

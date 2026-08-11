@@ -219,9 +219,26 @@ describe('GET /onboarding — status', () => {
    * one is an established customer partway through a purchase — throwing them
    * back into onboarding would lock them out of the account they already pay for.
    */
-  it('stays complete when one company is paid and another is not', async () => {
+  /*
+   * The rule this asserts was once the opposite: ANY paid company completed the
+   * owner. That let an owner who had paid for their first company create further
+   * ones that were never billed while the portal went on reporting them finished,
+   * so nothing ever routed them back to service selection. Every company owned
+   * must be paid for.
+   */
+  it('is incomplete when one company is paid and another is not', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(
       completedOwner({ ownedCompanies: [company(true, 1), company(false, 2)] })
+    );
+
+    const res = await request(app).get('/api/onboarding').set('Authorization', auth());
+
+    expect(res.body.data.onboarding).toMatchObject({ paymentComplete: false, complete: false });
+  });
+
+  it('completes an owner once every company they own is paid', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(
+      completedOwner({ ownedCompanies: [company(true, 1), company(true, 2)] })
     );
 
     const res = await request(app).get('/api/onboarding').set('Authorization', auth());

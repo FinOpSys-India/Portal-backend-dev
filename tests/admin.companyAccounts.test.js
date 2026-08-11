@@ -1049,7 +1049,23 @@ describe('DELETE /companies/:id/accounting-manager', () => {
 /* --------------------- inheritance at company creation -------------------- */
 
 describe('POST /onboarding/company — accounting-manager inheritance', () => {
-  const ownerRow = person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', { specificRole: 'OWNER' });
+  /*
+   * `phone` and `jobTitle` are load-bearing here. POST /onboarding/company now
+   * asks onboardingService whether the caller's PROFILE is finished and refuses
+   * with a 409 if it is not — onboarding runs profile, then company, then
+   * payment, and the endpoint enforces that order rather than trusting the
+   * client's router to. An owner without those two fields never reaches the
+   * inheritance logic these tests are about.
+   *
+   * `ownedCompanies` is empty on purpose: this owner is creating their FIRST
+   * company, so there is nothing to have paid for yet.
+   */
+  const ownerRow = {
+    ...person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', { specificRole: 'OWNER' }),
+    phone: '+1 555 0100',
+    jobTitle: 'Founder',
+    ownedCompanies: [],
+  };
 
   function body() {
     return {

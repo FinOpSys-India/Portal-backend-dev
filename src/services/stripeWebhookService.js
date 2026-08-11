@@ -56,6 +56,85 @@ function mapSubscriptionStatus(stripeStatus) {
   return SUBSCRIPTION_STATUS[stripeStatus] ?? 'INCOMPLETE';
 }
 
+/**
+ * Statuses that mean the company has stopped paying and is not about to resume
+ * on its own.
+ *
+ * PAST_DUE is deliberately absent. Stripe is still retrying the card during
+ * dunning and most of these recover within days, so suspending on the first
+ * failed attempt would take a customer's portal away over a temporary decline.
+ * UNPAID is where Stripe gives up, and CANCELED is the end of the road; those
+ * are the two that mean it.
+ */
+const LAPSED_SUBSCRIPTION_STATUSES = new Set(['UNPAID', 'CANCELED']);
+
+/**
+ * Keep `companies.status` honest about whether the company is being paid for.
+ * Call this after any write that changes a subscription's status.
+ *
+ * Both directions matter, and each was broken in its own way before:
+ *
+ *   ACTIVE   — company onboarding creates the row as ONBOARDING and stops there,
+ *              so THIS is what makes a company live. The old code activated it
+ *              the moment its details were submitted, which left an abandoned
+ *              checkout looking exactly like a paying customer.
+ *   SUSPENDED — a cancelled or unpaid subscription used to leave the company
+ *              reading ACTIVE forever. The owner was locked out by
+ *              requirePaidAccount, but every internal screen — the admin table,
+ *              the pickers, every `status` filter — still called the account
+ *              live. The same lie as the first case, pointing the other way.
+ *
+ * Called from several handlers on purpose. Stripe has more than one event that
+ * can be the first to report a subscription live — checkout.session.completed
+ * normally, but an invoice or payment_intent can arrive first, and after a lapse
+ * a renewal is what recovers it — so whichever lands first must be enough. Both
+ * repository calls are status-guarded `updateMany`s, so duplicates cost nothing
+ * and neither can touch an ARCHIVED company.
+ *
+ * WHY A PAYMENT MAY UN-SUSPEND. Reactivation accepts SUSPENDED as well as
+ * ONBOARDING, which means an account an admin suspended by hand comes back if a
+ * renewal succeeds. That is the lesser of two wrongs: the alternative leaves
+ * every customer who recovers from a failed card permanently suspended with no
+ * path back, which is the common case, against an admin suspension that is rare
+ * and re-appliable. If the two ever need telling apart, it takes a separate
+ * column recording WHO suspended the account — not a subtler status check.
+ *
+ * Never throws into the caller: the payment has already been recorded by the
+ * time this runs, and failing the webhook here would have Stripe retry an event
+ * whose financial half already succeeded. A company left on the wrong status is
+ * visibly wrong and recoverable; a re-delivered payment is neither.
+ */
+async function syncCompanyOnSubscriptionStatus({ companyId, status, requestId, event }) {
+  if (!companyId || !status) return;
+
+  const activating = status === 'ACTIVE';
+  const lapsing = LAPSED_SUBSCRIPTION_STATUSES.has(status);
+  if (!activating && !lapsing) return;
+
+  try {
+    const { count } = activating
+      ? await companyRepo.activateCompanyOnPayment(prisma, companyId)
+      : await companyRepo.suspendCompanyOnLapse(prisma, companyId);
+
+    // Zero means the company was not in a state this transition applies to —
+    // already live, already suspended, or archived. All are correct outcomes,
+    // and none is worth an event.
+    if (!count) return;
+
+    logEvent({
+      event: activating ? 'company.activated' : 'company.suspended',
+      status: 'success',
+      requestId,
+      companyId,
+      stripeEventId: event?.id,
+      stripeEventType: event?.type,
+      detail: activating ? 'payment_confirmed' : `subscription_${status.toLowerCase()}`,
+    });
+  } catch (err) {
+    logger.error(`Webhook: could not sync company ${companyId} status after ${status}: ${err.message}`);
+  }
+}
+
 /** Unix seconds -> Date, tolerating null. */
 function toDate(seconds) {
   return typeof seconds === 'number' ? new Date(seconds * 1000) : null;
@@ -529,6 +608,11 @@ async function handleCheckoutCompleted(event, { requestId }) {
     }
   });
 
+  // The normal path: checkout completed, so the company is now paid for and
+  // stops being an ONBOARDING shell. After the transaction, never inside it —
+  // a company must not read ACTIVE off a subscription write that rolled back.
+  await syncCompanyOnSubscriptionStatus({ companyId: subscription.companyId, status, requestId, event });
+
   /*
    * The company has just started paying for something, so its Active Services
    * and Billing Date have changed. Published after the transaction above has
@@ -582,6 +666,13 @@ async function handleAsyncPaymentFailed(event, { requestId }) {
   await repo.updateSubscription(prisma, subscription.id, {
     status: 'UNPAID',
     lastStripeEventAt: eventCreatedAt(event),
+  });
+
+  await syncCompanyOnSubscriptionStatus({
+    companyId: subscription.companyId,
+    status: 'UNPAID',
+    requestId,
+    event,
   });
 
   logEvent({
@@ -654,6 +745,10 @@ async function handleSubscriptionLifecycle(event, { requestId }) {
     canceledAt: toDate(stripeSubscription.canceled_at),
     lastStripeEventAt: eventCreatedAt(event),
   });
+
+  // A lifecycle event can be the first thing to report the subscription live —
+  // notably when checkout.session.completed is delayed or lost.
+  await syncCompanyOnSubscriptionStatus({ companyId: subscription.companyId, status: nextStatus, requestId, event });
 
   // past_due, cancelled, renewed: all of them change what the admin table shows
   // in Active Services and Billing Date.
@@ -764,6 +859,9 @@ async function handleInvoice(event, { requestId, paid }) {
         status: nextStatus,
         lastStripeEventAt: eventCreatedAt(event),
       });
+      // A paid invoice recovering an INCOMPLETE subscription is a first payment
+      // whose checkout event never arrived.
+      await syncCompanyOnSubscriptionStatus({ companyId: subscription.companyId, status: nextStatus, requestId, event });
     }
   }
 
@@ -844,6 +942,13 @@ async function handlePaymentIntent(event, { requestId, succeeded }) {
   await repo.updateSubscription(prisma, subscription.id, {
     status: succeeded ? 'ACTIVE' : 'UNPAID',
     lastStripeEventAt: eventCreatedAt(event),
+  });
+
+  await syncCompanyOnSubscriptionStatus({
+    companyId: subscription.companyId,
+    status: succeeded ? 'ACTIVE' : 'UNPAID',
+    requestId,
+    event,
   });
 
   logEvent({

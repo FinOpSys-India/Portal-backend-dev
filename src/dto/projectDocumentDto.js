@@ -86,6 +86,42 @@ function toDocumentList({ documents, total, totalBytes, limit, offset }) {
 }
 
 /**
+ * One attachment on the COMPANY-wide list, where the rows come from different
+ * projects.
+ *
+ * `project` is the whole difference from `toDocument`. On a project's own panel
+ * the heading already says which work the files belong to; on a list that spans
+ * projects, a file name with no project beside it cannot be placed at all — and
+ * the deadline and status are what let that list be read as "what is outstanding
+ * on this account" rather than a pile of filenames.
+ */
+function toCompanyDocument(document) {
+  return {
+    ...toDocument(document),
+    project: document.project
+      ? {
+          id: document.project.id,
+          projectName: document.project.projectName,
+          status: document.project.status,
+          deadlineDate: document.project.deadlineDate
+            ? new Date(document.project.deadlineDate).toISOString().slice(0, 10)
+            : null,
+        }
+      : null,
+  };
+}
+
+/** The company-wide documents screen: the page, its totals, and paging. */
+function toCompanyDocumentList({ companyId, documents, total, totalBytes, limit, offset }) {
+  return {
+    companyId,
+    documents: documents.map(toCompanyDocument),
+    totals: { count: total, sizeBytes: toBytes(totalBytes) },
+    pagination: { total, limit, offset, hasMore: offset + documents.length < total },
+  };
+}
+
+/**
  * The result of an upload: what was stored, and how many.
  *
  * Always an array, even for one file, because the endpoint always accepts an
@@ -101,4 +137,12 @@ function toUploadResult({ projectId, companyId, documents }) {
   };
 }
 
-module.exports = { toBytes, downloadUrl, toDocument, toDocumentList, toUploadResult };
+module.exports = {
+  toBytes,
+  downloadUrl,
+  toDocument,
+  toDocumentList,
+  toCompanyDocument,
+  toCompanyDocumentList,
+  toUploadResult,
+};

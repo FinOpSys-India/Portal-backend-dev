@@ -5,7 +5,6 @@ const express = require('express');
 const requireAuth = require('../middlewares/requireAuth');
 const requireRole = require('../middlewares/requireRole');
 const { projectLimiter, documentLimiter } = require('../middlewares/rateLimiter');
-const { parseDocumentUpload } = require('../middlewares/uploadDocuments');
 const {
   listServices,
   listProjects,
@@ -16,9 +15,11 @@ const {
   syncSpecialists,
 } = require('../controllers/projectController');
 const {
-  uploadDocuments,
+  requestUploadUrls,
+  confirmUploads,
   listDocuments,
   downloadDocument,
+  requestDownloadLinks,
   deleteDocument,
 } = require('../controllers/projectDocumentController');
 
@@ -86,9 +87,22 @@ router.delete('/:projectId', projectLimiter, deleteProject);
  * Documents attached to a project.
  *
  *   GET    /projects/42/documents                 -> the attachments panel
- *   POST   /projects/42/documents                 -> multipart, field "documents"
- *   GET    /projects/42/documents/7/download      -> the bytes
+ *   POST   /projects/42/documents/upload-url      -> where to send the files
+ *   POST   /projects/42/documents/confirm         -> record what was sent
+ *   GET    /projects/42/documents/7/download      -> one file
+ *   POST   /projects/42/documents/links           -> several, as direct links
  *   DELETE /projects/42/documents/7               -> soft delete
+ *
+ * NO FILE PASSES THROUGH THIS API, in either direction, and that is the single
+ * fact the whole shape follows from. A serverless host buffers every request and
+ * response whole and refuses anything past a few megabytes, so a route that
+ * carries bytes has a ceiling nothing in this application can raise. These
+ * routes carry only JSON: permission out, and a note of what happened back.
+ *
+ * Uploading is therefore two calls rather than one — ask, PUT to the bucket,
+ * confirm — because the API never sees the file and has to be told it arrived.
+ * Downloading is one, because the object already exists and a link to it is all
+ * the browser needs. Neither is bounded by size.
  *
  * NO ROLE GATE, for the same reason the read routes above carry none: who may
  * touch a project's files is decided per-record against the company, and a role
@@ -97,17 +111,40 @@ router.delete('/:projectId', projectLimiter, deleteProject);
  * separates them from everyone else is being on the company, which only the
  * service can see. See projectDocumentService for the three-layer rule.
  *
- * ORDER OF THE UPLOAD MIDDLEWARE MATTERS. `documentLimiter` runs first so a
- * throttled client is refused before the parser writes anything; the parser runs
- * second because a multipart body cannot be authorized until it has been read,
- * and the service removes the files again on every failure path.
- *
  * These sit below '/:projectId' only for readability — they cannot collide with
  * it, since Express matches the whole path and these carry extra segments.
  */
 router.get('/:projectId/documents', listDocuments);
-router.post('/:projectId/documents', documentLimiter, parseDocumentUpload, uploadDocuments);
+/*
+ * The upload pair, both rate-limited as uploads because that is what they are —
+ * the fact that the bytes go elsewhere does not make issuing write capabilities
+ * a read.
+ *
+ * Both sit ABOVE '/:projectId/documents/:documentId', so "upload-url" and
+ * "confirm" can never be parsed as a document id.
+ */
+router.post('/:projectId/documents/upload-url', documentLimiter, requestUploadUrls);
+router.post('/:projectId/documents/confirm', documentLimiter, confirmUploads);
 router.get('/:projectId/documents/:documentId/download', downloadDocument);
+/*
+ * The bulk download is a POST because its id list belongs in a body — fifty ids
+ * in a query string is a URL long enough for a proxy to truncate, and a
+ * truncated list would silently download the wrong subset.
+ *
+ * It returns LINKS rather than an archive, and that is the whole design. Building
+ * a zip means this function fetching every file and holding the result in memory,
+ * which puts the entire selection inside the host's response ceiling — a few
+ * megabytes, for a feature whose purpose is "give me everything". Signed links
+ * point the browser at the bucket instead, so the selection can be any size, and
+ * a client that wants a single archive builds it where the bytes already are.
+ *
+ * Rate-limited like an upload rather than like a read: it reads no bytes, but it
+ * mints one capability per document, which is not something to leave unthrottled.
+ *
+ * It sits ABOVE '/:projectId/documents/:documentId' so "links" is never parsed as
+ * a document id.
+ */
+router.post('/:projectId/documents/links', documentLimiter, requestDownloadLinks);
 router.delete('/:projectId/documents/:documentId', projectLimiter, deleteDocument);
 
 module.exports = router;

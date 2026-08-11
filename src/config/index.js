@@ -22,6 +22,49 @@ function durationToSeconds(value) {
 }
 
 /*
+ * THE HOST'S OWN CEILING ON A REQUEST OR RESPONSE BODY.
+ *
+ * Vercel does not hand a function the raw socket: every request and every
+ * response is buffered whole by the platform's gateway first, and to keep that
+ * from exhausting memory the body is capped at roughly 4.5 MB. It is a platform
+ * limit, not a plan one — no Pro or Enterprise upgrade lifts it — and it applies
+ * before any of this application's code runs.
+ *
+ * That mattered because our own limits were written for a normal server: a 25 MB
+ * document was accepted by the config, refused by the platform, and the user saw
+ * Vercel's error page instead of the message this API would have given them. A
+ * limit the user cannot see is worse than a lower one they can.
+ *
+ * ONLY THE AVATAR IS STILL SUBJECT TO IT. Project documents no longer travel
+ * through this API in either direction — the browser PUTs them to a signed URL
+ * and fetches them from one — so their limits describe what Supabase and this
+ * business allow, and nothing about the host. A profile picture is small enough
+ * that routing it through a function is simpler than a ticket exchange, so it
+ * stays, and stays clamped.
+ *
+ * So on Vercel — and only there, detected by the platform's own VERCEL variable —
+ * a limit describing a body that travels THROUGH this API is clamped to sit
+ * inside the ceiling, and the request is refused by our validator with our
+ * wording.
+ *
+ * THE CLAMP OVERRIDES AN EXPLICIT SETTING, unlike every other option in this
+ * file, because it is not a policy — it is a fact about where the code is
+ * running. Setting UPLOAD_MAX_DOCUMENT_BYTES to 25 MB on Vercel does not make a
+ * 25 MB multipart upload arrive; it only decides whether the user is told why.
+ * Off Vercel the clamp does nothing at all, so a container or a VM keeps exactly
+ * the number it was given.
+ *
+ * 4 MB rather than 4.5: the cap counts the whole HTTP body, and a multipart
+ * upload carries field names and boundaries alongside the file itself.
+ */
+const PLATFORM_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
+const HAS_PLATFORM_BODY_LIMIT = process.env.VERCEL === '1';
+
+function clampToPlatform(bytes) {
+  return HAS_PLATFORM_BODY_LIMIT ? Math.min(bytes, PLATFORM_BODY_LIMIT_BYTES) : bytes;
+}
+
+/*
  * The access-token lifetime is needed in two forms: the duration string handed
  * to jsonwebtoken when signing, and the equivalent seconds reported to clients
  * as `expiresInSeconds`. Resolve it once here and derive the seconds from the
@@ -290,14 +333,20 @@ const config = {
     // 2 MB. An avatar is displayed at ~256px; anything larger is a phone camera
     // original that will be downscaled to nothing in the browser anyway. Enforced
     // by multer, which aborts the stream at the limit rather than buffering it.
-    maxAvatarBytes: parseInt(process.env.UPLOAD_MAX_AVATAR_BYTES, 10) || 2 * 1024 * 1024,
+    //
+    // Clamped because this is the one upload still carried by this API — see
+    // PLATFORM_BODY_LIMIT_BYTES. At 2 MB the clamp changes nothing today; it is
+    // here so that raising this value on Vercel produces our error rather than
+    // the platform's.
+    maxAvatarBytes: clampToPlatform(parseInt(process.env.UPLOAD_MAX_AVATAR_BYTES, 10) || 2 * 1024 * 1024),
     // How long a browser may cache an avatar. Long is safe: every upload gets a
     // new random filename, so a changed picture is a changed URL.
     cacheMaxAgeSeconds: parseInt(process.env.UPLOAD_CACHE_MAX_AGE_SECONDS, 10) || 86400,
 
     /*
      * Project documents live in a DIFFERENT root, and that is the single most
-     * important line in this block.
+     * important line in this block. (Local driver only — under the supabase
+     * driver the same separation is the private `documentsBucket` below.)
      *
      * `dir` above is handed to express.static and served to anyone who knows the
      * URL — deliberately, because an <img src> cannot send an Authorization
@@ -316,8 +365,14 @@ const config = {
     /*
      * 25 MB per file. A scanned year of bank statements is the realistic upper
      * end of what this feature carries; anything larger is a video or a mistake.
-     * Enforced by multer, which aborts the stream at the limit rather than
-     * letting the whole file land first.
+     *
+     * NOT clamped by the platform ceiling, unlike the avatar above, because a
+     * document never passes through this API: the browser uploads it to a signed
+     * URL and downloads it from one. This number is therefore a real business
+     * limit rather than a description of the host, and it is enforced twice — once
+     * against the size the client declares, so an oversized file is refused before
+     * anyone waits for it to upload, and again against the size the bucket reports
+     * once it has, which is the check that actually binds.
      */
     maxDocumentBytes: parseInt(process.env.UPLOAD_MAX_DOCUMENT_BYTES, 10) || 25 * 1024 * 1024,
     /*
@@ -327,6 +382,118 @@ const config = {
      * go; more than that is several requests, which the rate limiter then sees.
      */
     maxDocumentsPerRequest: parseInt(process.env.UPLOAD_MAX_DOCUMENTS_PER_REQUEST, 10) || 10,
+    /*
+     * Documents in ONE bulk download (POST .../documents/links).
+     *
+     * A COUNT AND NOT A BYTE TOTAL, which is the whole difference from what this
+     * endpoint used to be. When it returned a zip, the bytes were the binding
+     * limit: every file had to be fetched and held in memory to build the
+     * archive, so fifty 25 MB scans meant 1.25 GB in a serverless function. Now it
+     * returns links, and the response is the same handful of kilobytes whether the
+     * documents behind it are 50 KB or 50 GB — the bytes go from the bucket to the
+     * browser and never pass through here at all.
+     *
+     * What survives is this count, because minting a link is a round trip to the
+     * bucket and fifty is already generous for one screen's selection. A larger
+     * request is refused with a 413 naming the limit, so the client can split it.
+     */
+    maxArchiveDocuments: parseInt(process.env.UPLOAD_MAX_ARCHIVE_DOCUMENTS, 10) || 50,
+  },
+  /*
+   * WHERE THE BYTES ACTUALLY LIVE.
+   *
+   * The `uploads` block above describes the files; this one describes the shelf
+   * they sit on. Two drivers, chosen by whether Supabase credentials are
+   * present:
+   *
+   *   local      a folder on this machine. Correct for `npm run dev` and for the
+   *              test suite, which must not need a network or a bucket.
+   *   supabase   Supabase Storage. REQUIRED IN ANY DEPLOYED ENVIRONMENT, because
+   *              a serverless host has no durable disk: on Vercel the project
+   *              tree is read-only and /tmp is wiped between invocations, so a
+   *              file written during an upload is gone before the download that
+   *              wants it. That is not a theoretical failure — it is the reason
+   *              every document download from the deployment returned 404 while
+   *              the list endpoint, which touches only Postgres, worked fine.
+   *
+   * The driver is INFERRED rather than configured, so no deployment can be one
+   * env var away from silently writing to a disk that will not survive. Set the
+   * two Supabase values and files go to the bucket; leave them unset and they go
+   * to a folder.
+   *
+   * THE STORED KEY IS THE SAME SHAPE UNDER BOTH ("avatars/18/9f3c.jpg",
+   * "projects/5/1a2b.pdf"), which is what lets a database written by one driver
+   * be read by the other, and what keeps every avatar row valid across the
+   * switch. A key is not a URL — see dto/userDto.avatarUrl.
+   */
+  storage: {
+    /*
+     * `NEXT_PUBLIC_SUPABASE_URL` is accepted as a fallback because the frontend
+     * already carries the same value under that name and one project URL in two
+     * variables is a thing to keep in sync and eventually get wrong. Safe to read
+     * a NEXT_PUBLIC_ variable here precisely because a project URL is not a
+     * secret — it is in every browser request the frontend makes. The KEY below
+     * has no such fallback, and must not grow one: NEXT_PUBLIC_ means "shipped to
+     * the browser", which is the one thing a service-role key must never be.
+     */
+    url: (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').replace(/\/+$/, ''),
+    // The SERVICE ROLE key, not the anon key. These buckets are written from the
+    // server only, and the documents bucket is private — an anon key cannot read
+    // it, which is the entire point of keeping documents out of the public one.
+    serviceKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+    /*
+     * THE TEST SUITE IS FORCED ONTO THE LOCAL DRIVER, unconditionally, and this
+     * is not a convenience.
+     *
+     * Several suites drive the storage layer for real rather than stubbing it —
+     * that is what makes them worth having. The moment real Supabase credentials
+     * appear in a developer's .env, those same tests would start writing probe
+     * files into the real bucket and deleting them again, against whatever
+     * project that key belongs to. A test run must
+     * never be able to touch live storage, and the only reliable place to
+     * guarantee that is here, above every test file, rather than in each one's
+     * setup where a new file would simply forget.
+     *
+     * A test that genuinely needs the remote driver mocks utils/storage.
+     */
+    get driver() {
+      if (process.env.NODE_ENV === 'test') return 'local';
+      return this.url && this.serviceKey ? 'supabase' : 'local';
+    },
+    /*
+     * TWO BUCKETS, AND THEY MUST HAVE DIFFERENT VISIBILITY.
+     *
+     * avatars    PUBLIC. An <img src> cannot send an Authorization header, so a
+     *            profile picture has to be fetchable by URL alone. Safe because
+     *            the filename is 32 random hex characters — unguessable and
+     *            unenumerable — and because nothing confidential is ever written
+     *            here. This mirrors exactly what express.static does locally.
+     *
+     * documents  PRIVATE. A client's bank statement or payroll register. Nothing
+     *            reads it but this server, and the only way out is
+     *            GET /projects/:id/documents/:id/download, which authorizes the
+     *            caller against the project's company first. Making this bucket
+     *            public would publish every client's financial records to anyone
+     *            with the URL, and no care in the service layer would undo it.
+     */
+    avatarBucket: process.env.SUPABASE_AVATAR_BUCKET || 'avatars',
+    documentsBucket: process.env.SUPABASE_DOCUMENTS_BUCKET || 'project-documents',
+    /*
+     * How long a signed download link stays valid.
+     *
+     * Short, because the link IS the authorization once it exists: anyone holding
+     * it can fetch the object without a token, so its lifetime is the window in
+     * which a leaked URL — out of a browser history, a proxy log, a pasted
+     * message — is still worth something.
+     *
+     * Sixty seconds is far longer than the redirect it exists for (the browser
+     * follows it immediately) and far too short to be worth passing around. It is
+     * not a limit on the DOWNLOAD: a transfer already in progress when the link
+     * expires runs to completion, so a slow connection on a large file is not cut
+     * off. Only STARTING a new fetch needs a fresh link, which means a re-request
+     * to this API, which means the access check runs again.
+     */
+    signedUrlTtlSeconds: parseInt(process.env.SUPABASE_SIGNED_URL_TTL_SECONDS, 10) || 60,
   },
   db: {
     // When set (e.g. Supabase/Neon), the connection string takes precedence

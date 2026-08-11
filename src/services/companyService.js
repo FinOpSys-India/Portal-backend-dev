@@ -12,6 +12,10 @@ const adminEvents = require('./adminEventService');
 // One-way dependency: projectService reaches for repositories, never for this
 // file, so requiring it here cannot close a cycle.
 const projectService = require('./projectService');
+// Likewise one-way, and required for the same reason the paywall middleware
+// requires it: `profileComplete` must have exactly one definition, and that
+// definition lives with the endpoint that publishes it.
+const onboardingService = require('./onboardingService');
 
 /**
  * Company onboarding and team management.
@@ -327,6 +331,62 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
     throw ownerRoleRequired();
   }
 
+  /*
+   * The steps are in an order, and the order is enforced here rather than only
+   * in the client's router.
+   *
+   * Onboarding is profile -> company -> payment, but nothing on this endpoint
+   * ever said so: the role gate above asks who the caller is, not how far
+   * through they are, so a caller skipping the UI could create a company while
+   * their own name was still blank. Every screen that lists companies shows the
+   * owner beside them, so that is a nameless row on an admin's table.
+   *
+   * `getStatus` is what GET /onboarding returns, and asking it rather than
+   * re-deriving the four fields keeps one definition of "profile complete" —
+   * the same reason requirePaidAccount goes through it.
+   */
+  const { profileComplete } = (await onboardingService.getStatus(userId)).onboarding;
+  if (!profileComplete) {
+    logEvent({
+      event: 'company.onboarding.denied',
+      status: 'failure',
+      requestId,
+      userId,
+      errorCode: 'PROFILE_INCOMPLETE',
+      detail: 'profile_incomplete',
+    });
+    throw new ApiError(409, 'Complete your profile before adding a company.', {
+      code: 'PROFILE_INCOMPLETE',
+    });
+  }
+
+  /*
+   * One unpaid company at a time. Finishing this form and walking away from the
+   * bill used to leave a live, fully-formed company that nothing was charging
+   * for, and the owner was free to do it again — so an account could accumulate
+   * any number of shells with no services attached.
+   *
+   * Checked BEFORE the idempotency lookup, so a client replaying a key it never
+   * paid for is refused rather than handed back a stored 201. The rule is about
+   * the state of the account, not about this particular request.
+   */
+  const unpaid = await repo.findUnpaidCompanyForOwner(prisma, userId);
+  if (unpaid) {
+    logEvent({
+      event: 'company.onboarding.denied',
+      status: 'failure',
+      requestId,
+      userId,
+      companyId: unpaid.id,
+      errorCode: 'COMPANY_PAYMENT_REQUIRED',
+      detail: 'unpaid_company_exists',
+    });
+    throw new ApiError(402, `Complete payment for ${unpaid.companyName} before adding another company.`, {
+      code: 'COMPANY_PAYMENT_REQUIRED',
+      details: { companyId: unpaid.id, companyName: unpaid.companyName },
+    });
+  }
+
   const requestHash = fingerprint(input);
 
   // Idempotency pre-check: a completed key replays; a reused key with a different
@@ -424,10 +484,24 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
       });
       logEvent({ event: 'company.address.linked', status: 'success', requestId, userId, companyId: created.id });
 
-      // Step 10: mark onboarding complete and activate the company.
+      /*
+       * Step 10: mark the FORM complete — and nothing more.
+       *
+       * The company deliberately stays ONBOARDING. Activating it here said a
+       * company was live the moment its details were typed in, before a single
+       * service had been selected or a penny charged, which made an unpaid shell
+       * indistinguishable from a paying customer everywhere `status` is read —
+       * the admin table, the pickers, every filter.
+       *
+       * Payment is what activates a company, so the flip to ACTIVE belongs to
+       * the Stripe webhook that sees the subscription go live
+       * (stripeWebhookService.syncCompanyOnSubscriptionStatus, which also
+       * suspends it again if that subscription later lapses).
+       * `onboardingCompleted` still goes true here, because it is a fact about
+       * this form and it is genuinely finished.
+       */
       const finalized = await repo.updateCompany(tx, created.id, {
         onboardingCompleted: true,
-        status: 'ACTIVE',
       });
 
       // Step 11: build the response now that all ids exist.

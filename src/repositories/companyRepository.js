@@ -214,6 +214,56 @@ function setAccountingManager(client, companyId, accountingManagerUserId) {
 }
 
 /**
+ * Bring a company live, once it is paid for: ONBOARDING (the first payment) or
+ * SUSPENDED (a recovered one) become ACTIVE.
+ *
+ * `updateMany` with the status in the WHERE rather than `update` by id, and that
+ * choice carries the whole rule:
+ *
+ *   - it is idempotent, so the several Stripe events that can each report a
+ *     subscription as live (checkout completed, invoice paid, payment intent
+ *     succeeded) may all arrive and only the first does anything;
+ *   - ARCHIVED is not in the list, so a late webhook cannot resurrect a company
+ *     somebody deliberately wound down.
+ *
+ * Returns Prisma's `{ count }`, which the caller uses to log the transition only
+ * when one actually happened.
+ */
+function activateCompanyOnPayment(client, companyId) {
+  return client.company.updateMany({
+    where: { id: companyId, status: { in: ['ONBOARDING', 'SUSPENDED'] }, deletedAt: null },
+    data: { status: 'ACTIVE' },
+  });
+}
+
+/**
+ * Suspend a company whose subscription has lapsed.
+ *
+ * Only an ACTIVE company is touched: one still ONBOARDING never got going, and
+ * ARCHIVED is a decision this must not overwrite.
+ *
+ * The `subscriptions: { none: ... }` clause is the part that stops a false
+ * suspension. A company may hold several subscription rows — an abandoned
+ * INCOMPLETE attempt beside the live one, or a replacement created before the
+ * old was cancelled — so "one subscription was cancelled" does not imply "this
+ * company has stopped paying". Re-asking the database whether ANY active
+ * subscription remains makes the check about the company rather than about the
+ * single row the webhook happened to carry, and it settles the race where a
+ * cancellation and its replacement's activation arrive together.
+ */
+function suspendCompanyOnLapse(client, companyId) {
+  return client.company.updateMany({
+    where: {
+      id: companyId,
+      status: 'ACTIVE',
+      deletedAt: null,
+      subscriptions: { none: { status: 'ACTIVE' } },
+    },
+    data: { status: 'SUSPENDED' },
+  });
+}
+
+/**
  * Soft-delete a company.
  *
  * The tombstone column existed and every read already filtered on it, but
@@ -929,6 +979,35 @@ function listOwnedCompanyOptions(client, ownerUserId) {
 }
 
 /**
+ * The owner's oldest live company that has no paid subscription, or null.
+ *
+ * `subscriptions: { none: { status: 'ACTIVE' } }` is evaluated by the database as
+ * a NOT EXISTS, so a company with a CANCELED or PAST_DUE subscription counts as
+ * unpaid exactly like one that never had a subscription at all — which is the
+ * point, since neither entitles anybody to a service.
+ *
+ * ARCHIVED companies are excluded alongside soft-deleted ones: a wound-down
+ * company is not an outstanding bill, and leaving it in would lock an owner out
+ * of creating anything ever again over an account they already closed.
+ *
+ * Returns the row rather than a boolean so the caller can name the company in
+ * the error — "pay for Acme Ltd first" is actionable where "payment required" is
+ * a puzzle for someone holding four accounts.
+ */
+function findUnpaidCompanyForOwner(client, ownerUserId) {
+  return client.company.findFirst({
+    where: {
+      ownerUserId,
+      deletedAt: null,
+      status: { not: 'ARCHIVED' },
+      subscriptions: { none: { status: 'ACTIVE' } },
+    },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true, companyName: true },
+  });
+}
+
+/**
  * Of `companyIds`, the ones this user owns — used to check an invite covers only
  * the caller's own companies.
  *
@@ -1022,6 +1101,7 @@ module.exports = {
   countTeammates,
   listOwnedCompanyOptions,
   listOwnedCompanyIds,
+  findUnpaidCompanyForOwner,
   findInheritableManagerSource,
   listActiveSubscriptionsForCompanies,
   listActiveAssignmentsForCompanies,
@@ -1039,6 +1119,8 @@ module.exports = {
   createCompany,
   updateCompany,
   setAccountingManager,
+  activateCompanyOnPayment,
+  suspendCompanyOnLapse,
   softDeleteCompany,
   createAddress,
   updateAddress,

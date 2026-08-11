@@ -1,11 +1,16 @@
 'use strict';
 
 const asyncHandler = require('../middlewares/asyncHandler');
+const config = require('../config');
 const common = require('../validators/common');
 const {
-  validateDocumentUpload,
   validateDocumentListQuery,
+  validateCompanyDocumentListQuery,
+  validateDocumentArchiveRequest,
+  validateUploadTicketRequest,
+  validateUploadConfirmRequest,
 } = require('../validators/projectDocumentValidator');
+const { isAllowedMimeType, ACCEPTED_LABEL } = require('../utils/documentTypes');
 const documentService = require('../services/projectDocumentService');
 
 /**
@@ -19,47 +24,70 @@ const documentService = require('../services/projectDocumentService');
  */
 
 /**
- * POST /projects/:projectId/documents
+ * POST /projects/:projectId/documents/upload-url
  *
- * multipart/form-data:
- *   companyId   the company the project belongs to — checked against it
- *   documents   one or more files (field name repeated per file)
+ *   { companyId, files: [{ fileName, mimeType, sizeBytes }] }
  *
- * The uploader is the token's subject, and each file's name, type, and size are
- * measured from the upload itself. Neither is accepted from the body.
+ * Step one of the direct upload: the browser says what it is about to send, and
+ * gets back one signed URL per file to PUT it to. Nothing is recorded — see
+ * projectDocumentService.createUploadTickets for what this call does and does
+ * not decide.
+ *
+ * 201 rather than 200: the response is a set of newly minted, one-shot
+ * capabilities that did not exist before the request.
  */
-const uploadDocuments = asyncHandler(async (req, res) => {
-  /*
-   * The files are already on disk — parseDocumentUpload wrote them, because a
-   * multipart body has to be read before anything about it can be judged. So
-   * this handler owns their removal on every path that does not end in a 201:
-   * a malformed companyId (raised by the validator, before the service is even
-   * called), a caller who turns out not to be on the company, a project that
-   * does not exist, a failed transaction. Without this, refused requests
-   * accumulate on the volume.
-   */
-  try {
-    const projectId = common.parseId(req.params.projectId, 'projectId');
-    const { companyId } = validateDocumentUpload(req.body);
+const requestUploadUrls = asyncHandler(async (req, res) => {
+  const projectId = common.parseId(req.params.projectId, 'projectId');
+  const { companyId, files } = validateUploadTicketRequest(req.body, {
+    maxFiles: config.uploads.maxDocumentsPerRequest,
+    maxBytes: config.uploads.maxDocumentBytes,
+    isAllowedMimeType,
+    acceptedLabel: ACCEPTED_LABEL,
+  });
 
-    const data = await documentService.uploadDocuments({
-      userId: req.user.id,
-      requestId: req.id,
-      projectId,
-      companyId,
-      files: req.files,
-    });
+  const data = await documentService.createUploadTickets({
+    userId: req.user.id,
+    requestId: req.id,
+    projectId,
+    companyId,
+    files,
+  });
 
-    return res.status(201).json({
-      success: true,
-      message: data.uploaded === 1 ? 'Document uploaded.' : `${data.uploaded} documents uploaded.`,
-      data,
-    });
-  } catch (err) {
-    // Never throws, so the original error is what reaches the client.
-    await documentService.discardUploadedFiles(req.files, req.id);
-    throw err;
-  }
+  return res.status(201).json({
+    success: true,
+    message: data.uploads.length === 1 ? 'Upload ready.' : `${data.uploads.length} uploads ready.`,
+    data,
+  });
+});
+
+/**
+ * POST /projects/:projectId/documents/confirm
+ *
+ *   { companyId, files: [{ key, fileName }] }
+ *
+ * Step three: the files are in the bucket, so record them. This is the call that
+ * makes a document exist — until it returns, the bytes are stored and nothing in
+ * the application knows about them.
+ */
+const confirmUploads = asyncHandler(async (req, res) => {
+  const projectId = common.parseId(req.params.projectId, 'projectId');
+  const { companyId, files } = validateUploadConfirmRequest(req.body, {
+    maxFiles: config.uploads.maxDocumentsPerRequest,
+  });
+
+  const data = await documentService.confirmUploads({
+    userId: req.user.id,
+    requestId: req.id,
+    projectId,
+    companyId,
+    files,
+  });
+
+  return res.status(201).json({
+    success: true,
+    message: data.uploaded === 1 ? 'Document uploaded.' : `${data.uploaded} documents uploaded.`,
+    data,
+  });
 });
 
 /**
@@ -75,6 +103,28 @@ const listDocuments = asyncHandler(async (req, res) => {
     userId: req.user.id,
     requestId: req.id,
     projectId,
+    query,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Documents retrieved.',
+    data,
+  });
+});
+
+/**
+ * GET /documents?companyId=&projectId=&search=&limit=&offset=&sort=&order=
+ *
+ * Every file on a company, across its projects — the same page/totals/paging
+ * shape as the per-project panel, with the project named on each row.
+ */
+const listCompanyDocuments = asyncHandler(async (req, res) => {
+  const query = validateCompanyDocumentListQuery(req.query);
+
+  const data = await documentService.listCompanyDocuments({
+    userId: req.user.id,
+    requestId: req.id,
     query,
   });
 
@@ -116,12 +166,75 @@ const downloadDocument = asyncHandler(async (req, res) => {
     documentId,
   });
 
+  /*
+   * A REDIRECT rather than the bytes, whenever the service could mint a signed
+   * link for the object (i.e. under the supabase driver — see storage.signedUrl).
+   *
+   * The route's contract is unchanged from the caller's side: the same URL, the
+   * same auth, and a browser following the redirect still ends up saving the same
+   * file under the same name, because the signed link carries its own
+   * `Content-Disposition: attachment; filename=...`. What changes is that the
+   * bytes travel from the bucket to the browser instead of through this function,
+   * which is the only way a file larger than the host's response ceiling can be
+   * downloaded at all.
+   *
+   * `no-store` on the redirect ITSELF matters as much as it did on the file. The
+   * 302 carries a working, if short-lived, capability in its Location header, and
+   * a cached redirect would hand that link to whoever opened the page next.
+   */
+  if (file.url) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    return res.redirect(302, file.url);
+  }
+
   res.setHeader('Content-Type', file.mimeType);
   res.setHeader('Content-Disposition', contentDisposition(file.fileName));
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('Content-Length', file.sizeBytes);
 
-  return res.sendFile(file.absolutePath);
+  // The buffer, not a path: the bytes come from the documents bucket, which has
+  // no filesystem for `sendFile` to read. `res.send` on a Buffer writes it as-is
+  // and does not touch the Content-Type already set above.
+  return res.send(file.body);
+});
+
+/**
+ * POST /projects/:projectId/documents/links
+ *
+ *   { }                      links for every document on the project
+ *   { documentIds: [5, 6] }  links for the ones the user ticked
+ *
+ * The bulk download, answered as JSON: one short-lived signed URL per document,
+ * which the browser fetches directly (and may assemble into a single archive
+ * itself). Nothing about this response grows with the size of the files, which is
+ * exactly why it replaced the zip this endpoint used to return — an archive built
+ * here had to be held in memory and sent back through the host, capping "download
+ * everything" at a few megabytes.
+ *
+ * `no-store`, because the body is a list of working capabilities — the same
+ * reason the single download's redirect carries it.
+ */
+const requestDownloadLinks = asyncHandler(async (req, res) => {
+  const projectId = common.parseId(req.params.projectId, 'projectId');
+  const { documentIds } = validateDocumentArchiveRequest(req.body, {
+    maxDocuments: config.uploads.maxArchiveDocuments,
+  });
+
+  const data = await documentService.createDownloadLinks({
+    userId: req.user.id,
+    requestId: req.id,
+    projectId,
+    documentIds,
+  });
+
+  res.setHeader('Cache-Control', 'private, no-store');
+
+  return res.status(200).json({
+    success: true,
+    message: data.count === 1 ? 'Download link ready.' : `${data.count} download links ready.`,
+    data,
+  });
 });
 
 /**
@@ -161,4 +274,12 @@ const deleteDocument = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { uploadDocuments, listDocuments, downloadDocument, deleteDocument };
+module.exports = {
+  requestUploadUrls,
+  confirmUploads,
+  listDocuments,
+  listCompanyDocuments,
+  downloadDocument,
+  requestDownloadLinks,
+  deleteDocument,
+};

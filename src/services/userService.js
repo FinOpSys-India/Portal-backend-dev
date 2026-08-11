@@ -1,14 +1,12 @@
 'use strict';
 
-const fs = require('fs/promises');
-const path = require('path');
-
 const config = require('../config');
 const { prisma } = require('../config/prisma');
 const repo = require('../repositories/userRepository');
 const userDto = require('../dto/userDto');
+const storage = require('../utils/storage');
+const { avatarKeyFor } = require('../middlewares/uploadAvatar');
 const ApiError = require('../utils/ApiError');
-const logger = require('../utils/logger');
 const { logEvent } = require('../utils/auditLog');
 
 /**
@@ -28,37 +26,21 @@ function userNotFound() {
 }
 
 /**
- * Delete a file we no longer reference, without ever failing the request over it.
+ * Delete a picture we no longer reference, without ever failing the request over
+ * it.
  *
- * An orphaned file costs a few kilobytes of disk; a 500 after the database has
- * already committed costs the user their update and tells them, wrongly, that it
- * did not happen. The database row is the source of truth about which picture is
- * current — the file is downstream of it, so cleanup is best-effort by design.
+ * An orphaned object costs a few kilobytes; a 500 after the database has already
+ * committed costs the user their update and tells them, wrongly, that it did not
+ * happen. The database row is the source of truth about which picture is current
+ * — the object is downstream of it, so cleanup is best-effort by design.
+ * `storage.removeObjects` never throws, which is what makes that true here.
  */
-async function unlinkQuietly(avatarKey, requestId) {
-  if (!avatarKey) return;
-  try {
-    await fs.unlink(path.join(config.uploads.dir, avatarKey));
-  } catch (err) {
-    // ENOENT is the normal case for a file already gone (a retried delete, a
-    // manually cleaned folder). Anything else is worth a line in the log.
-    if (err.code !== 'ENOENT') {
-      logger.warn(`[${requestId}] Could not remove avatar file ${avatarKey}: ${err.message}`);
-    }
-  }
-}
-
-/**
- * Turn the absolute path multer wrote into the key stored in the database.
- *
- * Always forward slashes: on Windows `path.relative` returns
- * `avatars\18\9f3c.jpg`, and that backslash would be carried into the row and
- * then into a URL, where it is not a separator at all. Normalising at the single
- * point where a path becomes a key means every consumer downstream — the URL
- * builder, the unlink above — sees one shape regardless of host OS.
- */
-function toStorageKey(absolutePath) {
-  return path.relative(config.uploads.dir, absolutePath).split(path.sep).join('/');
+function discardAvatar(avatarKey, requestId) {
+  return storage.removeObjects({
+    bucket: config.storage.avatarBucket,
+    keys: avatarKey,
+    requestId,
+  });
 }
 
 /**
@@ -144,17 +126,34 @@ async function updateMe({ userId, requestId, input }) {
 /**
  * POST /users/me/avatar — store the uploaded picture and point the row at it.
  *
- * Order matters, and it is: file already written (by multer) → row updated →
- * OLD file removed. Removing the old file first would leave the user with no
- * picture at all if the update then failed; removing it after means the worst
- * case is a stale file nobody references. And if the row update fails, the file
- * just written is removed here — otherwise every failed save would leak a
- * megabyte of disk that nothing will ever point to.
+ * ORDER MATTERS, and it is: new picture stored → row updated → OLD picture
+ * removed.
+ *
+ * Storing before updating is what makes the row's key always resolve: point the
+ * row at an object that is not there yet and every profile load in between shows
+ * a broken image. Removing the old one LAST is the same argument from the other
+ * end — remove it first and a failed update leaves the user with no picture at
+ * all, whereas this way the worst case is one stale object nobody references.
+ *
+ * And if the row update fails, the object just written is removed here.
+ * Otherwise every failed save would leak two megabytes that nothing will ever
+ * point to.
+ *
+ * The bytes arrive as `file.buffer` because the parser holds the upload in
+ * memory — there is no path, and on a serverless host there is nowhere for one
+ * to point.
  *
  * @param {{ userId: number, requestId: string, file: Express.Multer.File }} params
  */
 async function setAvatar({ userId, requestId, file }) {
-  const avatarKey = toStorageKey(file.path);
+  const avatarKey = avatarKeyFor(userId, file.mimetype);
+
+  await storage.putObject({
+    bucket: config.storage.avatarBucket,
+    key: avatarKey,
+    body: file.buffer,
+    contentType: file.mimetype,
+  });
 
   let previousKey = null;
   let updated;
@@ -166,12 +165,12 @@ async function setAvatar({ userId, requestId, file }) {
       return repo.updateMe(tx, userId, { avatarKey });
     });
   } catch (err) {
-    await unlinkQuietly(avatarKey, requestId);
+    await discardAvatar(avatarKey, requestId);
     throw err;
   }
 
   // Only now is the new picture the one of record, so the old one is garbage.
-  await unlinkQuietly(previousKey, requestId);
+  await discardAvatar(previousKey, requestId);
 
   logEvent({ event: 'user.avatar.updated', status: 'success', requestId, userId });
 
@@ -196,7 +195,7 @@ async function removeAvatar({ userId, requestId }) {
     return repo.updateMe(tx, userId, { avatarKey: null });
   });
 
-  await unlinkQuietly(previousKey, requestId);
+  await discardAvatar(previousKey, requestId);
 
   if (previousKey) {
     logEvent({ event: 'user.avatar.removed', status: 'success', requestId, userId });

@@ -10,11 +10,11 @@
  *
  * WHAT IS AND IS NOT STORED. The row holds the file's IDENTITY (where the bytes
  * are, what they were called, what type they are, how big) and nothing else; the
- * bytes themselves are on disk under config.uploads.documentsDir. Putting a
- * 25 MB PDF in a bytea column would make every `SELECT *` on this table drag the
- * whole archive across the wire, and make the nightly database backup carry the
- * files as well. Metadata in Postgres, bytes on the filesystem, joined by
- * `file_key` — which is exactly why that column is UNIQUE.
+ * bytes themselves live in the private documents bucket (see utils/storage).
+ * Putting a 25 MB PDF in a bytea column would make every `SELECT *` on this
+ * table drag the whole archive across the wire, and make the nightly database
+ * backup carry the files as well. Metadata in Postgres, bytes in object storage,
+ * joined by `file_key` — which is exactly why that column is UNIQUE.
  */
 
 /**
@@ -74,6 +74,68 @@ function listDocuments(client, { projectId, search, limit, offset, sort, order }
     orderBy: [{ [sort || 'createdAt']: order || 'desc' }, { id: 'desc' }],
     take: limit,
     skip: offset,
+  });
+}
+
+/**
+ * Every document belonging to a COMPANY, across all of its projects.
+ *
+ * Reached through the `project` relation rather than a `projectId IN (...)`
+ * list, so the company filter and the project's own soft-delete filter are one
+ * query the database plans together. Fetching the project ids first and passing
+ * them in would be two round trips, and would go stale between them — a project
+ * deleted in the gap would still have its files listed.
+ *
+ * `project: { deletedAt: null }` is the load-bearing half of that: a document is
+ * only reachable while the work it is attached to is. Without it, deleting a
+ * project would quietly leave its attachments on this screen, which is the one
+ * place they would still be downloadable from.
+ *
+ * `projectId` narrows to a single project when the caller wants one — the same
+ * endpoint answering "this company's files" and "this project's files, seen from
+ * the company screen" without a second contract to learn.
+ */
+function buildCompanyDocumentWhere({ companyId, projectId, search }) {
+  return {
+    deletedAt: null,
+    project: {
+      companyId,
+      deletedAt: null,
+      ...(projectId ? { id: projectId } : {}),
+    },
+    ...(search ? { originalName: { contains: search, mode: 'insensitive' } } : {}),
+  };
+}
+
+/**
+ * One page of a company's documents.
+ *
+ * The project is joined onto every row because this list spans projects: a file
+ * name on its own does not say which piece of work it belongs to, and that is
+ * the column the screen exists to show.
+ */
+function listCompanyDocuments(client, { companyId, projectId, search, limit, offset, sort, order }) {
+  return client.projectDocument.findMany({
+    where: buildCompanyDocumentWhere({ companyId, projectId, search }),
+    select: {
+      ...DOCUMENT_SELECT,
+      project: { select: { id: true, projectName: true, status: true, deadlineDate: true } },
+    },
+    // `id` breaks ties for the same reason as the per-project list: files
+    // uploaded in one request share a timestamp to the millisecond, and without
+    // a tiebreaker a row can appear on two pages while another is skipped.
+    orderBy: [{ [sort || 'createdAt']: order || 'desc' }, { id: 'desc' }],
+    take: limit,
+    skip: offset,
+  });
+}
+
+/** The company-wide totals, computed by Postgres — see summarizeDocuments. */
+function summarizeCompanyDocuments(client, { companyId, projectId, search }) {
+  return client.projectDocument.aggregate({
+    where: buildCompanyDocumentWhere({ companyId, projectId, search }),
+    _count: { _all: true },
+    _sum: { sizeBytes: true },
   });
 }
 
@@ -144,6 +206,38 @@ function findDocumentForAccess(client, documentId) {
   });
 }
 
+/**
+ * The documents a bulk download will archive — everything needed to fetch the
+ * bytes and name the member, and nothing else.
+ *
+ * `ids` null means the whole project, which is what "Download all" sends. When
+ * ids ARE given they are intersected with the project rather than trusted: an id
+ * belonging to another project simply does not come back, and the service turns
+ * that absence into a 404 naming it. That is what stops a caller with legitimate
+ * access to project 5 from pulling project 9's files into their archive by id.
+ *
+ * Ordered by name so the archive's contents read the way the panel does, rather
+ * than in whatever order the ids arrived.
+ */
+function listDocumentsForArchive(client, { projectId, ids }) {
+  return client.projectDocument.findMany({
+    where: {
+      projectId,
+      deletedAt: null,
+      ...(ids ? { id: { in: ids } } : {}),
+    },
+    select: {
+      id: true,
+      fileKey: true,
+      originalName: true,
+      mimeType: true,
+      sizeBytes: true,
+      createdAt: true,
+    },
+    orderBy: [{ originalName: 'asc' }, { id: 'asc' }],
+  });
+}
+
 /** One document in the response shape, after a write. */
 function findDocumentDetail(client, documentId) {
   return client.projectDocument.findFirst({
@@ -153,13 +247,36 @@ function findDocumentDetail(client, documentId) {
 }
 
 /**
+ * Rows already pointing at any of these storage keys — the guard against
+ * recording one uploaded object as two documents.
+ *
+ * Only the direct-upload path needs this. When a file arrives THROUGH the API the
+ * key is generated and inserted in the same call, so nothing can name it twice;
+ * when the browser uploads to the bucket itself, the confirm call that follows is
+ * an ordinary HTTP request that can be retried, replayed, or double-clicked, and
+ * without this each attempt would add another row for the same bytes.
+ *
+ * Soft-deleted rows are INCLUDED deliberately. A key belonging to a deleted
+ * document is not free to reuse: the row still refers to it, and re-confirming it
+ * would resurrect the object under a second id while the first still claims it.
+ */
+function findDocumentsByKeys(client, keys) {
+  return client.projectDocument.findMany({
+    where: { fileKey: { in: keys } },
+    select: { id: true, fileKey: true },
+  });
+}
+
+/**
  * Soft delete, matching projects and companies.
  *
- * The row survives with `deleted_at` set and the bytes are left on disk. Both
- * halves are deliberate: an attachment is evidence for a piece of work that was
- * done, and a mis-click that unlinked a client's only copy of a tax return would
- * be unrecoverable. Reclaiming the disk is a separate, deliberate sweep over
- * rows that have been deleted long enough — not a side effect of a button.
+ * The ROW survives with `deleted_at` set, because an attachment is evidence for a
+ * piece of work that was done and the history of who removed what is worth a few
+ * hundred bytes. The BYTES do not: the service deletes the object immediately
+ * afterwards, since a marked-deleted row that leaves its file in the bucket means
+ * stored data only ever grows and a user who removes a 20 MB mistake never gets
+ * that space back. See projectDocumentService.deleteDocument, which owns the
+ * ordering.
  */
 function softDeleteDocument(client, documentId, deletedAt) {
   return client.projectDocument.update({
@@ -173,9 +290,13 @@ module.exports = {
   DOCUMENT_SELECT,
   listDocuments,
   summarizeDocuments,
+  listCompanyDocuments,
+  summarizeCompanyDocuments,
   createDocuments,
   findDocumentsByIds,
+  listDocumentsForArchive,
   findDocumentForAccess,
   findDocumentDetail,
+  findDocumentsByKeys,
   softDeleteDocument,
 };
