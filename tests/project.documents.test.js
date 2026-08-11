@@ -4,14 +4,18 @@
  * Integration tests for the project-document endpoints — upload, list, download
  * and delete — through the real Express app with Prisma mocked.
  *
- * Real multipart bodies are posted, so multer actually runs and actually writes
- * files. That is the point: the rules worth testing here (the type allowlist, the
- * generated storage name, the cleanup after a rejected upload) are enforced by
- * the middleware and the filesystem, and a test that stubbed them out would
- * assert nothing about the behaviour that matters.
+ * NO FILE TRAVELS THROUGH THE API ANY MORE, and that shapes how these read. The
+ * browser uploads to a signed URL and downloads from one, so what is left for
+ * this API to get right is the part around the bytes: who may ask, which key gets
+ * issued, and — because the client is the only witness to its own upload — what
+ * is believed about a file that was uploaded out of sight. Those are the
+ * assertions here.
  *
- * The uploads go to a temporary directory, set BEFORE the app is required so
- * config picks it up, and the whole tree is removed afterwards.
+ * The storage layer is stubbed in the suites that need the remote driver, since
+ * config pins a test run to the LOCAL one so it can never write to a real bucket.
+ * The local driver's own path is still exercised where it survives (the download
+ * fallback, the delete), and it writes into a temporary directory set BEFORE the
+ * app is required so config picks it up; the tree is removed afterwards.
  */
 
 const fs = require('fs');
@@ -62,14 +66,28 @@ function auth({ userId = OWNER_ID, role = 'CUSTOMER', specificRole = 'OWNER' } =
 const ownerAuth = () => auth();
 const outsiderAuth = () => auth({ userId: OUTSIDER_ID });
 
+/*
+ * `phone`, `jobTitle` and `ownedCompanies` are here for requirePaidAccount, which
+ * gates every /projects route: it asks onboardingService for the caller's status,
+ * and an OWNER whose profile is half-filled or whose company carries no paid
+ * subscription is refused with a 402 before any route in this file runs.
+ *
+ * They are on the shared fixture rather than staged per test because being a paid
+ * account is the precondition for all of these tests, not the subject of any of
+ * them — the paywall has its own suite. A non-owner passes the gate regardless,
+ * so the extra fields are harmless for the specialist case.
+ */
 function person(id, role = 'CUSTOMER', specificRole = 'OWNER') {
   return {
     id,
     firstName: 'Ada',
     lastName: 'Hopper',
+    phone: '+1 555 0100',
+    jobTitle: 'Founder',
     status: 'ACTIVE',
     role: { code: role },
     specificRole: specificRole ? { code: specificRole } : null,
+    ownedCompanies: [{ id: COMPANY_ID, subscriptions: [{ id: 1 }] }],
   };
 }
 
@@ -129,17 +147,6 @@ function stageOwnerOnLiveProject() {
   mockPrisma.company.findFirst.mockResolvedValue(company());
 }
 
-/** Every file written under the temp documents root, as relative keys. */
-function storedFiles() {
-  const root = path.join(DOCUMENTS_DIR, 'projects');
-  if (!fs.existsSync(root)) return [];
-  const out = [];
-  for (const dir of fs.readdirSync(root)) {
-    for (const name of fs.readdirSync(path.join(root, dir))) out.push(`${dir}/${name}`);
-  }
-  return out;
-}
-
 beforeEach(() => {
   jest.clearAllMocks();
   fs.rmSync(path.join(DOCUMENTS_DIR, 'projects'), { recursive: true, force: true });
@@ -149,191 +156,6 @@ beforeEach(() => {
 
 afterAll(() => {
   fs.rmSync(DOCUMENTS_DIR, { recursive: true, force: true });
-});
-
-/* -------------------------------------------------------------------------- */
-/* upload                                                                     */
-/* -------------------------------------------------------------------------- */
-
-describe('POST /projects/:projectId/documents', () => {
-  it('stores the file and records what was measured from it, not what was claimed', async () => {
-    stageOwnerOnLiveProject();
-    mockPrisma.projectDocument.createManyAndReturn.mockResolvedValue([{ id: DOCUMENT_ID }]);
-    mockPrisma.projectDocument.findMany.mockResolvedValue([documentRow()]);
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', ownerAuth())
-      .field('companyId', String(COMPANY_ID))
-      .attach('documents', Buffer.from('%PDF-1.4 pretend'), {
-        filename: 'Q4 statement.pdf',
-        contentType: 'application/pdf',
-      });
-
-    expect(res.status).toBe(201);
-    expect(res.body.data.uploaded).toBe(1);
-    expect(res.body.data.companyId).toBe(COMPANY_ID);
-
-    const [row] = mockPrisma.projectDocument.createManyAndReturn.mock.calls[0][0].data;
-    expect(row.projectId).toBe(PROJECT_ID);
-    expect(row.uploadedByUserId).toBe(OWNER_ID);
-    expect(row.originalName).toBe('Q4 statement.pdf');
-    expect(row.mimeType).toBe('application/pdf');
-    expect(row.sizeBytes).toBe(BigInt(Buffer.from('%PDF-1.4 pretend').length));
-
-    // The stored name is generated, never the uploaded one.
-    expect(row.fileKey).toMatch(new RegExp(`^projects/${PROJECT_ID}/[0-9a-f]{32}\\.pdf$`));
-    expect(storedFiles()).toHaveLength(1);
-  });
-
-  it('serialises the BIGINT size as a JSON number rather than throwing on it', async () => {
-    stageOwnerOnLiveProject();
-    mockPrisma.projectDocument.createManyAndReturn.mockResolvedValue([{ id: DOCUMENT_ID }]);
-    mockPrisma.projectDocument.findMany.mockResolvedValue([documentRow()]);
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', ownerAuth())
-      .field('companyId', String(COMPANY_ID))
-      .attach('documents', Buffer.from('x'), { filename: 'a.pdf', contentType: 'application/pdf' });
-
-    expect(res.status).toBe(201);
-    expect(res.body.data.documents[0].sizeBytes).toBe(2048);
-    // The storage key is internal and must never reach the client.
-    expect(JSON.stringify(res.body)).not.toContain('fileKey');
-  });
-
-  it('accepts several files in one request and writes them in one transaction', async () => {
-    stageOwnerOnLiveProject();
-    mockPrisma.projectDocument.createManyAndReturn.mockResolvedValue([{ id: 1 }, { id: 2 }]);
-    mockPrisma.projectDocument.findMany.mockResolvedValue([
-      documentRow({ id: 1, originalName: 'a.pdf' }),
-      documentRow({ id: 2, originalName: 'b.csv', mimeType: 'text/csv' }),
-    ]);
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', ownerAuth())
-      .field('companyId', String(COMPANY_ID))
-      .attach('documents', Buffer.from('one'), { filename: 'a.pdf', contentType: 'application/pdf' })
-      .attach('documents', Buffer.from('two'), { filename: 'b.csv', contentType: 'text/csv' });
-
-    expect(res.status).toBe(201);
-    expect(res.body.data.uploaded).toBe(2);
-    expect(mockPrisma.projectDocument.createManyAndReturn).toHaveBeenCalledTimes(1);
-    expect(storedFiles()).toHaveLength(2);
-  });
-
-  it('refuses a caller who is not on the project’s company, and leaves no file behind', async () => {
-    mockPrisma.user.findUnique.mockResolvedValue(person(OUTSIDER_ID));
-    mockPrisma.project.findFirst.mockResolvedValue(project());
-    mockPrisma.company.findFirst.mockResolvedValue(company());
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', outsiderAuth())
-      .field('companyId', String(COMPANY_ID))
-      .attach('documents', Buffer.from('secret'), {
-        filename: 'x.pdf',
-        contentType: 'application/pdf',
-      });
-
-    expect(res.status).toBe(403);
-    expect(res.body.error.code).toBe('COMPANY_ACCESS_DENIED');
-    expect(mockPrisma.projectDocument.createManyAndReturn).not.toHaveBeenCalled();
-    // The bytes reached disk before the check could run; they must not stay.
-    expect(storedFiles()).toEqual([]);
-  });
-
-  it('refuses a companyId that is not the project’s, and leaves no file behind', async () => {
-    stageOwnerOnLiveProject();
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', ownerAuth())
-      .field('companyId', String(OTHER_COMPANY_ID))
-      .attach('documents', Buffer.from('x'), { filename: 'x.pdf', contentType: 'application/pdf' });
-
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('PROJECT_COMPANY_MISMATCH');
-    expect(storedFiles()).toEqual([]);
-  });
-
-  it('refuses an ADMIN, who is on no company, and leaves no file behind', async () => {
-    mockPrisma.user.findUnique.mockResolvedValue(person(1, 'ADMIN', null));
-    mockPrisma.project.findFirst.mockResolvedValue(project());
-    mockPrisma.company.findFirst.mockResolvedValue(company());
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', auth({ userId: 1, role: 'ADMIN', specificRole: null }))
-      .field('companyId', String(COMPANY_ID))
-      .attach('documents', Buffer.from('x'), { filename: 'x.pdf', contentType: 'application/pdf' });
-
-    expect(res.status).toBe(403);
-    expect(res.body.error.code).toBe('COMPANY_ACCESS_DENIED');
-    expect(mockPrisma.projectDocument.createManyAndReturn).not.toHaveBeenCalled();
-    expect(storedFiles()).toEqual([]);
-  });
-
-  it('rejects a file type that is not on the allowlist', async () => {
-    stageOwnerOnLiveProject();
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', ownerAuth())
-      .field('companyId', String(COMPANY_ID))
-      .attach('documents', Buffer.from('<svg onload=alert(1)>'), {
-        filename: 'payload.svg',
-        contentType: 'image/svg+xml',
-      });
-
-    expect(res.status).toBe(415);
-    expect(res.body.error.code).toBe('UNSUPPORTED_MEDIA_TYPE');
-    expect(storedFiles()).toEqual([]);
-  });
-
-  it('requires companyId', async () => {
-    stageOwnerOnLiveProject();
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', ownerAuth())
-      .attach('documents', Buffer.from('x'), { filename: 'x.pdf', contentType: 'application/pdf' });
-
-    expect(res.status).toBe(400);
-    expect(res.body.error.fields.companyId).toBeDefined();
-    expect(storedFiles()).toEqual([]);
-  });
-
-  it('accepts company_id, since a multipart body never reaches the case normaliser', async () => {
-    stageOwnerOnLiveProject();
-    mockPrisma.projectDocument.createManyAndReturn.mockResolvedValue([{ id: DOCUMENT_ID }]);
-    mockPrisma.projectDocument.findMany.mockResolvedValue([documentRow()]);
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', ownerAuth())
-      .field('company_id', String(COMPANY_ID))
-      .attach('documents', Buffer.from('x'), { filename: 'x.pdf', contentType: 'application/pdf' });
-
-    expect(res.status).toBe(201);
-  });
-
-  it('404s on a soft-deleted project without writing anything', async () => {
-    mockPrisma.user.findUnique.mockResolvedValue(person(OWNER_ID));
-    mockPrisma.project.findFirst.mockResolvedValue(null);
-
-    const res = await request(app)
-      .post(`/api/projects/${PROJECT_ID}/documents`)
-      .set('Authorization', ownerAuth())
-      .field('companyId', String(COMPANY_ID))
-      .attach('documents', Buffer.from('x'), { filename: 'x.pdf', contentType: 'application/pdf' });
-
-    expect(res.status).toBe(404);
-    expect(res.body.error.code).toBe('PROJECT_NOT_FOUND');
-    expect(storedFiles()).toEqual([]);
-  });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -410,6 +232,256 @@ describe('GET /projects/:projectId/documents', () => {
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('COMPANY_ACCESS_DENIED');
     expect(mockPrisma.projectDocument.findMany).not.toHaveBeenCalled();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* direct-to-bucket upload                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The ticket/confirm pair, which exists so a file larger than the host's request
+ * ceiling can be uploaded at all: the browser asks for a signed URL, PUTs the
+ * bytes to Supabase itself, then calls confirm to have them recorded.
+ *
+ * The storage layer is stubbed for the same reason as the signed-download suite —
+ * the test run is pinned to the local driver so it can never write to a real
+ * bucket, and these paths only exist under the remote one. What is under test is
+ * not Supabase; it is the two decisions this API makes around it: that a ticket
+ * is issued only to someone already allowed to upload, and that what gets
+ * RECORDED comes from the bucket rather than from the client's account of itself.
+ */
+describe('direct upload: POST .../documents/upload-url and /confirm', () => {
+  const storage = require('../src/utils/storage');
+  const KEY = `projects/${PROJECT_ID}/${'a1b2c3d4'.repeat(4)}.pdf`;
+
+  let remote;
+  let ticket;
+  let stat;
+  let removed;
+
+  beforeEach(() => {
+    remote = jest.spyOn(storage, 'isRemote').mockReturnValue(true);
+    ticket = jest.spyOn(storage, 'signedUploadUrl').mockImplementation(async ({ key }) => ({
+      url: `https://project.supabase.co/storage/v1/object/upload/sign/${key}?token=t`,
+      token: 't',
+      key,
+    }));
+    stat = jest.spyOn(storage, 'statObject').mockResolvedValue({ sizeBytes: 5000, contentType: 'application/pdf' });
+    removed = jest.spyOn(storage, 'removeObjects').mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    remote.mockRestore();
+    ticket.mockRestore();
+    stat.mockRestore();
+    removed.mockRestore();
+  });
+
+  const askFor = (files, companyId = COMPANY_ID) =>
+    request(app)
+      .post(`/api/projects/${PROJECT_ID}/documents/upload-url`)
+      .set('Authorization', ownerAuth())
+      .send({ companyId, files });
+
+  const pdf = (overrides = {}) => ({
+    fileName: 'statement.pdf',
+    mimeType: 'application/pdf',
+    sizeBytes: 5000,
+    ...overrides,
+  });
+
+  describe('upload-url', () => {
+    it('issues one signed URL per file, under a key the caller did not choose', async () => {
+      stageOwnerOnLiveProject();
+
+      const res = await askFor([pdf(), pdf({ fileName: 'ledger.xlsx', mimeType: 'text/csv' })]);
+
+      expect(res.status).toBe(201);
+      expect(res.body.data.uploads).toHaveLength(2);
+
+      // The key is generated here, from the allowlisted type — never from the
+      // name the client sent. That is what makes the ticket a write to one path
+      // rather than an open one.
+      expect(res.body.data.uploads[0].key).toMatch(
+        new RegExp(`^projects/${PROJECT_ID}/[0-9a-f]{32}\\.pdf$`)
+      );
+      expect(res.body.data.uploads[1].key).toMatch(
+        new RegExp(`^projects/${PROJECT_ID}/[0-9a-f]{32}\\.csv$`)
+      );
+      expect(res.body.data.uploads[0].uploadUrl).toContain('supabase.co');
+    });
+
+    it('refuses a type outside the allowlist before any ticket exists', async () => {
+      stageOwnerOnLiveProject();
+
+      const res = await askFor([pdf({ fileName: 'run.exe', mimeType: 'application/x-msdownload' })]);
+
+      expect(res.status).toBe(415);
+      expect(res.body.error.code).toBe('UNSUPPORTED_MEDIA_TYPE');
+      expect(ticket).not.toHaveBeenCalled();
+    });
+
+    it('refuses a declared size over the cap, so nobody uploads for four minutes to be told no', async () => {
+      stageOwnerOnLiveProject();
+
+      const res = await askFor([pdf({ sizeBytes: 99 * 1024 * 1024 })]);
+
+      expect(res.status).toBe(413);
+      expect(res.body.error.code).toBe('FILE_TOO_LARGE');
+      expect(ticket).not.toHaveBeenCalled();
+    });
+
+    it('mints nothing for someone who is not on the project', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(person(OUTSIDER_ID));
+      mockPrisma.project.findFirst.mockResolvedValue(project());
+      mockPrisma.company.findFirst.mockResolvedValue(company());
+
+      const res = await request(app)
+        .post(`/api/projects/${PROJECT_ID}/documents/upload-url`)
+        .set('Authorization', outsiderAuth())
+        .send({ companyId: COMPANY_ID, files: [pdf()] });
+
+      expect(res.status).toBe(403);
+      expect(ticket).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the request names a company the project does not belong to', async () => {
+      stageOwnerOnLiveProject();
+
+      const res = await askFor([pdf()], OTHER_COMPANY_ID);
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('PROJECT_COMPANY_MISMATCH');
+      expect(ticket).not.toHaveBeenCalled();
+    });
+
+    it('is unavailable on a deployment that stores files locally', async () => {
+      remote.mockReturnValue(false);
+      stageOwnerOnLiveProject();
+
+      const res = await askFor([pdf()]);
+
+      expect(res.status).toBe(501);
+      expect(res.body.error.code).toBe('DIRECT_TRANSFER_UNAVAILABLE');
+    });
+  });
+
+  describe('confirm', () => {
+    const confirm = (files, companyId = COMPANY_ID) =>
+      request(app)
+        .post(`/api/projects/${PROJECT_ID}/documents/confirm`)
+        .set('Authorization', ownerAuth())
+        .send({ companyId, files });
+
+    /** No row yet for the key, then the created row read back. Both are findMany. */
+    function stageInsert() {
+      mockPrisma.projectDocument.findMany
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([documentRow()]);
+      mockPrisma.projectDocument.createManyAndReturn.mockResolvedValue([{ id: DOCUMENT_ID }]);
+    }
+
+    it('records the size the BUCKET reports, not the one the client claims', async () => {
+      stageOwnerOnLiveProject();
+      stageInsert();
+      stat.mockResolvedValue({ sizeBytes: 9_000_000, contentType: 'application/pdf' });
+
+      const res = await confirm([{ key: KEY, fileName: 'Q4 statement.pdf' }]);
+
+      expect(res.status).toBe(201);
+      const [row] = mockPrisma.projectDocument.createManyAndReturn.mock.calls[0][0].data;
+      expect(row.sizeBytes).toBe(BigInt(9_000_000));
+      expect(row.fileKey).toBe(KEY);
+      expect(row.originalName).toBe('Q4 statement.pdf');
+      // From the extension we put in the key at ticket time — not from anything
+      // the browser set as the object's content type.
+      expect(row.mimeType).toBe('application/pdf');
+      expect(row.uploadedByUserId).toBe(OWNER_ID);
+    });
+
+    it('refuses a key belonging to a different project', async () => {
+      stageOwnerOnLiveProject();
+
+      const res = await confirm([{ key: `projects/999/${'a1b2c3d4'.repeat(4)}.pdf`, fileName: 'theirs.pdf' }]);
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('INVALID_UPLOAD_KEY');
+      expect(mockPrisma.projectDocument.createManyAndReturn).not.toHaveBeenCalled();
+    });
+
+    it('refuses a key this API could never have issued', async () => {
+      stageOwnerOnLiveProject();
+
+      const res = await confirm([{ key: `projects/${PROJECT_ID}/../../secrets.env`, fileName: 'x.pdf' }]);
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('INVALID_UPLOAD_KEY');
+    });
+
+    it('404s when the object never arrived, rather than recording a row pointing at nothing', async () => {
+      stageOwnerOnLiveProject();
+      mockPrisma.projectDocument.findMany.mockResolvedValueOnce([]);
+      stat.mockResolvedValue(null);
+
+      const res = await confirm([{ key: KEY, fileName: 'statement.pdf' }]);
+
+      expect(res.status).toBe(404);
+      expect(res.body.error.code).toBe('UPLOAD_NOT_FOUND');
+      expect(mockPrisma.projectDocument.createManyAndReturn).not.toHaveBeenCalled();
+    });
+
+    it('deletes an object that turns out to be over the cap, instead of leaving it stored', async () => {
+      stageOwnerOnLiveProject();
+      mockPrisma.projectDocument.findMany.mockResolvedValueOnce([]);
+      // The ticket was issued against a modest declared size; the real object is
+      // far larger. This is the check that makes the earlier one enforceable.
+      stat.mockResolvedValue({ sizeBytes: 90 * 1024 * 1024, contentType: 'application/pdf' });
+
+      const res = await confirm([{ key: KEY, fileName: 'huge.pdf' }]);
+
+      expect(res.status).toBe(413);
+      expect(res.body.error.code).toBe('FILE_TOO_LARGE');
+      expect(removed).toHaveBeenCalledWith(expect.objectContaining({ keys: [KEY] }));
+      expect(mockPrisma.projectDocument.createManyAndReturn).not.toHaveBeenCalled();
+    });
+
+    it('refuses to record the same upload twice', async () => {
+      stageOwnerOnLiveProject();
+      mockPrisma.projectDocument.findMany.mockResolvedValueOnce([{ id: DOCUMENT_ID, fileKey: KEY }]);
+
+      const res = await confirm([{ key: KEY, fileName: 'statement.pdf' }]);
+
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('DOCUMENT_ALREADY_RECORDED');
+      expect(mockPrisma.projectDocument.createManyAndReturn).not.toHaveBeenCalled();
+    });
+
+    it('refuses the same key twice within one request', async () => {
+      stageOwnerOnLiveProject();
+
+      const res = await confirm([
+        { key: KEY, fileName: 'statement.pdf' },
+        { key: KEY, fileName: 'statement.pdf' },
+      ]);
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('refuses an outsider before it looks at the bucket at all', async () => {
+      mockPrisma.user.findUnique.mockResolvedValue(person(OUTSIDER_ID));
+      mockPrisma.project.findFirst.mockResolvedValue(project());
+      mockPrisma.company.findFirst.mockResolvedValue(company());
+
+      const res = await request(app)
+        .post(`/api/projects/${PROJECT_ID}/documents/confirm`)
+        .set('Authorization', outsiderAuth())
+        .send({ companyId: COMPANY_ID, files: [{ key: KEY, fileName: 'statement.pdf' }] });
+
+      expect(res.status).toBe(403);
+      expect(stat).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -492,8 +564,240 @@ describe('GET /projects/:projectId/documents/:documentId/download', () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* download under the remote driver                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The signed-URL branch, which the rest of this file cannot reach.
+ *
+ * config.storage forces the LOCAL driver whenever NODE_ENV is 'test', so that a
+ * test run can never write into a real bucket — which also means the branch that
+ * only exists under the supabase driver would otherwise ship untested. Rather
+ * than unset that guard (and give every future test file the power to touch live
+ * storage), `storage.signedUrl` is stubbed here: it is the single function whose
+ * returning a string is what "we are on the remote driver" means to everything
+ * above it.
+ *
+ * What is being checked is not Supabase's URL format — that is their business —
+ * but the two things this codebase decides: that a link is only minted AFTER the
+ * access check, and that the redirect carrying it is not cacheable.
+ */
+describe('GET .../download under the supabase driver', () => {
+  const storage = require('../src/utils/storage');
+  const SIGNED = 'https://project.supabase.co/storage/v1/object/sign/project-documents/x?token=abc';
+
+  let signed;
+
+  beforeEach(() => {
+    signed = jest.spyOn(storage, 'signedUrl').mockResolvedValue(SIGNED);
+  });
+
+  afterEach(() => signed.mockRestore());
+
+  function stageDocument() {
+    stageOwnerOnLiveProject();
+    mockPrisma.projectDocument.findFirst.mockResolvedValue({
+      ...documentRow(),
+      fileKey: `projects/${PROJECT_ID}/abc123.pdf`,
+      project: { id: PROJECT_ID, companyId: COMPANY_ID, createdByUserId: OWNER_ID, assignedSpecialistUserId: SPECIALIST_ID, deletedAt: null },
+    });
+  }
+
+  it('redirects to a signed link instead of sending the bytes', async () => {
+    stageDocument();
+
+    const res = await request(app)
+      .get(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}/download`)
+      .set('Authorization', ownerAuth())
+      .redirects(0);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe(SIGNED);
+    // Uncacheable: the Location header is a working capability for as long as the
+    // link lives, and a cached 302 would hand it to the next person.
+    expect(res.headers['cache-control']).toContain('no-store');
+  });
+
+  it('asks for the link with the original filename, so the browser saves it as an attachment', async () => {
+    stageDocument();
+
+    await request(app)
+      .get(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}/download`)
+      .set('Authorization', ownerAuth())
+      .redirects(0);
+
+    expect(signed).toHaveBeenCalledWith(
+      expect.objectContaining({ key: `projects/${PROJECT_ID}/abc123.pdf`, download: 'statement.pdf' })
+    );
+  });
+
+  it('mints no link at all for someone who may not read the document', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(person(OUTSIDER_ID));
+    mockPrisma.project.findFirst.mockResolvedValue(project());
+    mockPrisma.company.findFirst.mockResolvedValue(company());
+    mockPrisma.projectDocument.findFirst.mockResolvedValue({
+      ...documentRow(),
+      fileKey: `projects/${PROJECT_ID}/abc123.pdf`,
+      project: { id: PROJECT_ID, companyId: COMPANY_ID, createdByUserId: OWNER_ID, assignedSpecialistUserId: SPECIALIST_ID, deletedAt: null },
+    });
+
+    const res = await request(app)
+      .get(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}/download`)
+      .set('Authorization', outsiderAuth())
+      .redirects(0);
+
+    expect(res.status).toBe(403);
+    expect(signed).not.toHaveBeenCalled();
+  });
+
+  it('404s when the object is gone, rather than redirecting to a link that would fail', async () => {
+    // Supabase declines to sign a key that is not in the bucket, and there is no
+    // local file behind this key either — so the request lands on the same 404 it
+    // always did instead of sending the browser somewhere broken.
+    signed.mockResolvedValue(null);
+    stageDocument();
+
+    const res = await request(app)
+      .get(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}/download`)
+      .set('Authorization', ownerAuth())
+      .redirects(0);
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('DOCUMENT_NOT_FOUND');
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* delete                                                                     */
 /* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/* bulk download as links                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The alternative to the zip, for a client that would rather fetch the files
+ * itself. The selection rules are the archive's — that is the whole point, since
+ * the two answer the same question — so what is worth asserting here is the part
+ * that differs: one link per document, an expiry the client is told about, and a
+ * response that is not cacheable because it is a list of live capabilities.
+ */
+describe('POST /projects/:projectId/documents/links', () => {
+  const storage = require('../src/utils/storage');
+
+  let remote;
+  let signed;
+
+  beforeEach(() => {
+    remote = jest.spyOn(storage, 'isRemote').mockReturnValue(true);
+    signed = jest
+      .spyOn(storage, 'signedUrl')
+      .mockImplementation(async ({ key }) => `https://project.supabase.co/sign/${key}?token=t`);
+  });
+
+  afterEach(() => {
+    remote.mockRestore();
+    signed.mockRestore();
+  });
+
+  const row = (id, originalName) => ({
+    id,
+    fileKey: `projects/${PROJECT_ID}/${String(id).repeat(4)}abcdef.pdf`,
+    originalName,
+    mimeType: 'application/pdf',
+    sizeBytes: BigInt(40 * 1024 * 1024),
+    createdAt: new Date('2026-01-05T10:00:00Z'),
+  });
+
+  it('returns one link per document, with the expiry stated', async () => {
+    stageOwnerOnLiveProject();
+    mockPrisma.projectDocument.findMany.mockResolvedValue([row(1, 'statement.pdf'), row(2, 'return.pdf')]);
+
+    const res = await request(app)
+      .post(`/api/projects/${PROJECT_ID}/documents/links`)
+      .set('Authorization', ownerAuth())
+      .send({ documentIds: [1, 2] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.count).toBe(2);
+    expect(res.body.data.expiresInSeconds).toBeGreaterThan(0);
+    expect(res.body.data.documents.map((d) => d.url)).toEqual([
+      expect.stringContaining('supabase.co'),
+      expect.stringContaining('supabase.co'),
+    ]);
+    // 40 MB each — far past anything the zip could return, which is why this
+    // endpoint exists.
+    expect(res.body.data.documents[0].sizeBytes).toBe(40 * 1024 * 1024);
+    expect(res.headers['cache-control']).toContain('no-store');
+  });
+
+  it('asks for each link under the document original name', async () => {
+    stageOwnerOnLiveProject();
+    mockPrisma.projectDocument.findMany.mockResolvedValue([row(1, 'statement.pdf')]);
+
+    await request(app)
+      .post(`/api/projects/${PROJECT_ID}/documents/links`)
+      .set('Authorization', ownerAuth())
+      .send({});
+
+    expect(signed).toHaveBeenCalledWith(expect.objectContaining({ download: 'statement.pdf' }));
+  });
+
+  it('404s on an id that is not on this project, rather than dropping it silently', async () => {
+    stageOwnerOnLiveProject();
+    // Only one of the two asked-for ids resolves against this project.
+    mockPrisma.projectDocument.findMany.mockResolvedValue([row(1, 'statement.pdf')]);
+
+    const res = await request(app)
+      .post(`/api/projects/${PROJECT_ID}/documents/links`)
+      .set('Authorization', ownerAuth())
+      .send({ documentIds: [1, 2] });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.details.missing).toEqual([2]);
+  });
+
+  it('404s rather than returning a link that would fail', async () => {
+    stageOwnerOnLiveProject();
+    mockPrisma.projectDocument.findMany.mockResolvedValue([row(1, 'statement.pdf')]);
+    signed.mockResolvedValue(null);
+
+    const res = await request(app)
+      .post(`/api/projects/${PROJECT_ID}/documents/links`)
+      .set('Authorization', ownerAuth())
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('DOCUMENT_NOT_FOUND');
+  });
+
+  it('refuses an outsider without minting anything', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(person(OUTSIDER_ID));
+    mockPrisma.project.findFirst.mockResolvedValue(project());
+    mockPrisma.company.findFirst.mockResolvedValue(company());
+
+    const res = await request(app)
+      .post(`/api/projects/${PROJECT_ID}/documents/links`)
+      .set('Authorization', outsiderAuth())
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(signed).not.toHaveBeenCalled();
+  });
+
+  it('is unavailable on a deployment that stores files locally', async () => {
+    remote.mockReturnValue(false);
+    stageOwnerOnLiveProject();
+
+    const res = await request(app)
+      .post(`/api/projects/${PROJECT_ID}/documents/links`)
+      .set('Authorization', ownerAuth())
+      .send({});
+
+    expect(res.status).toBe(501);
+    expect(res.body.error.code).toBe('DIRECT_TRANSFER_UNAVAILABLE');
+  });
+});
 
 describe('DELETE /projects/:projectId/documents/:documentId', () => {
   const withProject = (overrides = {}) => ({
@@ -522,6 +826,65 @@ describe('DELETE /projects/:projectId/documents/:documentId', () => {
     const call = mockPrisma.projectDocument.update.mock.calls[0][0];
     expect(call.where).toEqual({ id: DOCUMENT_ID });
     expect(call.data.deletedAt).toBeInstanceOf(Date);
+  });
+
+  it('removes the stored file, so a delete actually frees the space', async () => {
+    const fileKey = `projects/${PROJECT_ID}/tobin.pdf`;
+    const abs = path.join(DOCUMENTS_DIR, fileKey);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, 'twenty megabytes, pretend');
+
+    stageOwnerOnLiveProject();
+    mockPrisma.projectDocument.findFirst.mockResolvedValue({ ...withProject(), fileKey });
+    mockPrisma.projectDocument.update.mockResolvedValue({ id: DOCUMENT_ID, deletedAt: new Date() });
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    // The row is kept for the history; the bytes are not, because a marked-deleted
+    // row that leaves its object behind means storage only ever grows.
+    expect(fs.existsSync(abs)).toBe(false);
+  });
+
+  it('still succeeds when the stored file is already gone', async () => {
+    // A retried delete, or a row whose object was removed by hand. The user's
+    // delete has nothing left to do and must not fail over it.
+    stageOwnerOnLiveProject();
+    mockPrisma.projectDocument.findFirst.mockResolvedValue({
+      ...withProject(),
+      fileKey: `projects/${PROJECT_ID}/never-written.pdf`,
+    });
+    mockPrisma.projectDocument.update.mockResolvedValue({ id: DOCUMENT_ID, deletedAt: new Date() });
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.deleted).toBe(true);
+  });
+
+  it('leaves the file alone when the delete is refused', async () => {
+    const TEAMMATE_ID = 61;
+    const fileKey = `projects/${PROJECT_ID}/keepme.pdf`;
+    const abs = path.join(DOCUMENTS_DIR, fileKey);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, 'still needed');
+
+    mockPrisma.user.findUnique.mockResolvedValue(person(TEAMMATE_ID));
+    mockPrisma.project.findFirst.mockResolvedValue(project());
+    mockPrisma.company.findFirst.mockResolvedValue(company());
+    mockPrisma.companyMember.findFirst.mockResolvedValue({ id: 1 });
+    mockPrisma.projectDocument.findFirst.mockResolvedValue({ ...withProject(), fileKey });
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}`)
+      .set('Authorization', auth({ userId: TEAMMATE_ID }));
+
+    expect(res.status).toBe(403);
+    expect(fs.existsSync(abs)).toBe(true);
   });
 
   it('refuses a teammate who can read the project but did not upload the file', async () => {

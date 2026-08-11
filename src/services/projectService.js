@@ -211,6 +211,22 @@ async function loadProjectForRead(client, { userId, projectId }) {
   return { caller, project, company };
 }
 
+/**
+ * The same read rule, asked about a COMPANY rather than one of its projects.
+ *
+ * Exported for the company-wide document list, which has no single project to
+ * hang the check on: it spans every project the company has. Sharing this rather
+ * than reimplementing it matters more here than anywhere, because a per-company
+ * query that got the check wrong would leak an entire client's files at once
+ * instead of one project's.
+ */
+async function loadCompanyForRead(client, { userId, companyId }) {
+  const caller = await loadCaller(userId);
+  const company = await loadCompany(client, companyId);
+  await assertReadAccess(client, caller, company);
+  return { caller, company };
+}
+
 /* -------------------------------------------------------------------------- */
 /* the service the project is for                                             */
 /* -------------------------------------------------------------------------- */
@@ -649,5 +665,6 @@ module.exports = {
   backfillAfterStaffingChange,
   // Shared with projectDocumentService — see loadProjectForRead above.
   loadProjectForRead,
+  loadCompanyForRead,
   assertWriteAccess,
 };

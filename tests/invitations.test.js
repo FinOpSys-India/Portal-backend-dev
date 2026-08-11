@@ -124,8 +124,22 @@ describe('POST /api/invitations — authentication', () => {
   });
 
   it('refuses a non-admin caller (403)', async () => {
+    /*
+     * Staged as a PAID owner deliberately. /invitations sits behind
+     * requirePaidAccount, which runs ahead of the role gate, so an owner with no
+     * paid company is refused with a 402 before the question this test asks is
+     * ever reached. Paying for the account is what gets the request as far as the
+     * role check — which is the thing being asserted: being an owner in good
+     * standing still does not make you an admin.
+     */
     mockPrisma.user.findUnique.mockResolvedValue(
-      adminUser({ role: { code: 'CUSTOMER' }, specificRole: { code: 'OWNER' } })
+      adminUser({
+        role: { code: 'CUSTOMER' },
+        specificRole: { code: 'OWNER' },
+        phone: '+1 555 0100',
+        jobTitle: 'Founder',
+        ownedCompanies: [{ id: 900, subscriptions: [{ id: 1 }] }],
+      })
     );
 
     const res = await request(app)

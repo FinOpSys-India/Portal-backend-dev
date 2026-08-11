@@ -47,14 +47,24 @@ function auth({ userId = USER_ID, email = USER_EMAIL, role = 'CUSTOMER', specifi
   return `Bearer ${signAccessToken({ userId, email, role, specificRole })}`;
 }
 
+/*
+ * `phone`, `jobTitle` and `ownedCompanies` are here because onboardCompany now
+ * refuses a caller whose profile is unfinished, and it reads that through
+ * onboardingService.getStatus — which selects exactly these. An owner fixture
+ * without them is one that could not legally reach this endpoint at all, so
+ * every test would be asserting against a 409.
+ */
 function ownerUser(overrides = {}) {
   return {
     id: USER_ID,
     firstName: 'Ada',
     lastName: 'Lovelace',
+    phone: '+15551234567',
+    jobTitle: 'Founder',
     status: 'ACTIVE',
     role: { code: 'CUSTOMER' },
     specificRole: { code: 'OWNER' },
+    ownedCompanies: [],
     ...overrides,
   };
 }
@@ -124,6 +134,19 @@ function stageHappyPath() {
   mockPrisma.companyAddress.create.mockResolvedValue({ id: 700 });
   mockPrisma.company.update.mockResolvedValue(companyRow({ onboardingCompleted: true, status: 'ACTIVE' }));
   mockPrisma.idempotencyKey.create.mockResolvedValue({ id: 1 });
+}
+
+/**
+ * `company.findFirst` now backs two different questions on this route: "is this
+ * email already taken?" and "does this owner still owe for a company?". Staging
+ * a conflict with a bare mockResolvedValue answers BOTH with the same row, which
+ * turns every email test into a 402 about an outstanding bill. Route on the
+ * shape of the where instead — only the unpaid probe carries `subscriptions`.
+ */
+function stageCompanyEmailTaken(row) {
+  mockPrisma.company.findFirst.mockImplementation(({ where }) =>
+    Promise.resolve(where?.subscriptions ? null : row)
+  );
 }
 
 beforeEach(() => {
@@ -266,7 +289,7 @@ describe('POST /api/onboarding/company — happy path', () => {
 describe('POST /api/onboarding/company — company email must be free', () => {
   it('rejects an email another company already uses (409)', async () => {
     stageHappyPath();
-    mockPrisma.company.findFirst.mockResolvedValue(companyRow({ id: 901 }));
+    stageCompanyEmailTaken(companyRow({ id: 901 }));
 
     const res = await request(app).post('/api/onboarding/company').set('Authorization', auth()).send(validBody());
 

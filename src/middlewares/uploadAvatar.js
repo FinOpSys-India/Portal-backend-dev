@@ -1,21 +1,18 @@
 'use strict';
 
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 
 const multer = require('multer');
 
 const config = require('../config');
+const storage = require('../utils/storage');
 const ApiError = require('../utils/ApiError');
 
 /**
  * The multipart parser for POST /users/me/avatar.
  *
- * This is the only route in the API that accepts a file, and it is the only
- * place where bytes from a client reach the filesystem — so every rule about
- * what may be written, where, and under what name is enforced here rather than
- * spread between the route and the service.
+ * Every rule about what may be stored, where, and under what name is enforced
+ * here rather than spread between the route and the service.
  *
  * Three rules, and the reason for each:
  *
@@ -28,11 +25,17 @@ const ApiError = require('../utils/ApiError');
  *      file called `x.php` uploaded as image/jpeg lands as `.jpg`, and nothing
  *      the static server hands back can be interpreted as code.
  *   3. Size is capped by multer itself, which aborts the request mid-stream.
- *      Checking after the fact would mean the whole file was already on disk.
+ *      Checking after the fact would mean the whole file was already buffered.
  *
- * Files are written under `<uploads>/avatars/<userId>/`, and the user id comes
- * from the verified token (requireAuth runs first), never from the request — so
- * one user cannot write into another's folder.
+ * Objects are stored under `avatars/<userId>/`, and the user id comes from the
+ * verified token (requireAuth runs first), never from the request — so one user
+ * cannot write into another's prefix.
+ *
+ * THE PARSER HOLDS THE IMAGE IN MEMORY rather than writing it to disk, because a
+ * serverless host has no durable disk: a file written during the upload is gone
+ * before the request that wants to display it. userService hands the buffer to
+ * the avatars bucket once the row is ready. One image of at most
+ * `maxAvatarBytes` (2 MB) is resident at a time.
  */
 
 // The set of formats a browser can display and we are willing to serve back.
@@ -46,21 +49,21 @@ const EXTENSION_BY_MIME = {
 
 const FIELD_NAME = 'avatar';
 
-const storage = multer.diskStorage({
-  destination(req, file, cb) {
-    // Per-user folder: keeps one directory from growing to a million entries,
-    // and makes "delete this account's files" a single recursive remove.
-    const dir = path.join(config.uploads.dir, 'avatars', String(req.user.id));
-    fs.mkdir(dir, { recursive: true }, (err) => cb(err, dir));
-  },
-  filename(req, file, cb) {
-    const ext = EXTENSION_BY_MIME[file.mimetype];
-    cb(null, `${crypto.randomBytes(16).toString('hex')}${ext}`);
-  },
-});
+/**
+ * The storage key for one uploaded avatar: `avatars/<userId>/<random><ext>`.
+ *
+ * Per-user prefix: keeps one listing from growing to a million entries, and
+ * makes "delete this account's files" one prefixed remove. The user id is the
+ * token's subject, so nothing a client sends can steer it.
+ */
+function avatarKeyFor(userId, mimeType) {
+  const ext = EXTENSION_BY_MIME[mimeType] ?? '';
+  return storage.keyFor('avatars', userId, `${crypto.randomBytes(16).toString('hex')}${ext}`);
+}
 
 const parser = multer({
-  storage,
+  // In memory — see the note above. userService writes it to the bucket.
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: config.uploads.maxAvatarBytes,
     files: 1,
@@ -147,4 +150,4 @@ function uploadAvatar(req, res, next) {
   });
 }
 
-module.exports = { uploadAvatar, EXTENSION_BY_MIME };
+module.exports = { uploadAvatar, EXTENSION_BY_MIME, avatarKeyFor };

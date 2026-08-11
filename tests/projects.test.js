@@ -56,14 +56,29 @@ const ownerAuth = () => auth();
 const managerAuth = () => auth({ userId: MANAGER_ID, role: 'ACCOUNTING_MANAGER', specificRole: null });
 const adminAuth = () => auth({ userId: 1, role: 'ADMIN', specificRole: null });
 
-function person(id, first, last, role, specificRole = null) {
+/*
+ * `phone`, `jobTitle` and `ownedCompanies` are here for requirePaidAccount, which
+ * gates every /projects route: it asks onboardingService for the caller's status,
+ * and an OWNER whose profile is half-filled or whose company carries no paid
+ * subscription is refused with a 402 before any route in this file runs.
+ *
+ * They are on the shared fixture rather than staged per test because being a paid
+ * account is the precondition for all of these tests, not the subject of any of
+ * them — the paywall has its own suite. A non-owner passes the gate regardless,
+ * so the extra fields are harmless for the manager, admin and specialist cases.
+ */
+function person(id, first, last, role, specificRole = null, overrides = {}) {
   return {
     id,
     firstName: first,
     lastName: last,
+    phone: '+1 555 0100',
+    jobTitle: 'Founder',
     status: 'ACTIVE',
     role: { code: role },
     specificRole: specificRole ? { code: specificRole } : null,
+    ownedCompanies: [{ id: COMPANY_ID, subscriptions: [{ id: 1 }] }],
+    ...overrides,
   };
 }
 

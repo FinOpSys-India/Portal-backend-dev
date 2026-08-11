@@ -1,22 +1,31 @@
 'use strict';
 
 const config = require('../config');
+const storage = require('../utils/storage');
 
 /**
  * Response shapes for the caller's own profile.
  *
  * The one job worth stating: `avatarKey` never leaves this file. The database
  * stores a key ("avatars/18/9f3c2a.jpg"), the client needs a URL, and the
- * translation happens here — in exactly one place — so moving the files to a CDN
- * or a signed-URL bucket later is an edit to `avatarUrl()` and nothing else. Ship
- * the raw key to the client and every frontend gains its own copy of the rule
- * for turning it into a URL, and then you cannot move the files at all.
+ * translation happens here — in exactly one place. That is what made moving the
+ * pictures off local disk and into a Supabase bucket an edit to this one
+ * function: the stored keys did not change, only what they resolve to. Ship the
+ * raw key to the client and every frontend gains its own copy of the rule for
+ * turning it into a URL, and then you cannot move the files at all.
  */
 
-/** Absolute URL for a stored avatar key, or null when the user has no picture. */
+/**
+ * Absolute URL for a stored avatar key, or null when the user has no picture.
+ *
+ * Public either way — the avatars bucket is public and so is the local uploads
+ * folder — because an <img src> cannot send an Authorization header. Safe
+ * because the filename is 32 random hex characters and nothing confidential is
+ * ever written there. Documents are the opposite case and go out through an
+ * authorized route instead; see dto/projectDocumentDto.
+ */
 function avatarUrl(avatarKey) {
-  if (!avatarKey) return null;
-  return `${config.uploads.publicBaseUrl}${config.uploads.publicPath}/${avatarKey}`;
+  return storage.publicUrl({ bucket: config.storage.avatarBucket, key: avatarKey });
 }
 
 /** An address row as the client sees it. Mirrors dto/companyDto.toAddress. */
