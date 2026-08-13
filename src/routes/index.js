@@ -19,6 +19,7 @@ const adminRoutes = require('./adminRoutes');
 const accountingManagerRoutes = require('./accountingManagerRoutes');
 const projectRoutes = require('./projectRoutes');
 const documentRoutes = require('./documentRoutes');
+const taskRoutes = require('./taskRoutes');
 const billingRoutes = require('./billingRoutes');
 
 /**
@@ -115,6 +116,10 @@ router.use('/projects', requireAuth, requirePaidAccount, projectRoutes);
 // Every file on a company, across its projects. Gated with /projects, since it
 // reads the same records through a different door.
 router.use('/documents', requireAuth, requirePaidAccount, documentRoutes);
+// The task board: every task on a company, and the writes the assigned
+// specialist performs on them. Gated with /projects for the same reason
+// /documents is — it reads and writes the same work through a different door.
+router.use('/tasks', requireAuth, requirePaidAccount, taskRoutes);
 router.use('/invitations', requireAuth, requirePaidAccount, invitationRoutes);
 // POST /billing/webhook is mounted in app.js instead — it needs the raw body,
 // so it must sit ahead of express.json(). Everything else is authenticated here.

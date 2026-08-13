@@ -22,6 +22,7 @@ const {
   requestDownloadLinks,
   deleteDocument,
 } = require('../controllers/projectDocumentController');
+const { listProjectTasks } = require('../controllers/projectTaskController');
 
 /*
  * Projects: a unit of work opened against one company, for one service it pays
@@ -146,5 +147,21 @@ router.get('/:projectId/documents/:documentId/download', downloadDocument);
  */
 router.post('/:projectId/documents/links', documentLimiter, requestDownloadLinks);
 router.delete('/:projectId/documents/:documentId', projectLimiter, deleteDocument);
+
+/*
+ * One project's tasks.
+ *
+ *   GET /projects/42/tasks?status=&specialistUserId=&search=&limit=&offset=
+ *
+ * The read half of the tasks feature that is scoped to a single project; the
+ * company-wide list and every write live on /tasks (see routes/taskRoutes).
+ * Split the same way the documents feature is, and for the same reason: a read
+ * that spans a company is top-level and takes the global ?companyId= filter,
+ * a read scoped to one piece of work hangs off it.
+ *
+ * No role gate, matching every other read here — the service applies the project
+ * read rule, which is wider than any role claim can describe.
+ */
+router.get('/:projectId/tasks', listProjectTasks);
 
 module.exports = router;

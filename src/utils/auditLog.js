@@ -34,6 +34,12 @@ const FIELD_ALLOWLIST = [
   // free text a customer typed, which is exactly what this allowlist keeps out.
   'projectId',
   'projectCount',
+  // Task context, on the same terms as the project ids above: an identifier and
+  // a count. The task NAME and its DESCRIPTION are deliberately absent — both
+  // are free text somebody typed, which is what this allowlist exists to keep
+  // out of the log.
+  'taskId',
+  'taskCount',
   'idempotent',
   /*
    * Billing / Stripe context. All of these are identifiers, counts, or integer

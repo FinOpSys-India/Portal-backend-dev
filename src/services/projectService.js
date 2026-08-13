@@ -2,6 +2,7 @@
 
 const { prisma } = require('../config/prisma');
 const repo = require('../repositories/projectRepository');
+const taskRepo = require('../repositories/projectTaskRepository');
 const companyRepo = require('../repositories/companyRepository');
 const catalog = require('../config/serviceCatalog');
 const dto = require('../dto/projectDto');
@@ -398,6 +399,7 @@ async function backfillSpecialists(companyId, { requestId } = {}) {
   if (!pending.length) return { assigned: 0, remaining: 0 };
 
   let assigned = 0;
+  let tasksMoved = 0;
   for (const project of pending) {
     const specialization = project.servicePlan?.specialization;
     if (!specialization) continue;
@@ -408,8 +410,28 @@ async function backfillSpecialists(companyId, { requestId } = {}) {
     });
     if (!specialistUserId) continue;
 
-    await repo.setAssignedSpecialist(prisma, project.id, specialistUserId);
+    /*
+     * The project and its open tasks move TOGETHER, in one transaction.
+     *
+     * A task's specialist must equal its project's. The database was going to
+     * hold that itself — a composite foreign key with ON UPDATE CASCADE — and
+     * that constraint was dropped, so this pairing is now the only thing making
+     * the two agree. Outside a transaction, a failure between the two writes
+     * would leave a project staffed to one person and its tasks to another, with
+     * nothing to detect it: exactly the drift the cascade would have made
+     * impossible.
+     */
+    const moved = await prisma.$transaction(async (tx) => {
+      await repo.setAssignedSpecialist(tx, project.id, specialistUserId);
+      const result = await taskRepo.reassignOpenTaskSpecialist(tx, {
+        projectId: project.id,
+        specialistUserId,
+      });
+      return result?.count ?? 0;
+    });
+
     assigned += 1;
+    tasksMoved += moved;
   }
 
   if (assigned) {
@@ -419,6 +441,10 @@ async function backfillSpecialists(companyId, { requestId } = {}) {
       requestId,
       companyId,
       projectCount: assigned,
+      // Logged rather than returned: the endpoint's response shape is a
+      // contract, and how many tasks followed the projects is an operational
+      // detail rather than something a caller acts on.
+      taskCount: tasksMoved,
     });
   }
 
@@ -576,6 +602,36 @@ async function createProject({ userId, requestId, input }) {
 }
 
 /**
+ * The PROJECT side of the task deadline rule.
+ *
+ * A task must fall AFTER its project's deadline. `project_tasks` carries no
+ * CHECK for that — the comparison crosses tables — so the rule is held in code,
+ * and it has two sides: filing a task (projectTaskService) and moving the
+ * project's deadline out from under tasks already filed, which is this one.
+ *
+ * Pushing a deadline LATER is the dangerous direction: every task on or before
+ * the new date becomes a violation. This BLOCKS the edit rather than shifting
+ * the tasks, because there is no correct amount to shift them by — the caller is
+ * told how many rows are in the way, and re-dating them is a deliberate second
+ * action.
+ *
+ * It lives in this file rather than beside its other half only because
+ * projectTaskService already requires this module, and a require back the other
+ * way would close a cycle. The task repository has no service dependencies, so
+ * reaching it directly is safe.
+ */
+async function assertDeadlineLeavesTasksValid(client, { projectId, deadlineDate }) {
+  const offending = await taskRepo.countTasksNotAfter(client, { projectId, date: deadlineDate });
+  if (!offending) return;
+
+  throw new ApiError(409, 'This project has tasks that would fall on or before the new deadline.', {
+    code: 'PROJECT_DEADLINE_CONFLICTS_WITH_TASKS',
+    fields: { deadlineDate: `Re-date the ${offending} affected task(s) first.` },
+    details: { offendingTaskCount: offending },
+  });
+}
+
+/**
  * PATCH /projects/:projectId — correct the name, the deadline, or the note, and
  * move the status (which is what moves the progress bar).
  *
@@ -590,6 +646,12 @@ async function updateProject({ userId, requestId, projectId, input }) {
 
     const company = await loadCompany(tx, project.companyId);
     assertWriteAccess(caller, company, project);
+
+    // Inside the transaction, so a task filed between the check and the write
+    // cannot slip past it.
+    if (input.deadlineDate !== undefined) {
+      await assertDeadlineLeavesTasksValid(tx, { projectId, deadlineDate: input.deadlineDate });
+    }
 
     return repo.updateProject(tx, projectId, input);
   });

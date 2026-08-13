@@ -272,7 +272,17 @@ function findProjectDetail(client, projectId) {
 function findProjectForAccess(client, projectId) {
   return client.project.findFirst({
     where: { id: projectId, deletedAt: null },
-    select: { id: true, companyId: true, createdByUserId: true, assignedSpecialistUserId: true, status: true },
+    // `deadlineDate` is here for the tasks feature: a task must fall after its
+    // project's deadline, and that comparison runs on the same load that decides
+    // whether the caller may write at all.
+    select: {
+      id: true,
+      companyId: true,
+      createdByUserId: true,
+      assignedSpecialistUserId: true,
+      status: true,
+      deadlineDate: true,
+    },
   });
 }
 

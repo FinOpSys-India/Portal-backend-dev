@@ -23,6 +23,10 @@ const mockPrisma = {
     create: jest.fn(),
     update: jest.fn(),
   },
+  // Re-staffing a project carries its open tasks to the new specialist, and the
+  // project deadline can only move if no live task would fall on or before it —
+  // both reach projectTask from the project paths.
+  projectTask: { updateMany: jest.fn(), count: jest.fn() },
   $transaction: jest.fn(async (cb) => cb(mockPrisma)),
 };
 
@@ -242,6 +246,11 @@ function stageBench(bench = BENCH) {
 beforeEach(() => {
   jest.clearAllMocks();
   mockPrisma.$transaction.mockImplementation(async (cb) => cb(mockPrisma));
+
+  // Defaults for the task side: nothing to carry, and no task standing in the
+  // way of a deadline move. Cases that care override them.
+  mockPrisma.projectTask.updateMany.mockResolvedValue({ count: 0 });
+  mockPrisma.projectTask.count.mockResolvedValue(0);
 
   stageUsers({
     [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER'),
@@ -774,6 +783,53 @@ describe('PATCH /projects/:projectId', () => {
     expect(res.body.data.status).toBe('ACTIVE');
   });
 
+  /*
+   * The project side of the rule that a task falls AFTER its project. The
+   * database holds no CHECK for it — the comparison crosses tables — so moving a
+   * project's deadline LATER has to be refused here, or tasks already filed
+   * silently become violations.
+   */
+  it('refuses a deadline move that would leave tasks on or before it (409)', async () => {
+    mockPrisma.projectTask.count.mockResolvedValue(3);
+
+    const res = await request(app)
+      .patch(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth())
+      .send({ deadline_date: '2030-06-30' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('PROJECT_DEADLINE_CONFLICTS_WITH_TASKS');
+    expect(res.body.error.details.offendingTaskCount).toBe(3);
+    // Refused, not written — the count is checked inside the same transaction.
+    expect(mockPrisma.project.update).not.toHaveBeenCalled();
+  });
+
+  it('allows the deadline move when every task still falls after it (200)', async () => {
+    mockPrisma.projectTask.count.mockResolvedValue(0);
+    mockPrisma.project.update.mockResolvedValue(projectRow({ deadlineDate: new Date('2030-06-30') }));
+
+    const res = await request(app)
+      .patch(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth())
+      .send({ deadline_date: '2030-06-30' });
+
+    expect(res.status).toBe(200);
+    expect(mockPrisma.projectTask.count).toHaveBeenCalledWith({
+      where: { projectId: PROJECT_ID, deletedAt: null, deadlineDate: { lte: new Date('2030-06-30') } },
+    });
+  });
+
+  it('leaves the task check alone when the deadline is not being touched', async () => {
+    mockPrisma.project.update.mockResolvedValue(projectRow({ projectName: 'Renamed' }));
+
+    await request(app)
+      .patch(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth())
+      .send({ project_name: 'Renamed' });
+
+    expect(mockPrisma.projectTask.count).not.toHaveBeenCalled();
+  });
+
   it('sets the progress bar, passing a string to the NUMERIC column (200)', async () => {
     mockPrisma.project.update.mockResolvedValue(projectRow({ status: 'ACTIVE', progressBar: '65.50' }));
 
@@ -879,6 +935,59 @@ describe('POST /projects/sync-specialists', () => {
         data: { assignedSpecialistUserId: BOOKKEEPER_ID },
       })
     );
+  });
+
+  it('carries the project’s OPEN tasks to the new specialist, leaving finished work alone', async () => {
+    mockPrisma.project.findMany.mockResolvedValue([
+      { id: PROJECT_ID, servicePlan: { specialization: { id: 1, specializationCode: 'BOOKKEEPING' } } },
+    ]);
+    mockPrisma.project.update.mockResolvedValue({ id: PROJECT_ID, assignedSpecialistUserId: BOOKKEEPER_ID });
+    mockPrisma.projectTask.updateMany.mockResolvedValue({ count: 2 });
+
+    const res = await request(app)
+      .post('/api/projects/sync-specialists')
+      .set('Authorization', managerAuth())
+      .send({ company_id: COMPANY_ID });
+
+    expect(res.status).toBe(200);
+    /*
+     * The database no longer holds "a task's specialist is its project's" — the
+     * composite foreign key that would have cascaded was dropped — so this write
+     * is the only thing keeping the two in step.
+     */
+    expect(mockPrisma.projectTask.updateMany).toHaveBeenCalledWith({
+      where: {
+        projectId: PROJECT_ID,
+        deletedAt: null,
+        // COMPLETED is absent: putting a new name on finished work would rewrite
+        // history, the same reason the project sweep skips completed projects.
+        status: { in: ['TODO', 'ACTIVE'] },
+        /*
+         * Spelled out rather than as `NOT: { specialistUserId }`, because the
+         * NULL rows are the point: an accounting manager may file tasks on a
+         * project before anyone is staffed on it, and a bare negation would
+         * skip exactly those (`col <> 77` is UNKNOWN when col is NULL).
+         */
+        OR: [{ specialistUserId: null }, { specialistUserId: { not: BOOKKEEPER_ID } }],
+      },
+      data: { specialistUserId: BOOKKEEPER_ID },
+    });
+  });
+
+  it('moves the project and its tasks inside ONE transaction', async () => {
+    mockPrisma.project.findMany.mockResolvedValue([
+      { id: PROJECT_ID, servicePlan: { specialization: { id: 1, specializationCode: 'BOOKKEEPING' } } },
+    ]);
+    mockPrisma.project.update.mockResolvedValue({ id: PROJECT_ID, assignedSpecialistUserId: BOOKKEEPER_ID });
+
+    await request(app)
+      .post('/api/projects/sync-specialists')
+      .set('Authorization', managerAuth())
+      .send({ company_id: COMPANY_ID });
+
+    // Without the transaction a failure between the two writes would leave a
+    // project staffed to one person and its tasks to another, undetectably.
+    expect(mockPrisma.$transaction).toHaveBeenCalled();
   });
 
   it('only ever looks at live, unassigned projects', async () => {
