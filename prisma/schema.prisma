@@ -169,6 +169,11 @@ model User {
 
   uploadedProjectDocuments ProjectDocument[] @relation("ProjectDocumentUploader")
 
+  // Tasks. Same split as projects above, and for the same reason: `createdTasks`
+  // is who filed the task, `assignedTasks` is who owns the work.
+  createdTasks  ProjectTask[] @relation("ProjectTaskCreatedBy")
+  assignedTasks ProjectTask[] @relation("ProjectTaskSpecialist")
+
   idempotencyKeys       IdempotencyKey[]
 
   @@map("users")
@@ -1001,6 +1006,7 @@ model Project {
   createdBy          User  @relation("ProjectCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
 
   documents ProjectDocument[]
+  tasks     ProjectTask[]
 
   @@index([companyId])
   @@index([assignedSpecialistUserId])
@@ -1052,4 +1058,76 @@ enum ProjectStatus {
   COMPLETED
 
   @@map("project_status")
+}
+
+/// One piece of work filed under a project, owned by the specialist that project
+/// is staffed with.
+///
+/// TWO RULES THIS MODEL CANNOT STATE, both enforced in the service layer:
+///
+///   1. `deadlineDate` must fall AFTER the project's own `deadlineDate`. The
+///      comparison crosses tables, so no CHECK and no Prisma attribute can hold
+///      it — and it has to be re-checked when a PROJECT's deadline moves, not
+///      only when a task is written, or tasks already filed become invalid.
+///
+///   2. `specialistUserId` must be the project's `assignedSpecialistUserId`.
+///      One project has exactly one specialist, so a task naming anyone else is
+///      wrong. The service already loads the project to authorize the caller,
+///      so the check is free there. NOTE the consequence: re-running
+///      POST /projects/sync-specialists must carry these rows to the new
+///      specialist too, or tasks are left pointing at someone off the account.
+///
+/// There is no `companyId`, matching ProjectDocument: the project already names
+/// the company, and a second copy of that fact could disagree with the first.
+model ProjectTask {
+  id        Int    @id @default(autoincrement())
+  projectId Int    @map("project_id")
+  taskName  String @map("task_name") @db.VarChar(255)
+
+  /// NOT NULL by decision — a task states what it is. Callers with nothing to
+  /// add send an empty string rather than omitting the field.
+  description String
+
+  status TaskStatus @default(TODO)
+
+  /// Who owns the work. Nullable because the project's own specialist is
+  /// nullable (a company can be unstaffed on that service line), so a task can
+  /// outlive the assignment.
+  specialistUserId Int? @map("specialist_user_id")
+
+  /// A DATE, not a timestamp, matching Project.deadlineDate — a deadline is the
+  /// calendar day the user picked, and a zone would shift it across midnight
+  /// for readers elsewhere.
+  deadlineDate DateTime @map("deadline_date") @db.Date
+
+  /// Who filed it. A different question from who owns it, hence its own column:
+  /// an accounting manager may open a task the specialist then works.
+  createdByUserId Int @map("created_by_user_id")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft delete, matching Project and ProjectDocument.
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  // Every foreign key here is NO ACTION in the database — no ON DELETE clause
+  // was written — so nothing referenced by a task can be hard-deleted. Restrict
+  // is the Prisma spelling of that. Projects and companies are soft-deleted in
+  // this application anyway, so it only ever blocks a true DELETE.
+  project    Project @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  specialist User?   @relation("ProjectTaskSpecialist", fields: [specialistUserId], references: [id], onDelete: Restrict)
+  createdBy  User    @relation("ProjectTaskCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  // The only index on the table. Every read in this feature is "tasks for
+  // project X", and Postgres does not index the referencing side of a foreign
+  // key on its own.
+  @@index([projectId])
+  @@map("project_tasks")
+}
+
+enum TaskStatus {
+  TODO
+  ACTIVE
+  COMPLETED
+
+  @@map("task_status")
 }

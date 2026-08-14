@@ -2,6 +2,10 @@
 
 const catalog = require('../config/serviceCatalog');
 const money = require('../utils/money');
+// The avatar KEY is what the database stores and the URL is what a client needs;
+// borrowing the builder keeps that translation in one file rather than teaching
+// a second DTO how storage paths are assembled.
+const { avatarUrl } = require('./userDto');
 
 /**
  * Response DTOs for the company flows. These are the ONLY shapes that leave the
@@ -80,12 +84,12 @@ function toAddress(address) {
 
 /**
  * The full onboarding response: company + its primary address + the accounting
- * manager the new company inherited, if any.
+ * manager, which on a freshly onboarded company is always null.
  *
- * `accountingManager` is always present as a key (null when nothing was
- * inherited) rather than appearing only on the companies that got one — a client
- * that has to check whether a field exists before reading it will eventually
- * forget to.
+ * The key is still emitted, rather than dropped because it can only be null
+ * today: a client that has to check whether a field exists before reading it
+ * will eventually forget to, and the same shape then holds once an admin
+ * assigns a manager and the company is re-read.
  */
 function toCompanyOnboardingResponse({ company, address, accountingManager = null }) {
   return {
@@ -583,6 +587,44 @@ function toSpecialistRow({ user, specialities, companies }) {
 }
 
 /**
+ * The specialist profile behind a clicked directory row: who they are, how to
+ * reach them, and the work they hold.
+ *
+ * NO COMPANY BLOCK, deliberately. The caller reached this profile through one
+ * named company and is looking at a person, not an account — the company's own
+ * details already have their screens (GET /companies/:companyId and /team), and
+ * repeating them here would be a second copy to keep in step with the first. The
+ * only company context left is what each task carries, which is the context the
+ * task actually needs.
+ *
+ * `address` is the specialist's OWN address (users.address_id), not the
+ * company's. Null when they never completed the onboarding form, which is common
+ * enough that the key is always present rather than conditional.
+ *
+ * `tasks` is null for an admin rather than empty, and the difference is the
+ * point: empty would claim the specialist has no work, when in truth the admin's
+ * view names no company for the work to belong to. It matches the task endpoints
+ * themselves, which refuse an admin outright.
+ */
+function toSpecialistDetail({ user, specialities, tasks }) {
+  return {
+    ...toDirectoryUser(user),
+    fullName: [user.firstName, user.lastName].filter(Boolean).join(' '),
+    serviceSpeciality: user.specificRole?.name ?? null,
+    specialities,
+    phone: user.phone ?? null,
+    avatarUrl: avatarUrl(user.avatarKey),
+    address: toAddress(user.address),
+    createdAt: user.createdAt ?? null,
+    tasks,
+    // The count of the array in this same response, never a separate COUNT: two
+    // numbers from two queries can disagree, and a header reading "12 tasks"
+    // above nine rows is a bug report waiting to happen.
+    taskCount: tasks === null ? null : tasks.length,
+  };
+}
+
+/**
  * One row of the customer directory: the person, their specific role on the
  * customer side (Owner / Team), and the companies they are attached to.
  *
@@ -610,12 +652,41 @@ function toCustomerRow(user) {
   };
 }
 
+/**
+ * The customer profile behind a clicked directory row: the person, and only the
+ * person.
+ *
+ * NO COMPANY BLOCK, the same call as toSpecialistDetail makes and for the same
+ * reason — the caller arrived here through one named company and is looking at a
+ * human being, not an account. The company's own details already have their
+ * screens (GET /companies/:companyId and /team).
+ *
+ * `address` is the customer's OWN address (users.address_id), not their
+ * company's. Null when they never completed the onboarding form, which is common
+ * enough that the key is always present rather than conditional.
+ */
+function toCustomerDetail(user) {
+  return {
+    ...toDirectoryUser(user),
+    fullName: [user.firstName, user.lastName].filter(Boolean).join(' '),
+    // Code and display name both, as on the directory row: the code is what a
+    // client branches on, the name is what the screen renders.
+    specificRoleName: user.specificRole?.name ?? null,
+    phone: user.phone ?? null,
+    avatarUrl: avatarUrl(user.avatarKey),
+    address: toAddress(user.address),
+    createdAt: user.createdAt ?? null,
+  };
+}
+
 module.exports = {
   toCompany,
   toCompanyWithPeople,
   toAccountingManagerRow,
   toSpecialistRow,
+  toSpecialistDetail,
   toCustomerRow,
+  toCustomerDetail,
   toOwnedCompanyOption,
   toTeammateRow,
   toCompanyDetail,

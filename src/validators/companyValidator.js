@@ -463,6 +463,50 @@ function validateScopedDirectoryQuery(query = {}) {
 }
 
 /**
+ * `?companyId=` for GET /specialists/:userId — and nothing else.
+ *
+ * The profile takes no paging, no search and no sort: it is one person, and a
+ * parameter the endpoint would ignore is worse than one it rejects, because the
+ * client that sent it believes it did something. `rejectUnknown` therefore does
+ * most of the work here.
+ *
+ * Whether `companyId` is required, forbidden, or reachable at all depends on the
+ * caller's role and is decided in the service — this validates the SHAPE only.
+ */
+function validateSpecialistDetailQuery(query = {}) {
+  common.rejectUnknown(query, ['companyId'], 'query string');
+
+  return {
+    companyId:
+      query.companyId === undefined || query.companyId === null || query.companyId === ''
+        ? null
+        : common.parseId(query.companyId, 'companyId'),
+  };
+}
+
+/**
+ * `?companyId=` for GET /customers/:userId — the same shape as the specialist
+ * profile above, and for the same reason: one person, so no paging, no search
+ * and no sort.
+ *
+ * Kept as its own function rather than shared with the specialist profile
+ * because the rules BEHIND the parameter differ — there it is forbidden to an
+ * admin and required of a manager; here it is required of everyone, because the
+ * endpoint has one audience and no unscoped form. Both decisions are the
+ * service's; this validates the SHAPE only.
+ */
+function validateCustomerDetailQuery(query = {}) {
+  common.rejectUnknown(query, ['companyId'], 'query string');
+
+  return {
+    companyId:
+      query.companyId === undefined || query.companyId === null || query.companyId === ''
+        ? null
+        : common.parseId(query.companyId, 'companyId'),
+  };
+}
+
+/**
  * `?companyId=&search=&specificRole=&includeInactive=&limit=&offset=&sort=&order=`
  * for GET /teammates.
  *
@@ -546,6 +590,8 @@ module.exports = {
   validateUserListQuery,
   validateAccountingManagerListQuery,
   validateScopedDirectoryQuery,
+  validateSpecialistDetailQuery,
+  validateCustomerDetailQuery,
   validateTeammateListQuery,
   validateSpecialistListQuery,
   parseId: common.parseId,

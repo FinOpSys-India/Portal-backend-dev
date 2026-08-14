@@ -11,6 +11,8 @@ const {
   validateUserListQuery,
   validateAccountingManagerListQuery,
   validateScopedDirectoryQuery,
+  validateSpecialistDetailQuery,
+  validateCustomerDetailQuery,
   validateTeammateListQuery,
   validateSpecialistListQuery,
   parseId,
@@ -316,6 +318,37 @@ const listSpecialistDirectory = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /specialists/:userId
+ *
+ * The profile behind a clicked directory row: the person, their contact detail
+ * and address, the companies and specialities they hold, and the per-status
+ * counters for their tasks on the named company. The task TABLE stays at
+ * GET /tasks?companyId=&specialistUserId=, which pages and filters.
+ */
+const getSpecialistDetail = asyncHandler(async (req, res) => {
+  const specialistUserId = parseId(req.params.userId, 'userId');
+  const query = validateSpecialistDetailQuery(req.query);
+
+  const specialist = await companyService.getSpecialistDetail({
+    userId: req.user.id,
+    requestId: req.id,
+    specialistUserId,
+    query,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Specialist retrieved.',
+    data: {
+      specialist,
+      // Echo the scope, so a client can tell an admin's unscoped profile from a
+      // manager's view of the same person on one account.
+      filters: { companyId: query.companyId },
+    },
+  });
+});
+
+/**
  * GET /companies/owned
  *
  * The live companies the caller owns — the company picker on the teammate form.
@@ -411,6 +444,36 @@ const listCustomerDirectory = asyncHandler(async (req, res) => {
         order: query.order,
       },
       filters: { companyId: query.companyId, search: query.search, includeInactive: query.includeInactive },
+    },
+  });
+});
+
+/**
+ * GET \customers:userId
+ *
+ * The profile behind a clicked customer row: the person, their contact detail
+ * and their own address. No companies and no nested tables — this screen is the
+ * human being, and the account already has its own.
+ */
+const getCustomerDetail = asyncHandler(async (req, res) => {
+  const customerUserId = parseId(req.params.userId, 'userId');
+  const query = validateCustomerDetailQuery(req.query);
+
+  const customer = await companyService.getCustomerDetail({
+    userId: req.user.id,
+    requestId: req.id,
+    customerUserId,
+    query,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Customer retrieved.',
+    data: {
+      customer,
+      // Echoed for the same reason the directories echo it: the company the
+      // profile was read through is part of the answer, not just the request.
+      filters: { companyId: query.companyId },
     },
   });
 });
@@ -582,7 +645,9 @@ module.exports = {
   listCompanyAccounts,
   listAccountingManagers,
   listSpecialistDirectory,
+  getSpecialistDetail,
   listCustomerDirectory,
+  getCustomerDetail,
   listOwnedCompanies,
   listTeammates,
   listManagedCompanies,

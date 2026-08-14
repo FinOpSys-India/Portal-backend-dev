@@ -754,6 +754,37 @@ function countSpecialistDirectory(client, { userIds, search, includeInactive }) 
   return client.user.count({ where: buildSpecialistDirectoryWhere({ userIds, search, includeInactive }) });
 }
 
+/**
+ * One specialist in full, for the profile behind a clicked directory row.
+ *
+ * The role predicate is part of the LOOKUP, not a check performed after it: a
+ * user id that belongs to a customer or an accounting manager must come back as
+ * "no such specialist" rather than as a person the caller can then inspect, and
+ * folding it into the `where` is what makes that true by construction.
+ *
+ * Carries the contact detail the list row deliberately omits — phone, avatar,
+ * address. A directory table has no room for it and no use for it; a profile is
+ * exactly the screen that does.
+ *
+ * `includeInactive` is absent on purpose. Reaching a profile means the caller
+ * already has the id, and a hibernated specialist is precisely the one whose
+ * history someone needs to look up — hiding the row would answer "who was
+ * working my account last quarter?" with a 404.
+ */
+function findSpecialistProfile(client, userId) {
+  return client.user.findFirst({
+    where: { id: userId, role: { code: SPECIALIST_ROLE_CODE } },
+    select: {
+      ...DIRECTORY_SELECT,
+      phone: true,
+      avatarKey: true,
+      createdAt: true,
+      specificRole: { select: { code: true, name: true } },
+      address: true,
+    },
+  });
+}
+
 /** The ids of every live company the caller can reach. Admin: every company. */
 async function listAccessibleCompanyIds(client, { userId, isAdmin }) {
   const rows = await client.company.findMany({
@@ -898,6 +929,37 @@ function countCustomerDirectory(client, { userIds, search, includeInactive }) {
   return client.user.count({ where: buildCustomerDirectoryWhere({ userIds, search, includeInactive }) });
 }
 
+/**
+ * One customer-side user in full, for the profile behind a clicked directory row.
+ *
+ * The role predicate is part of the LOOKUP rather than a check afterwards, for
+ * the same reason it is on findSpecialistProfile: a specialist's or a manager's
+ * id must come back as "no such customer", not as a person the caller may then
+ * inspect.
+ *
+ * NO COMPANIES are selected, unlike the directory row. The profile is the
+ * PERSON — name, contact detail, address, avatar. Which accounts they own is
+ * already on the row that was clicked and on the company screens themselves, and
+ * a third copy here would be one more thing to keep in step with the other two.
+ *
+ * `includeInactive` is absent on purpose, as on the specialist profile: reaching
+ * a profile means the caller already holds the id, and a deactivated customer is
+ * exactly the one whose contact details someone still needs to look up.
+ */
+function findCustomerProfile(client, userId) {
+  return client.user.findFirst({
+    where: { id: userId, role: { code: CUSTOMER_ROLE_CODE } },
+    select: {
+      ...DIRECTORY_SELECT,
+      phone: true,
+      avatarKey: true,
+      createdAt: true,
+      specificRole: { select: { code: true, name: true } },
+      address: true,
+    },
+  });
+}
+
 /* ------------------------------- teammates -------------------------------- */
 
 /**
@@ -1035,37 +1097,6 @@ async function listCustomerIdsForCompanies(client, companyIds) {
   return rows.map((row) => row.ownerUserId);
 }
 
-/**
- * The company a new one should inherit its accounting manager from: the OLDEST
- * live company belonging to the same creator whose manager is still eligible.
- *
- * "Oldest" is the tie-break for a creator whose companies sit with different
- * managers — it makes inheritance deterministic and stable, where "newest" would
- * mean the answer changes every time another company is added. Eligibility is
- * checked in the JOIN, not afterwards, so a company pointing at a deactivated or
- * re-roled manager is simply not a candidate and the search falls through to the
- * next one instead of stopping there.
- *
- * ARCHIVED companies are excluded alongside soft-deleted ones: a wound-down
- * company should not go on deciding who staffs new ones.
- */
-function findInheritableManagerSource(client, ownerUserId) {
-  return client.company.findFirst({
-    where: {
-      ownerUserId,
-      deletedAt: null,
-      status: { not: 'ARCHIVED' },
-      accountingManager: { is: ELIGIBLE_MANAGER_WHERE },
-    },
-    orderBy: { createdAt: 'asc' },
-    select: {
-      id: true,
-      accountingManagerUserId: true,
-      accountingManager: { select: USER_ROLE_SELECT },
-    },
-  });
-}
-
 /* ----------------------------- idempotency ------------------------------- */
 
 function findIdempotencyKey(client, { userId, idempotencyKey }) {
@@ -1088,6 +1119,7 @@ module.exports = {
   SPECIALIST_ROLE_CODE,
   STANDING_SPECIALIST_COLUMNS,
   listSpecialistDirectory,
+  findSpecialistProfile,
   countSpecialistDirectory,
   listAccessibleCompanyIds,
   listSpecialistIdsForCompanies,
@@ -1096,13 +1128,13 @@ module.exports = {
   CUSTOMER_ROLE_CODE,
   listCustomerDirectory,
   countCustomerDirectory,
+  findCustomerProfile,
   listCustomerIdsForCompanies,
   listTeammates,
   countTeammates,
   listOwnedCompanyOptions,
   listOwnedCompanyIds,
   findUnpaidCompanyForOwner,
-  findInheritableManagerSource,
   listActiveSubscriptionsForCompanies,
   listActiveAssignmentsForCompanies,
   listEligibleSpecialists,

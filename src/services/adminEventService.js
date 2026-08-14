@@ -41,7 +41,7 @@ const dto = require('../dto/companyDto');
  * refetch just that row.
  */
 
-/** A newly onboarded company, including any manager it inherited. */
+/** A newly onboarded company — always unstaffed until an admin assigns. */
 function companyCreated(company) {
   realtime.publish('company.created', { company: dto.toCompanyWithPeople(company) });
 }

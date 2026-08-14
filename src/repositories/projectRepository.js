@@ -248,6 +248,26 @@ function listProjects(client, { companyId, status, assignedSpecialistUserId, sea
   });
 }
 
+/**
+ * Every project of a company as { id, projectName } — the project dropdown.
+ *
+ * Two columns and no joins, which is the whole point: the table's row carries a
+ * plan, a company, and two user records, and a picker that paid for all of them
+ * would be four joins to render a list of names.
+ *
+ * UNPAGED. A dropdown that pages is a dropdown missing options, and a company's
+ * projects are bounded by the work it has commissioned. Ordered by name so the
+ * list reads the way a picker should — the deadline ordering the table uses
+ * makes a dropdown impossible to scan for a name you already know.
+ */
+function listProjectOptions(client, { companyId, status, assignedSpecialistUserId }) {
+  return client.project.findMany({
+    where: buildProjectWhere({ companyId, status, assignedSpecialistUserId, search: null }),
+    select: { id: true, projectName: true },
+    orderBy: [{ projectName: 'asc' }, { id: 'desc' }],
+  });
+}
+
 function countProjects(client, { companyId, status, assignedSpecialistUserId, search }) {
   return client.project.count({
     where: buildProjectWhere({ companyId, status, assignedSpecialistUserId, search }),
@@ -272,7 +292,17 @@ function findProjectDetail(client, projectId) {
 function findProjectForAccess(client, projectId) {
   return client.project.findFirst({
     where: { id: projectId, deletedAt: null },
-    select: { id: true, companyId: true, createdByUserId: true, assignedSpecialistUserId: true, status: true },
+    // `deadlineDate` is here for the tasks feature: a task must fall after its
+    // project's deadline, and that comparison runs on the same load that decides
+    // whether the caller may write at all.
+    select: {
+      id: true,
+      companyId: true,
+      createdByUserId: true,
+      assignedSpecialistUserId: true,
+      status: true,
+      deadlineDate: true,
+    },
   });
 }
 
@@ -336,6 +366,7 @@ module.exports = {
   findEligibleSpecialists,
   findActiveAssignmentForUser,
   listProjects,
+  listProjectOptions,
   countProjects,
   findProjectDetail,
   findProjectForAccess,
