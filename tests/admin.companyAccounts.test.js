@@ -2,8 +2,8 @@
 
 /**
  * Integration tests for admin company-account management: the management-page
- * read, accounting-manager assignment/removal, company-creation inheritance, and
- * the real-time channel — through the real Express app with Prisma mocked.
+ * read, accounting-manager assignment/removal, company creation leaving the
+ * manager unassigned, and the real-time channel — through the real Express app with Prisma mocked.
  */
 
 const mockPrisma = {
@@ -1046,16 +1046,16 @@ describe('DELETE /companies/:id/accounting-manager', () => {
   });
 });
 
-/* --------------------- inheritance at company creation -------------------- */
+/* ------------------- staffing at company creation: none ------------------- */
 
-describe('POST /onboarding/company — accounting-manager inheritance', () => {
+describe('POST /onboarding/company — accounting manager is never auto-assigned', () => {
   /*
    * `phone` and `jobTitle` are load-bearing here. POST /onboarding/company now
    * asks onboardingService whether the caller's PROFILE is finished and refuses
    * with a 409 if it is not — onboarding runs profile, then company, then
    * payment, and the endpoint enforces that order rather than trusting the
    * client's router to. An owner without those two fields never reaches the
-   * inheritance logic these tests are about.
+   * company insert these tests are about.
    *
    * `ownedCompanies` is empty on purpose: this owner is creating their FIRST
    * company, so there is nothing to have paid for yet.
@@ -1088,16 +1088,12 @@ describe('POST /onboarding/company — accounting-manager inheritance', () => {
   }
 
   /**
-   * company.findFirst backs three different questions here. Route by the shape
-   * of the where clause so each gets its own answer.
+   * The only company.findFirst the onboarding path still makes is the
+   * company-email availability check; everything else answers null.
    */
-  function stageOnboarding({ inheritanceSource }) {
-    stageUsers({ [OWNER_ID]: ownerRow });
-    mockPrisma.company.findFirst.mockImplementation(({ where }) => {
-      if (where.companyEmail) return Promise.resolve(null); // email is free
-      if (where.accountingManager) return Promise.resolve(inheritanceSource); // inheritance lookup
-      return Promise.resolve(null);
-    });
+  function stageOnboarding({ owner = ownerRow } = {}) {
+    stageUsers({ [OWNER_ID]: owner });
+    mockPrisma.company.findFirst.mockResolvedValue(null);
     mockPrisma.address.create.mockResolvedValue({ id: 500, line1: '1 Congress Ave', city: 'Austin', country: 'United States' });
 
     // The finalize update must return the row as the database would — with the
@@ -1113,47 +1109,8 @@ describe('POST /onboarding/company — accounting-manager inheritance', () => {
     );
   }
 
-  it('inherits the manager from the creator’s oldest eligible company', async () => {
-    stageOnboarding({
-      inheritanceSource: {
-        id: 800,
-        accountingManagerUserId: MANAGER_ID,
-        accountingManager: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER'),
-      },
-    });
-
-    const res = await request(app)
-      .post('/api/onboarding/company')
-      .set('Authorization', auth({ userId: OWNER_ID, role: 'CUSTOMER', specificRole: 'OWNER' }))
-      .send(body());
-
-    expect(res.status).toBe(201);
-    // Assigned as part of the CREATE, inside the same transaction — the company
-    // is never briefly unassigned.
-    expect(mockPrisma.company.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ accountingManagerUserId: MANAGER_ID }) })
-    );
-    expect(res.body.data.company.accountingManagerUserId).toBe(MANAGER_ID);
-    expect(res.body.data.accountingManager).toMatchObject({ userId: MANAGER_ID, email: 'sarah.jones@finopsys.ai' });
-    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
-
-    // Oldest first, live companies only, and the manager's eligibility is part
-    // of the query rather than an afterthought.
-    expect(mockPrisma.company.findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          ownerUserId: OWNER_ID,
-          deletedAt: null,
-          status: { not: 'ARCHIVED' },
-          accountingManager: { is: { status: 'ACTIVE', role: { code: 'ACCOUNTING_MANAGER' } } },
-        }),
-        orderBy: { createdAt: 'asc' },
-      })
-    );
-  });
-
-  it('creates the company unassigned when the creator has no eligible manager', async () => {
-    stageOnboarding({ inheritanceSource: null });
+  it('creates the company unassigned', async () => {
+    stageOnboarding();
 
     const res = await request(app)
       .post('/api/onboarding/company')
@@ -1162,19 +1119,25 @@ describe('POST /onboarding/company — accounting-manager inheritance', () => {
 
     expect(res.status).toBe(201);
     expect(res.body.data.accountingManager).toBeNull();
-    const createData = mockPrisma.company.create.mock.calls[0][0].data;
-    expect(createData.accountingManagerUserId).toBeUndefined();
+    // The column is left out of the insert entirely, so it keeps its NULL
+    // default rather than being written to null explicitly.
+    expect(mockPrisma.company.create.mock.calls[0][0].data.accountingManagerUserId).toBeUndefined();
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
   });
 
-  it('does not inherit a manager who has lost the role since that assignment', async () => {
-    // The relation filter would not return this row in production; the service
-    // re-asserts eligibility on what it is handed, so the rule survives a
-    // loosened query too.
+  it('stays unassigned even when the owner already has a staffed company', async () => {
+    /*
+     * The case the removed inheritance rule used to cover. An owner opening
+     * their second business gets a company an admin still has to staff — who
+     * works an account is a staffing decision, and a customer filling in the
+     * onboarding form must not be able to make it.
+     */
     stageOnboarding({
-      inheritanceSource: {
-        id: 800,
-        accountingManagerUserId: MANAGER_ID,
-        accountingManager: person(MANAGER_ID, 'Sarah', 'Jones', 'SPECIALIST'),
+      owner: {
+        ...ownerRow,
+        // Shaped as onboardingService selects it: the paid subscription is what
+        // keeps the existing company from reopening the payment step.
+        ownedCompanies: [{ id: 800, accountingManagerUserId: MANAGER_ID, subscriptions: [{ id: 9 }] }],
       },
     });
 
@@ -1186,6 +1149,11 @@ describe('POST /onboarding/company — accounting-manager inheritance', () => {
     expect(res.status).toBe(201);
     expect(res.body.data.accountingManager).toBeNull();
     expect(mockPrisma.company.create.mock.calls[0][0].data.accountingManagerUserId).toBeUndefined();
+
+    // No lookup for a manager to copy is made at all.
+    for (const [args] of mockPrisma.company.findFirst.mock.calls) {
+      expect(args.where.accountingManager).toBeUndefined();
+    }
   });
 });
 

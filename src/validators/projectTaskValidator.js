@@ -20,10 +20,11 @@ const ApiError = require('../utils/ApiError');
  * than claims: the service checks both against the caller's access, and
  * `companyId` is checked against the project's own before anything is written.
  *
- * THE DEADLINE RULE IS NOT HERE, and cannot be. A task's deadline must fall
- * after its PROJECT's deadline, which means the check needs a row this file has
- * no way to read. It lives in projectTaskService, which already loads the
- * project to authorize the caller.
+ * HALF THE DEADLINE RULE IS NOT HERE, and cannot be. A task's deadline must fall
+ * on or before its PROJECT's deadline, which means the check needs a row this
+ * file has no way to read. It lives in projectTaskService, which already loads
+ * the project to authorize the caller. The other half — must be after today —
+ * needs nothing but the value, so it is applied here.
  */
 
 const TASK_STATUSES = ['TODO', 'ACTIVE', 'COMPLETED'];
@@ -101,10 +102,10 @@ function validateTaskDescription(value, field = 'description') {
  * project is a 400 rather than a silent write to whichever the code read first.
  * The upload endpoint treats it the same way, for the same reason.
  *
- * `deadlineDate` is NOT required to be in the future here, unlike a project's.
- * The binding rule is that it falls after the PROJECT's deadline, checked in the
- * service — and applying a second, weaker rule on top would refuse a perfectly
- * ordinary task filed against a project that is already overdue.
+ * `deadlineDate` must be in the future, exactly as a project's is on create: a
+ * task due today or earlier is a typo rather than a plan. That is the LOWER
+ * bound and it needs no row, so it lives here. The UPPER bound — on or before
+ * the PROJECT's deadline — needs the project row and is checked in the service.
  */
 function validateTaskCreate(body = {}) {
   common.rejectUnknown(body, CREATE_FIELDS);
@@ -118,7 +119,7 @@ function validateTaskCreate(body = {}) {
         : common.parseId(body.companyId, 'companyId'),
     taskName: common.str(body.taskName, 'taskName', { max: LIMITS.taskName }),
     description: validateTaskDescription(body.description),
-    deadlineDate: validateDeadline(body.deadlineDate, 'deadlineDate'),
+    deadlineDate: validateDeadline(body.deadlineDate, 'deadlineDate', { mustBeFuture: true }),
     // A task may be opened straight into ACTIVE by someone who is starting it
     // now. Absent means TODO, which is the column's own default.
     status: body.status === undefined ? null : common.enumValue(body.status, 'status', TASK_STATUSES),

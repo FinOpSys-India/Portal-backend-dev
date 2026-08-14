@@ -71,6 +71,7 @@ function projectAccessDenied() {
 const isAdmin = (caller) => caller.role?.code === 'ADMIN';
 const isCustomer = (caller) => caller.role?.code === 'CUSTOMER';
 const isAccountingManager = (caller) => caller.role?.code === 'ACCOUNTING_MANAGER';
+const isSpecialist = (caller) => caller.role?.code === 'SPECIALIST';
 
 /** Load the caller with their role, or 401. */
 async function loadCaller(userId) {
@@ -475,6 +476,23 @@ async function syncSpecialists({ userId, requestId, companyId }) {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * The specialist narrowing, shared by every read that lists projects.
+ *
+ * A specialist's scope is FORCED, never merely defaulted — the filter they sent
+ * is replaced, not filled in. `?assignedSpecialistUserId=` is a convenience for
+ * the people who can see the whole table; letting a specialist set it would make
+ * the one filter on these endpoints the way around the rule it exists to
+ * enforce.
+ *
+ * One function rather than the same two lines in each caller: the day the table
+ * enforces this and the dropdown does not is the day the dropdown leaks the
+ * names of projects the table refuses to show.
+ */
+function scopeToOwnWork(caller, requested) {
+  return isSpecialist(caller) ? caller.id : requested;
+}
+
+/**
  * GET /projects/services?companyId=… — the "Service" dropdown for the new
  * project form, and nothing else.
  *
@@ -502,6 +520,49 @@ async function listServices({ userId, requestId, companyId }) {
 }
 
 /**
+ * GET /projects/options?companyId=… — the project dropdown: ids and names.
+ *
+ * The same scope rule as the table, applied to a two-column answer: whoever is
+ * on the company sees every project, a specialist sees the ones they hold. A
+ * picker that offered a project its owner could not then open would be an
+ * invitation to a 404.
+ *
+ * A separate endpoint rather than a `?fields=` on the table, because the two
+ * differ in more than which columns they carry: this one is unpaged, ordered by
+ * name, and joins nothing. An endpoint whose response shape changes with a query
+ * parameter is two endpoints wearing one name.
+ */
+async function listProjectOptions({ userId, requestId, query }) {
+  const { companyId, status } = query;
+
+  const caller = await loadCaller(userId);
+  const company = await loadCompany(prisma, companyId);
+  await assertReadAccess(prisma, caller, company);
+
+  const projects = await repo.listProjectOptions(prisma, {
+    companyId,
+    status,
+    assignedSpecialistUserId: scopeToOwnWork(caller, query.assignedSpecialistUserId),
+  });
+
+  logEvent({
+    event: 'project.options.read',
+    status: 'success',
+    requestId,
+    userId,
+    companyId,
+    projectCount: projects.length,
+  });
+
+  return {
+    companyId,
+    companyName: company.companyName,
+    projects: projects.map((project) => ({ id: project.id, projectName: project.projectName })),
+    total: projects.length,
+  };
+}
+
+/**
  * GET /projects?companyId=… — the projects table.
  *
  * One response carries the page, the total, and the company's service list,
@@ -509,13 +570,26 @@ async function listServices({ userId, requestId, companyId }) {
  * that must be ready the moment the page is. Splitting them would mean the
  * button opens a form with an empty dropdown for as long as a second request
  * takes.
+ *
+ * TWO DEGREES OF ATTACHMENT, and the scope follows which one the caller has:
+ *
+ *   on the COMPANY   the owner, a teammate, the accounting manager — every
+ *                    project on the account. The account is theirs; the whole
+ *                    table is the answer.
+ *   on the PROJECT   a specialist — only the projects they are assigned to.
+ *                    Being staffed on an account makes them party to their own
+ *                    work, not to the client's whole book of it: a bookkeeper
+ *                    covering one line has no business reading the tax project's
+ *                    name, deadline, or notes.
  */
 async function listProjects({ userId, requestId, query }) {
-  const { companyId, status, assignedSpecialistUserId, search, limit, offset, sort, order } = query;
+  const { companyId, status, search, limit, offset, sort, order } = query;
 
   const caller = await loadCaller(userId);
   const company = await loadCompany(prisma, companyId);
   await assertReadAccess(prisma, caller, company);
+
+  const assignedSpecialistUserId = scopeToOwnWork(caller, query.assignedSpecialistUserId);
 
   const [projects, total, services] = await Promise.all([
     repo.listProjects(prisma, { companyId, status, assignedSpecialistUserId, search, limit, offset, sort, order }),
@@ -544,6 +618,18 @@ async function getProject({ userId, requestId, projectId }) {
 
   const company = await loadCompany(prisma, project.companyId);
   await assertReadAccess(prisma, caller, company);
+
+  /*
+   * The same rule the list applies, applied again here — a specialist reads
+   * their OWN projects. Without this, the list's scope would be decoration: the
+   * project it declines to show is one id away, and hiding a row while serving
+   * it by id is not a rule, it is a hint.
+   *
+   * A 404 rather than a 403, matching a project that does not exist: from where
+   * this caller stands the two are the same, and a 403 would confirm which of
+   * the client's projects are real.
+   */
+  if (isSpecialist(caller) && project.assignedSpecialistUserId !== caller.id) throw projectNotFound();
 
   logEvent({ event: 'project.read', status: 'success', requestId, userId, companyId: company.id, projectId });
 
@@ -604,13 +690,13 @@ async function createProject({ userId, requestId, input }) {
 /**
  * The PROJECT side of the task deadline rule.
  *
- * A task must fall AFTER its project's deadline. `project_tasks` carries no
- * CHECK for that — the comparison crosses tables — so the rule is held in code,
- * and it has two sides: filing a task (projectTaskService) and moving the
+ * A task must fall ON OR BEFORE its project's deadline. `project_tasks` carries
+ * no CHECK for that — the comparison crosses tables — so the rule is held in
+ * code, and it has two sides: filing a task (projectTaskService) and moving the
  * project's deadline out from under tasks already filed, which is this one.
  *
- * Pushing a deadline LATER is the dangerous direction: every task on or before
- * the new date becomes a violation. This BLOCKS the edit rather than shifting
+ * Pulling a deadline EARLIER is the dangerous direction: every task after the
+ * new date becomes a violation. This BLOCKS the edit rather than shifting
  * the tasks, because there is no correct amount to shift them by — the caller is
  * told how many rows are in the way, and re-dating them is a deliberate second
  * action.
@@ -621,10 +707,10 @@ async function createProject({ userId, requestId, input }) {
  * reaching it directly is safe.
  */
 async function assertDeadlineLeavesTasksValid(client, { projectId, deadlineDate }) {
-  const offending = await taskRepo.countTasksNotAfter(client, { projectId, date: deadlineDate });
+  const offending = await taskRepo.countTasksAfter(client, { projectId, date: deadlineDate });
   if (!offending) return;
 
-  throw new ApiError(409, 'This project has tasks that would fall on or before the new deadline.', {
+  throw new ApiError(409, 'This project has tasks that would fall after the new deadline.', {
     code: 'PROJECT_DEADLINE_CONFLICTS_WITH_TASKS',
     fields: { deadlineDate: `Re-date the ${offending} affected task(s) first.` },
     details: { offendingTaskCount: offending },
@@ -718,6 +804,7 @@ async function backfillAfterStaffingChange(companyId, { requestId } = {}) {
 module.exports = {
   listServices,
   listProjects,
+  listProjectOptions,
   getProject,
   createProject,
   updateProject,

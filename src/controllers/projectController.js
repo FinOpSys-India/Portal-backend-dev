@@ -6,6 +6,7 @@ const {
   validateProjectCreate,
   validateProjectUpdate,
   validateProjectListQuery,
+  validateProjectOptionsQuery,
   validateCompanyQuery,
 } = require('../validators/projectValidator');
 const projectService = require('../services/projectService');
@@ -56,6 +57,29 @@ const listProjects = asyncHandler(async (req, res) => {
   const query = validateProjectListQuery(req.query);
 
   const data = await projectService.listProjects({
+    userId: req.user.id,
+    requestId: req.id,
+    query,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Projects retrieved.',
+    data,
+  });
+});
+
+/**
+ * GET /projects/options?companyId=42&status=
+ *
+ * The project dropdown: id and name only, unpaged, ordered by name. Same scope
+ * rule as the table — whoever is on the company sees every project, a specialist
+ * sees the ones they are assigned to.
+ */
+const listProjectOptions = asyncHandler(async (req, res) => {
+  const query = validateProjectOptionsQuery(req.query);
+
+  const data = await projectService.listProjectOptions({
     userId: req.user.id,
     requestId: req.id,
     query,
@@ -183,6 +207,7 @@ const syncSpecialists = asyncHandler(async (req, res) => {
 module.exports = {
   listServices,
   listProjects,
+  listProjectOptions,
   getProject,
   createProject,
   updateProject,

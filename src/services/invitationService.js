@@ -17,6 +17,24 @@ const companyRepo = require('../repositories/companyRepository');
  */
 const CUSTOMER_ROLE_CODE = 'CUSTOMER';
 const OWNER_SPECIFIC_ROLE_CODE = 'OWNER';
+const ACCOUNTING_MANAGER_ROLE_CODE = 'ACCOUNTING_MANAGER';
+
+/**
+ * The firm's own mail domain. An accounting manager is STAFF — they are given a
+ * company's books, its billing and its customer contact details — so the address
+ * that receives the invitation must be one the firm controls.
+ *
+ * Overridable by env so a staging or a white-label deployment is not pinned to
+ * this firm's domain, with the production value as the default rather than as a
+ * required variable: an unset env var must not silently turn the rule off.
+ *
+ * Deliberately NOT applied to specialists today. They are staff too and the same
+ * argument reaches them, but they are also the role most likely to be a
+ * contractor on their own domain, and quietly refusing those invitations would
+ * be a policy change nobody asked for. Adding SPECIALIST here is a one-line
+ * change when that call is made.
+ */
+const INTERNAL_EMAIL_DOMAIN = (process.env.INTERNAL_EMAIL_DOMAIN || 'finopsys.ai').toLowerCase();
 
 /**
  * Invitation lifecycle: create, list, revoke, resend.
@@ -166,6 +184,36 @@ async function resolveRolePair({ roleId, specificRoleId }) {
 }
 
 /**
+ * An ACCOUNTING_MANAGER invitation may only be sent to the firm's own domain.
+ *
+ * Checked HERE rather than in the validator because the rule is about the ROLE,
+ * and the validator sees only a `roleId` — a number whose meaning lives in the
+ * `roles` table. Deciding it from the resolved role code is what keeps the rule
+ * correct if the seed's ids ever differ between environments.
+ *
+ * An exact match on the domain, not a suffix test: `finopsys.ai.attacker.com`
+ * ends with the domain and is not it, and there are no legitimate subdomain
+ * addresses here to accommodate.
+ *
+ * A 400 rather than a 403 — nothing is forbidden to this caller, the address is
+ * simply wrong for the role they picked, and the invite form can say so on the
+ * field.
+ */
+function assertRoleAllowsEmailDomain(email, role) {
+  if (role.code !== ACCOUNTING_MANAGER_ROLE_CODE) return;
+
+  // The validator has already lowercased and shape-checked the address, so the
+  // part after the final '@' is the domain.
+  const domain = String(email).split('@').pop().toLowerCase();
+  if (domain === INTERNAL_EMAIL_DOMAIN) return;
+
+  throw new ApiError(400, `An accounting manager must be invited on an @${INTERNAL_EMAIL_DOMAIN} address.`, {
+    code: 'INTERNAL_EMAIL_REQUIRED',
+    fields: { email: `Use an @${INTERNAL_EMAIL_DOMAIN} address.` },
+  });
+}
+
+/**
  * A fresh invitation token plus its expiry.
  *
  * `rawToken` goes into the email and is never stored; `tokenHash` is what the
@@ -234,6 +282,7 @@ async function deliver({ invitation, inviter, token, requestId, fields = INVITAT
 async function createInvitation({ inviterUserId, requestId, input, fields = INVITATION_FIELDS }) {
   const inviter = await loadInviter(inviterUserId);
   const { role, specificRole } = await resolveRolePair(input);
+  assertRoleAllowsEmailDomain(input.email, role);
 
   const existingUser = await prisma.user.findFirst({
     where: { email: { equals: input.email, mode: 'insensitive' } },

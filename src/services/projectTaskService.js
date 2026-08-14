@@ -13,11 +13,11 @@ const { logEvent } = require('../utils/auditLog');
  * THE TWO RULES THIS FILE OWNS, and it owns them because the database was
  * deliberately not asked to:
  *
- *   1. A TASK IS DUE AFTER ITS PROJECT. `project_tasks` carries no CHECK for
- *      this — a CHECK sees only its own row and the comparison crosses tables —
- *      so it is enforced here, on BOTH sides. Filing or re-dating a task is the
- *      obvious side; moving the PROJECT's deadline later is the one that is easy
- *      to forget, and it is guarded by assertDeadlineLeavesTasksValid in
+ *   1. A TASK IS DUE ON OR BEFORE ITS PROJECT. `project_tasks` carries no CHECK
+ *      for this — a CHECK sees only its own row and the comparison crosses
+ *      tables — so it is enforced here, on BOTH sides. Filing or re-dating a task
+ *      is the obvious side; pulling the PROJECT's deadline earlier is the one
+ *      that is easy to forget, and it is guarded by assertDeadlineLeavesTasksValid in
  *      projectService — which lives there rather than here only because a
  *      require in that direction would close a cycle. Guarding only the first
  *      side would leave the table able to hold rows that violate its own rule.
@@ -112,24 +112,28 @@ function assertTaskWriteAccess(caller, company, project) {
 }
 
 /**
- * Rule 1, on the task side: strictly after the project's own deadline.
+ * Rule 1, on the task side: on or before the project's own deadline.
  *
- * Equal dates are refused. A task due the same day the project is due has no
- * room to be a step toward it, and "after" was chosen over "on or after"
- * deliberately.
+ * The project's deadline is the outer bound, and a task is a step toward meeting
+ * it — so work cannot be scheduled to land after the thing it is a step toward.
+ * Equal dates ARE allowed: the last step of a piece of work legitimately falls
+ * on the day it is due.
+ *
+ * The lower bound — must be after today — is the validator's, since it needs no
+ * row to check.
  *
  * The error names the project's date as well as the task's, because the caller's
  * next move is to pick a valid one and a message that does not say the bound
  * makes them guess.
  */
-function assertDeadlineAfterProject(taskDeadline, projectDeadline) {
+function assertDeadlineWithinProject(taskDeadline, projectDeadline) {
   if (!projectDeadline || !taskDeadline) return;
-  if (taskDeadline.getTime() > projectDeadline.getTime()) return;
+  if (taskDeadline.getTime() <= projectDeadline.getTime()) return;
 
   const asDay = (d) => d.toISOString().slice(0, 10);
-  throw new ApiError(400, 'A task deadline must fall after its project deadline.', {
-    code: 'TASK_DEADLINE_BEFORE_PROJECT',
-    fields: { deadlineDate: `Choose a date after ${asDay(projectDeadline)}.` },
+  throw new ApiError(400, 'A task deadline cannot fall after its project deadline.', {
+    code: 'TASK_DEADLINE_AFTER_PROJECT',
+    fields: { deadlineDate: `Choose a date on or before ${asDay(projectDeadline)}.` },
     details: { projectDeadlineDate: asDay(projectDeadline), taskDeadlineDate: asDay(taskDeadline) },
   });
 }
@@ -270,7 +274,7 @@ async function createTask({ userId, requestId, input }) {
 
     assertCompanyMatches(input.companyId, project);
     assertTaskWriteAccess(caller, company, project);
-    assertDeadlineAfterProject(input.deadlineDate, project.deadlineDate);
+    assertDeadlineWithinProject(input.deadlineDate, project.deadlineDate);
 
     return repo.createTask(tx, {
       projectId: project.id,
@@ -347,6 +351,6 @@ module.exports = {
   createTask,
   updateTaskStatus,
   // Exported for tests and for any future caller that needs the same rule.
-  assertDeadlineAfterProject,
+  assertDeadlineWithinProject,
   assertTaskWriteAccess,
 };

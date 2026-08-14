@@ -8,9 +8,9 @@
  * request did not say, and — more than in any other suite here — the ones
  * covering the two rules the DATABASE was deliberately not asked to hold:
  *
- *   1. A task falls AFTER its project's deadline. There is no CHECK for it (the
- *      comparison crosses tables), so if these tests do not hold the line,
- *      nothing does.
+ *   1. A task falls after today and ON OR BEFORE its project's deadline. There
+ *      is no CHECK for the second half (the comparison crosses tables), so if
+ *      these tests do not hold the line, nothing does.
  *
  *   2. Only the project's assigned specialist may file or move a task. The
  *      composite foreign key that would have pinned a task's specialist to its
@@ -58,10 +58,11 @@ const OTHER_COMPANY_ID = 901;
 const PROJECT_ID = 300;
 const TASK_ID = 700;
 
-// The project is due 2026-12-31, so every valid task deadline below is in 2027.
-// That relationship is the subject of half this file — keep the two in view.
+// The project is due 2026-12-31, so every valid task deadline below sits after
+// today and on or before that day. That relationship is the subject of half this
+// file — keep the two in view.
 const PROJECT_DEADLINE = '2026-12-31';
-const VALID_TASK_DEADLINE = '2027-01-15';
+const VALID_TASK_DEADLINE = '2026-11-15';
 
 function auth({ userId = OWNER_ID, role = 'CUSTOMER', specificRole = 'OWNER' } = {}) {
   return `Bearer ${signAccessToken({ userId, email: 'u@finopsys.ai', role, specificRole })}`;
@@ -240,7 +241,7 @@ describe('GET /tasks', () => {
     // serialising it as an ISO string is how a deadline renders as the day
     // before to anyone west of UTC.
     expect(task.deadlineDate).toBe(VALID_TASK_DEADLINE);
-    // The project's own deadline rides along so a date picker knows its lower
+    // The project's own deadline rides along so a date picker knows its upper
     // bound without a second request.
     expect(task.project.deadlineDate).toBe(PROJECT_DEADLINE);
     expect(task.specialist).toMatchObject({ id: BOOKKEEPER_ID, specificRole: 'SPECIALIST_3' });
@@ -414,53 +415,67 @@ describe('POST /tasks', () => {
     );
   });
 
-  /* ---- rule 1: the deadline falls after the project's ---- */
+  /* ---- rule 1: after today, on or before the project's deadline ---- */
 
-  it('refuses a deadline BEFORE the project’s (400)', async () => {
+  it('refuses a deadline AFTER the project’s (400)', async () => {
     const res = await request(app)
       .post('/api/tasks')
       .set('Authorization', specialistAuth())
-      .send(body({ deadlineDate: '2026-11-01' }));
+      .send(body({ deadlineDate: '2027-09-30' }));
 
     expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('TASK_DEADLINE_BEFORE_PROJECT');
+    expect(res.body.error.code).toBe('TASK_DEADLINE_AFTER_PROJECT');
     // The bound is named, so the caller does not have to guess a valid date.
     expect(res.body.error.details.projectDeadlineDate).toBe(PROJECT_DEADLINE);
     expect(mockPrisma.projectTask.create).not.toHaveBeenCalled();
   });
 
-  it('refuses a deadline EQUAL to the project’s — "after" is strict (400)', async () => {
+  it('accepts a deadline EQUAL to the project’s — the last step lands on the day (201)', async () => {
     const res = await request(app)
       .post('/api/tasks')
       .set('Authorization', specialistAuth())
       .send(body({ deadlineDate: PROJECT_DEADLINE }));
 
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('TASK_DEADLINE_BEFORE_PROJECT');
-  });
-
-  it('accepts the very next day (201)', async () => {
-    const res = await request(app)
-      .post('/api/tasks')
-      .set('Authorization', specialistAuth())
-      .send(body({ deadlineDate: '2027-01-01' }));
-
     expect(res.status).toBe(201);
   });
 
-  it('does NOT require the deadline to be in the future — an overdue project still takes tasks (201)', async () => {
-    mockPrisma.project.findFirst.mockResolvedValue(
-      projectAccessRow({ deadlineDate: new Date('2020-01-01T00:00:00.000Z') })
-    );
-
+  it('refuses a deadline in the PAST (400)', async () => {
     const res = await request(app)
       .post('/api/tasks')
       .set('Authorization', specialistAuth())
       .send(body({ deadlineDate: '2020-06-01' }));
 
-    // The binding rule is "after the project", not "after today". Applying both
-    // would refuse ordinary work filed against an overdue project.
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(400);
+    expect(res.body.error.fields.deadlineDate).toBe('Choose a date after today.');
+    expect(mockPrisma.projectTask.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses TODAY — a task already due is a typo, not a plan (400)', async () => {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const res = await request(app)
+      .post('/api/tasks')
+      .set('Authorization', specialistAuth())
+      .send(body({ deadlineDate: today }));
+
+    expect(res.status).toBe(400);
+    expect(mockPrisma.projectTask.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses any task on an OVERDUE project — no valid date is left (400)', async () => {
+    mockPrisma.project.findFirst.mockResolvedValue(
+      projectAccessRow({ deadlineDate: new Date('2020-01-01T00:00:00.000Z') })
+    );
+
+    // The two bounds cross once a project is past due: after today, and on or
+    // before a date that has already gone. Re-date the project first.
+    const res = await request(app)
+      .post('/api/tasks')
+      .set('Authorization', specialistAuth())
+      .send(body({ deadlineDate: VALID_TASK_DEADLINE }));
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('TASK_DEADLINE_AFTER_PROJECT');
   });
 
   /* ---- rule 2: only the project's specialist ---- */

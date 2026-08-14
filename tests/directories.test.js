@@ -17,6 +17,9 @@ const mockPrisma = {
   user: { findUnique: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   company: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   companySpecialistAssignment: { findFirst: jest.fn(), findMany: jest.fn() },
+  // The specialist profile carries that person's whole task table on the named
+  // company.
+  projectTask: { findMany: jest.fn() },
   $transaction: jest.fn(async (cb) => cb(mockPrisma)),
 };
 
@@ -100,6 +103,8 @@ beforeEach(() => {
   mockPrisma.company.findFirst.mockResolvedValue(company());
   mockPrisma.companySpecialistAssignment.findMany.mockResolvedValue([]);
   mockPrisma.companySpecialistAssignment.findFirst.mockResolvedValue(null);
+  mockPrisma.user.findFirst.mockResolvedValue(null);
+  mockPrisma.projectTask.findMany.mockResolvedValue([]);
   stageCallers();
 });
 
@@ -290,6 +295,29 @@ describe('GET /specialists', () => {
     expect(mockPrisma.user.findMany).not.toHaveBeenCalled();
   });
 
+  it('refuses the company filter from an admin', async () => {
+    // The admin roll is the whole roll. A filter on an admin token is the
+    // frontend sending the manager's query, not a narrower question.
+    const res = await request(app)
+      .get(`/api/specialists?companyId=${COMPANY_ID}`)
+      .set('Authorization', adminAuth());
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('COMPANY_FILTER_NOT_SUPPORTED');
+    expect(mockPrisma.user.findMany).not.toHaveBeenCalled();
+  });
+
+  it('refuses an owner of the very company being asked about', async () => {
+    // Reading the company is deliberately NOT enough — staffing is the
+    // manager's view. The owner's team screen is GET /companies/:id/team.
+    const res = await request(app)
+      .get(`/api/specialists?companyId=${COMPANY_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(403);
+    expect(mockPrisma.user.findMany).not.toHaveBeenCalled();
+  });
+
   it('scopes a manager to the named company', async () => {
     stageSpecialists({ users: [bookkeeper()], assignments: [assignment()], scopeIds: [SPECIALIST_ID] });
 
@@ -401,6 +429,190 @@ describe('GET /specialists', () => {
     const res = await request(app).get('/api/specialists');
 
     expect(res.status).toBe(401);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* GET /specialists/:userId                                                   */
+/* -------------------------------------------------------------------------- */
+
+describe('GET /specialists/:userId', () => {
+  const profile = (overrides = {}) => ({
+    ...person(SPECIALIST_ID, 'Bea', 'Books', 'SPECIALIST', {
+      specificRole: 'SPECIALIST_3',
+      specificRoleName: 'Bookkeeping Specialist',
+    }),
+    phone: '+1 555 0100',
+    avatarKey: null,
+    createdAt: new Date('2026-01-04T00:00:00Z'),
+    address: {
+      id: 7,
+      line1: '900 Biscayne Blvd',
+      line2: 'Suite 400',
+      city: 'Miami',
+      state: 'FL',
+      postalCode: '33132',
+      country: 'United States',
+      countryCode: 'US',
+    },
+    ...overrides,
+  });
+
+  /**
+   * `user.findFirst` is the profile lookup and `user.findUnique` is the caller,
+   * so the two must not be staged with one mock — a test that returns the
+   * profile for both would authorise the request as the specialist themselves.
+   */
+  const task = (id, taskName, status) => ({
+    id,
+    projectId: 5,
+    taskName,
+    description: null,
+    status,
+    deadlineDate: new Date('2026-09-30T00:00:00Z'),
+    specialistUserId: SPECIALIST_ID,
+    createdByUserId: MANAGER_ID,
+    createdAt: new Date('2026-08-01T00:00:00Z'),
+    updatedAt: new Date('2026-08-01T00:00:00Z'),
+    project: {
+      id: 5,
+      companyId: COMPANY_ID,
+      projectName: 'Q3 Close',
+      status: 'ACTIVE',
+      deadlineDate: new Date('2026-10-31T00:00:00Z'),
+      company: { id: COMPANY_ID, companyName: 'BlueHorizon Executive Aviation LLC' },
+    },
+    specialist: null,
+    createdBy: null,
+  });
+
+  function stageProfile({ specialist = profile(), attached = true, tasks = [] } = {}) {
+    mockPrisma.user.findFirst.mockResolvedValue(specialist);
+    mockPrisma.companySpecialistAssignment.findMany.mockImplementation(({ distinct }) =>
+      Promise.resolve(
+        distinct
+          ? (attached ? [{ specialistUserId: SPECIALIST_ID }] : [])
+          : [
+              {
+                specialistUserId: SPECIALIST_ID,
+                company: { id: COMPANY_ID, companyName: 'BlueHorizon Executive Aviation LLC', status: 'ACTIVE' },
+                specialization: { specializationCode: 'BOOKKEEPING', specializationName: 'Bookkeeping' },
+              },
+            ]
+      )
+    );
+    mockPrisma.projectTask.findMany.mockResolvedValue(tasks);
+  }
+
+  it('gives a manager the profile, the address and the whole task table', async () => {
+    stageProfile({ tasks: [task(1, 'Reconcile bank', 'TODO'), task(2, 'Post journals', 'ACTIVE')] });
+
+    const res = await request(app)
+      .get(`/api/specialists/${SPECIALIST_ID}?companyId=${COMPANY_ID}`)
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.specialist).toMatchObject({
+      userId: SPECIALIST_ID,
+      fullName: 'Bea Books',
+      phone: '+1 555 0100',
+      serviceSpeciality: 'Bookkeeping Specialist',
+      taskCount: 2,
+    });
+    expect(res.body.data.specialist.address).toMatchObject({ city: 'Miami', postalCode: '33132' });
+    // Four columns and nothing else: the profile has already said whose work
+    // this is and which account it is on, so assignee, creator, project and the
+    // audit timestamps would only repeat the page back to itself.
+    expect(res.body.data.specialist.tasks[0]).toEqual({
+      id: 1,
+      taskName: 'Reconcile bank',
+      description: null,
+      status: 'TODO',
+      // A DATE column must leave as YYYY-MM-DD, never as an ISO timestamp.
+      deadlineDate: '2026-09-30',
+    });
+
+    // The profile shows the PERSON: the company block belongs to the company
+    // screens, and duplicating it here would be a second copy to keep in step.
+    expect(res.body.data.specialist.companies).toBeUndefined();
+    expect(res.body.data.specialist.companyCount).toBeUndefined();
+
+    // The tasks are THIS specialist's on THIS company, not the whole board.
+    expect(mockPrisma.projectTask.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          specialistUserId: SPECIALIST_ID,
+          project: expect.objectContaining({ companyId: COMPANY_ID }),
+        }),
+      })
+    );
+  });
+
+  it('404s a specialist who does not work the manager\'s company', async () => {
+    stageProfile({ attached: false });
+
+    const res = await request(app)
+      .get(`/api/specialists/${SPECIALIST_ID}?companyId=${COMPANY_ID}`)
+      .set('Authorization', managerAuth());
+
+    // A 404 rather than a 403: a 403 would confirm the id is a real specialist.
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('SPECIALIST_NOT_FOUND');
+  });
+
+  it('404s a user who is not a specialist at all', async () => {
+    mockPrisma.user.findFirst.mockResolvedValue(null);
+
+    const res = await request(app)
+      .get(`/api/specialists/${OWNER_ID}?companyId=${COMPANY_ID}`)
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(404);
+  });
+
+  it('gives an admin the unscoped profile, with no tasks', async () => {
+    stageProfile();
+
+    const res = await request(app).get(`/api/specialists/${SPECIALIST_ID}`).set('Authorization', adminAuth());
+
+    expect(res.status).toBe(200);
+    // Null rather than empty, and the difference is the point: empty would claim
+    // the specialist has no work, when the admin view names no company for the
+    // work to belong to. The task endpoints refuse an admin outright.
+    expect(res.body.data.specialist.tasks).toBeNull();
+    expect(res.body.data.specialist.taskCount).toBeNull();
+    expect(mockPrisma.projectTask.findMany).not.toHaveBeenCalled();
+  });
+
+  it('applies the same scope rules as the list', async () => {
+    stageProfile();
+
+    const [managerNoFilter, adminFiltered, owner] = await Promise.all([
+      request(app).get(`/api/specialists/${SPECIALIST_ID}`).set('Authorization', managerAuth()),
+      request(app)
+        .get(`/api/specialists/${SPECIALIST_ID}?companyId=${COMPANY_ID}`)
+        .set('Authorization', adminAuth()),
+      request(app)
+        .get(`/api/specialists/${SPECIALIST_ID}?companyId=${COMPANY_ID}`)
+        .set('Authorization', ownerAuth()),
+    ]);
+
+    expect(managerNoFilter.status).toBe(400);
+    expect(managerNoFilter.body.error.code).toBe('COMPANY_ID_REQUIRED');
+    expect(adminFiltered.status).toBe(400);
+    expect(adminFiltered.body.error.code).toBe('COMPANY_FILTER_NOT_SUPPORTED');
+    expect(owner.status).toBe(403);
+  });
+
+  it('rejects a malformed id and an unknown query parameter', async () => {
+    const [badId, badQuery] = await Promise.all([
+      request(app).get('/api/specialists/abc').set('Authorization', adminAuth()),
+      request(app).get(`/api/specialists/${SPECIALIST_ID}?limit=5`).set('Authorization', adminAuth()),
+    ]);
+
+    expect(badId.status).toBe(400);
+    expect(badQuery.status).toBe(400);
+    expect(mockPrisma.user.findFirst).not.toHaveBeenCalled();
   });
 });
 

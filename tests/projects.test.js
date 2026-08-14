@@ -24,7 +24,7 @@ const mockPrisma = {
     update: jest.fn(),
   },
   // Re-staffing a project carries its open tasks to the new specialist, and the
-  // project deadline can only move if no live task would fall on or before it —
+  // project deadline can only move if no live task would fall after it —
   // both reach projectTask from the project paths.
   projectTask: { updateMany: jest.fn(), count: jest.fn() },
   $transaction: jest.fn(async (cb) => cb(mockPrisma)),
@@ -417,6 +417,56 @@ describe('GET /projects', () => {
     expect(res.status).toBe(200);
   });
 
+  /*
+   * The two degrees of attachment this endpoint distinguishes. Being staffed on
+   * an ACCOUNT is not being party to the client's whole book of work — a
+   * bookkeeper covering one line has no business reading the tax project.
+   */
+  it('narrows a specialist to the projects they are assigned to (200)', async () => {
+    mockPrisma.company.findFirst.mockResolvedValue(company({ bookkeepingSpecialistUserId: BOOKKEEPER_ID }));
+    mockPrisma.project.findMany.mockResolvedValue([]);
+    mockPrisma.project.count.mockResolvedValue(0);
+
+    const res = await request(app)
+      .get(`/api/projects?company_id=${COMPANY_ID}`)
+      .set('Authorization', auth({ userId: BOOKKEEPER_ID, role: 'SPECIALIST', specificRole: 'SPECIALIST_3' }));
+
+    expect(res.status).toBe(200);
+    expect(mockPrisma.project.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ assignedSpecialistUserId: BOOKKEEPER_ID }),
+      })
+    );
+  });
+
+  it('ignores a specialist\'s own assignedSpecialistUserId filter (200)', async () => {
+    mockPrisma.company.findFirst.mockResolvedValue(company({ bookkeepingSpecialistUserId: BOOKKEEPER_ID }));
+    mockPrisma.project.findMany.mockResolvedValue([]);
+    mockPrisma.project.count.mockResolvedValue(0);
+
+    // Forced, not defaulted: the one filter on this endpoint must not become the
+    // way around the rule above.
+    await request(app)
+      .get(`/api/projects?company_id=${COMPANY_ID}&assigned_specialist_user_id=${TAX_SPECIALIST_ID}`)
+      .set('Authorization', auth({ userId: BOOKKEEPER_ID, role: 'SPECIALIST', specificRole: 'SPECIALIST_3' }));
+
+    expect(mockPrisma.project.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ assignedSpecialistUserId: BOOKKEEPER_ID }),
+      })
+    );
+  });
+
+  it('leaves the whole table to someone on the company (200)', async () => {
+    mockPrisma.project.findMany.mockResolvedValue([]);
+    mockPrisma.project.count.mockResolvedValue(0);
+
+    await request(app).get(`/api/projects?company_id=${COMPANY_ID}`).set('Authorization', ownerAuth());
+
+    const [call] = mockPrisma.project.findMany.mock.calls;
+    expect(call[0].where.assignedSpecialistUserId).toBeUndefined();
+  });
+
   it('returns the stored progress, decimals and all (200)', async () => {
     mockPrisma.project.findMany.mockResolvedValue([
       projectRow({ status: 'ACTIVE', progressBar: '42.50' }),
@@ -447,6 +497,123 @@ describe('GET /projects', () => {
     expect(res.body.data.projects[0]).toEqual(
       expect.objectContaining({ status: 'COMPLETED', progressBar: 0 })
     );
+  });
+});
+
+/* -------------------------------- the picker ------------------------------ */
+
+describe('GET /projects/options', () => {
+  it('returns ids and names only, ordered by name (200)', async () => {
+    mockPrisma.project.findMany.mockResolvedValue([
+      { id: 5, projectName: 'Annual Accounts' },
+      { id: 9, projectName: 'Q4 Books Close' },
+    ]);
+
+    const res = await request(app)
+      .get(`/api/projects/options?company_id=${COMPANY_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    // Two columns and nothing else — a picker that paid for the table's joins
+    // would be four joins to render a list of names.
+    expect(res.body.data.projects).toEqual([
+      { id: 5, projectName: 'Annual Accounts' },
+      { id: 9, projectName: 'Q4 Books Close' },
+    ]);
+    expect(res.body.data.total).toBe(2);
+    expect(mockPrisma.project.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        select: { id: true, projectName: true },
+        orderBy: [{ projectName: 'asc' }, { id: 'desc' }],
+      })
+    );
+  });
+
+  /*
+   * The dropdown must not offer what the table refuses to show — a picker
+   * listing a project its owner cannot then open is an invitation to a 404.
+   */
+  it('narrows a specialist to their own projects (200)', async () => {
+    mockPrisma.company.findFirst.mockResolvedValue(company({ bookkeepingSpecialistUserId: BOOKKEEPER_ID }));
+    mockPrisma.project.findMany.mockResolvedValue([]);
+
+    await request(app)
+      .get(`/api/projects/options?company_id=${COMPANY_ID}`)
+      .set('Authorization', auth({ userId: BOOKKEEPER_ID, role: 'SPECIALIST', specificRole: 'SPECIALIST_3' }));
+
+    expect(mockPrisma.project.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ assignedSpecialistUserId: BOOKKEEPER_ID }),
+      })
+    );
+  });
+
+  it('requires companyId and rejects paging parameters', async () => {
+    const [noCompany, paged] = await Promise.all([
+      request(app).get('/api/projects/options').set('Authorization', ownerAuth()),
+      request(app)
+        .get(`/api/projects/options?company_id=${COMPANY_ID}&limit=10`)
+        .set('Authorization', ownerAuth()),
+    ]);
+
+    expect(noCompany.status).toBe(400);
+    // A dropdown that pages is a dropdown missing options.
+    expect(paged.status).toBe(400);
+  });
+});
+
+/* --------------------------------- detail --------------------------------- */
+
+describe('GET /projects/:projectId', () => {
+  const specialistAuth = (userId) =>
+    auth({ userId, role: 'SPECIALIST', specificRole: 'SPECIALIST_3' });
+
+  beforeEach(() => {
+    // The tax specialist is not in the default cast, and the callers these tests
+    // authenticate as must resolve or every one of them 401s before the rule
+    // under test is reached.
+    stageUsers({
+      [OWNER_ID]: person(OWNER_ID, 'John', 'Smith', 'CUSTOMER', 'OWNER'),
+      [BOOKKEEPER_ID]: person(BOOKKEEPER_ID, 'Ada', 'Hopper', 'SPECIALIST', 'SPECIALIST_3'),
+      [TAX_SPECIALIST_ID]: person(TAX_SPECIALIST_ID, 'Tara', 'Ex', 'SPECIALIST', 'SPECIALIST_2'),
+    });
+    mockPrisma.company.findFirst.mockResolvedValue(company({ bookkeepingSpecialistUserId: BOOKKEEPER_ID }));
+    mockPrisma.project.findFirst.mockResolvedValue(projectRow());
+  });
+
+  it('lets the assigned specialist open their own project (200)', async () => {
+    const res = await request(app)
+      .get(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', specialistAuth(BOOKKEEPER_ID));
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.projectName).toBe('Q4 Books Close');
+  });
+
+  /*
+   * Without this the list's scope would be decoration: the project it declines
+   * to show is one id away, and hiding a row while serving it by id is a hint,
+   * not a rule.
+   */
+  it('404s a project the specialist is not assigned to', async () => {
+    mockPrisma.company.findFirst.mockResolvedValue(
+      company({ bookkeepingSpecialistUserId: BOOKKEEPER_ID, taxSpecialistUserId: TAX_SPECIALIST_ID })
+    );
+
+    const res = await request(app)
+      .get(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', specialistAuth(TAX_SPECIALIST_ID));
+
+    // 404 and not 403: a 403 would confirm which of the client's projects exist.
+    expect(res.status).toBe(404);
+  });
+
+  it('leaves any project on the account open to its owner (200)', async () => {
+    const res = await request(app)
+      .get(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
   });
 });
 
@@ -784,12 +951,12 @@ describe('PATCH /projects/:projectId', () => {
   });
 
   /*
-   * The project side of the rule that a task falls AFTER its project. The
-   * database holds no CHECK for it — the comparison crosses tables — so moving a
-   * project's deadline LATER has to be refused here, or tasks already filed
+   * The project side of the rule that a task falls ON OR BEFORE its project. The
+   * database holds no CHECK for it — the comparison crosses tables — so pulling a
+   * project's deadline EARLIER has to be refused here, or tasks already filed
    * silently become violations.
    */
-  it('refuses a deadline move that would leave tasks on or before it (409)', async () => {
+  it('refuses a deadline move that would leave tasks after it (409)', async () => {
     mockPrisma.projectTask.count.mockResolvedValue(3);
 
     const res = await request(app)
@@ -804,7 +971,7 @@ describe('PATCH /projects/:projectId', () => {
     expect(mockPrisma.project.update).not.toHaveBeenCalled();
   });
 
-  it('allows the deadline move when every task still falls after it (200)', async () => {
+  it('allows the deadline move when every task still falls on or before it (200)', async () => {
     mockPrisma.projectTask.count.mockResolvedValue(0);
     mockPrisma.project.update.mockResolvedValue(projectRow({ deadlineDate: new Date('2030-06-30') }));
 
@@ -815,7 +982,7 @@ describe('PATCH /projects/:projectId', () => {
 
     expect(res.status).toBe(200);
     expect(mockPrisma.projectTask.count).toHaveBeenCalledWith({
-      where: { projectId: PROJECT_ID, deletedAt: null, deadlineDate: { lte: new Date('2030-06-30') } },
+      where: { projectId: PROJECT_ID, deletedAt: null, deadlineDate: { gt: new Date('2030-06-30') } },
     });
   });
 

@@ -226,16 +226,16 @@ function findTaskForAccess(client, taskId) {
 }
 
 /**
- * Live tasks on a project that fall on or before a candidate date.
+ * Live tasks on a project that fall after a candidate date.
  *
- * Read by the project-update path: a task must be due AFTER its project, so
- * moving a project's deadline later can invalidate tasks already filed. Counting
- * them is what lets that edit be refused with a number the user can act on
- * rather than silently breaking the rule.
+ * Read by the project-update path: a task must be due ON OR BEFORE its project,
+ * so pulling a project's deadline earlier can invalidate tasks already filed.
+ * Counting them is what lets that edit be refused with a number the user can act
+ * on rather than silently breaking the rule.
  */
-function countTasksNotAfter(client, { projectId, date }) {
+function countTasksAfter(client, { projectId, date }) {
   return client.projectTask.count({
-    where: { projectId, deletedAt: null, deadlineDate: { lte: date } },
+    where: { projectId, deletedAt: null, deadlineDate: { gt: date } },
   });
 }
 
@@ -311,7 +311,7 @@ module.exports = {
   summarizeCompanyTasks,
   findTaskDetail,
   findTaskForAccess,
-  countTasksNotAfter,
+  countTasksAfter,
   createTask,
   updateTask,
   reassignOpenTaskSpecialist,

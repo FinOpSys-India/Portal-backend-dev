@@ -271,6 +271,32 @@ function validateProjectUpdate(body = {}) {
 }
 
 /** GET /projects?companyId=…  and  GET /projects/services?companyId=… */
+/**
+ * `?companyId=&status=&assignedSpecialistUserId=` for GET /projects/options.
+ *
+ * No paging, no search, no sort — a dropdown that pages is a dropdown missing
+ * options, and a parameter the endpoint would ignore is worse than one it
+ * rejects, because the client that sent it believes it did something.
+ */
+function validateProjectOptionsQuery(query = {}) {
+  common.rejectUnknown(query, ['companyId', 'status', 'assignedSpecialistUserId'], 'query string');
+
+  if (query.companyId === undefined || query.companyId === null || query.companyId === '') {
+    throw new ApiError(400, 'companyId is required.', {
+      code: 'VALIDATION_ERROR',
+      fields: { companyId: 'Select a company.' },
+    });
+  }
+
+  return {
+    companyId: common.parseId(query.companyId, 'companyId'),
+    status: query.status ? common.enumValue(query.status, 'status', PROJECT_STATUSES) : null,
+    assignedSpecialistUserId: query.assignedSpecialistUserId
+      ? common.parseId(query.assignedSpecialistUserId, 'assignedSpecialistUserId')
+      : null,
+  };
+}
+
 function validateProjectListQuery(query = {}) {
   const allowed = ['companyId', 'status', 'search', 'assignedSpecialistUserId', 'limit', 'offset', 'sort', 'order'];
   common.rejectUnknown(query, allowed, 'query string');
@@ -395,5 +421,6 @@ module.exports = {
   validateProjectCreate,
   validateProjectUpdate,
   validateProjectListQuery,
+  validateProjectOptionsQuery,
   validateCompanyQuery,
 };

@@ -63,6 +63,34 @@ function toTask(task) {
 }
 
 /**
+ * One task as it appears on a SPECIALIST'S PROFILE: what the work is, where it
+ * stands, and when it is due.
+ *
+ * Deliberately narrower than `toTask`. The profile has already answered "whose
+ * work is this?" — every row belongs to the specialist named at the top of the
+ * page — so the assignee, the creator and the audit timestamps would repeat what
+ * the screen already says. The company is fixed too, being the one the caller
+ * filtered by.
+ *
+ * A separate shape rather than a `fields=` parameter on `toTask`: two callers
+ * wanting two shapes is two functions, and an endpoint whose response shape
+ * changes with a query parameter is two endpoints wearing one name. The full row
+ * — project, assignee, provenance — is a request away at GET /tasks.
+ */
+function toProfileTask(task) {
+  return {
+    id: task.id,
+    taskName: task.taskName,
+    description: task.description,
+    status: task.status,
+    // A DATE column must leave as "YYYY-MM-DD" and never as an ISO timestamp, or
+    // every consumer runs it through `new Date()` and renders the day before to
+    // anyone west of UTC.
+    deadlineDate: toDateOnly(task.deadlineDate),
+  };
+}
+
+/**
  * The per-status counters above a task table.
  *
  * Every status is present with an explicit zero rather than only the ones that
@@ -88,6 +116,7 @@ function toTaskList({ tasks, statusCounts, total, limit, offset }) {
 
 module.exports = {
   toTask,
+  toProfileTask,
   toStatusCounts,
   toTaskList,
 };

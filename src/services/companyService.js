@@ -7,7 +7,13 @@ const ApiError = require('../utils/ApiError');
 const { logEvent } = require('../utils/auditLog');
 const catalog = require('../config/serviceCatalog');
 const repo = require('../repositories/companyRepository');
+// The specialist profile carries that person's task table, so it reads the tasks
+// directly rather than through projectTaskService — that service's entry points
+// apply the TASK access rule, and this endpoint has already applied the stricter
+// staffing one.
+const taskRepo = require('../repositories/projectTaskRepository');
 const dto = require('../dto/companyDto');
+const taskDto = require('../dto/projectTaskDto');
 const adminEvents = require('./adminEventService');
 // One-way dependency: projectService reaches for repositories, never for this
 // file, so requiring it here cannot close a cycle.
@@ -41,19 +47,6 @@ function hasOwnerRole(user) {
 }
 function hasAccountingManagerRole(user) {
   return user?.role?.code === repo.ACCOUNTING_MANAGER_ROLE_CODE;
-}
-/**
- * The complete definition of "may be assigned as this company's accounting
- * manager": the user exists, is ACTIVE, and holds the role today.
- *
- * Written once and used by BOTH paths that attach a manager — the admin
- * assignment and company-creation inheritance — because the second one would
- * otherwise be a way to route around the first. A manager who was deactivated
- * after being attached to an older company must not ride into a new company on
- * the back of that old assignment.
- */
-function isEligibleAccountingManager(user) {
-  return Boolean(user) && user.status === 'ACTIVE' && hasAccountingManagerRole(user);
 }
 function hasSpecialistRole(user) {
   return user?.role?.code === 'SPECIALIST';
@@ -274,45 +267,6 @@ function isCompanyEmailConflict(err) {
     .includes('company_email');
 }
 
-/* ------------------------ accounting-manager inheritance ------------------ */
-
-/**
- * The accounting manager a NEW company should start with, or null.
- *
- * The rule: a person who already has us doing their books keeps the same
- * accounting manager when they open another business. Without it, every company
- * after the first lands unassigned and an admin has to notice and re-attach the
- * manager the customer already deals with — which is exactly the kind of manual
- * step that quietly does not happen.
- *
- * WHICH manager, when the creator's existing companies disagree: the one on
- * their OLDEST live company. Deterministic and stable — "newest" would change
- * the answer every time another company is created. There is no default-manager
- * column on the creator to consult instead: this application has never had one
- * (the `customers` table was dropped in db/schema/13, and a company is owned
- * directly by a user), and adding a column to store a value that is already
- * derivable from the companies themselves would create a second copy of the
- * truth that can drift from the first. The derivation IS the default.
- *
- * Runs on the transaction client, so the manager it reports eligible is
- * eligible in the same snapshot the company is written in.
- *
- * @param {object} tx           Prisma transaction client.
- * @param {number} ownerUserId  The creator.
- * @returns {Promise<{ manager: object, sourceCompanyId: number }|null>}
- */
-async function resolveInheritedAccountingManager(tx, ownerUserId) {
-  const source = await repo.findInheritableManagerSource(tx, ownerUserId);
-  if (!source) return null;
-
-  // The query filters on eligibility already; this re-asserts it on the values
-  // actually returned, so the rule holds even if that filter is ever loosened.
-  const manager = source.accountingManager;
-  if (!isEligibleAccountingManager(manager)) return null;
-
-  return { manager, sourceCompanyId: source.id };
-}
-
 /* --------------------------- company onboarding -------------------------- */
 
 /**
@@ -436,15 +390,6 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
       });
       logEvent({ event: 'company.address.created', status: 'success', requestId, userId });
 
-      /*
-       * Inheritance, resolved INSIDE the transaction and before the insert, so
-       * the new company is created already carrying the manager rather than
-       * created and then amended. Two consequences worth stating: a rollback
-       * takes the assignment with it, and there is never an instant in which the
-       * company exists unassigned.
-       */
-      const inherited = await resolveInheritedAccountingManager(tx, userId);
-
       // Step 6 + 7: create the company owned by the authenticated user.
       const created = await repo.createCompany(tx, {
         companyName: input.companyName,
@@ -456,24 +401,18 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
         revenueCurrency: input.revenueCurrency,
         // Ownership comes from the verified token, never from the request.
         ownerUserId: userId,
-        // Omitted entirely when nothing was inherited, so the column keeps its
-        // NULL default and the create data says only what it means.
-        ...(inherited ? { accountingManagerUserId: inherited.manager.id } : {}),
+        /*
+         * No accounting manager here, ever. Every company is staffed by an
+         * admin through PUT /companies/:companyId/accounting-manager — a new
+         * company is created unassigned even when the same owner already has
+         * companies with a manager, because who works an account is a staffing
+         * decision that belongs to the admin, not something a customer can set
+         * in motion by filling in the onboarding form. The column keeps its
+         * NULL default.
+         */
         status: 'ONBOARDING',
       });
       logEvent({ event: 'company.created', status: 'success', requestId, userId, companyId: created.id });
-
-      if (inherited) {
-        logEvent({
-          event: 'company.accounting_manager.inherited',
-          status: 'success',
-          requestId,
-          userId,
-          companyId: created.id,
-          accountingManagerUserId: inherited.manager.id,
-          detail: `from_company_${inherited.sourceCompanyId}`,
-        });
-      }
 
       // Step 9: link the address to the company as its primary business address.
       await repo.createCompanyAddress(tx, {
@@ -511,7 +450,6 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
         data: dto.toCompanyOnboardingResponse({
           company: finalized,
           address: createdAddress,
-          accountingManager: inherited?.manager ?? null,
         }),
       };
 
@@ -538,7 +476,7 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
         company: {
           ...finalized,
           owner: { id: caller.id, firstName: caller.firstName, lastName: caller.lastName, email: caller.email },
-          accountingManager: inherited?.manager ?? null,
+          accountingManager: null,
         },
       };
     });
@@ -1122,104 +1060,25 @@ async function listAccountingManagers({ userId, requestId, query }) {
   };
 }
 
+function specialistNotFound() {
+  return new ApiError(404, 'Specialist not found.', { code: 'SPECIALIST_NOT_FOUND' });
+}
+
 /**
- * GET /specialists — the specialist directory, scoped to who is asking.
+ * Fold both attachment mechanisms into one per-specialist view.
  *
- * ONE endpoint, two audiences, and the difference is the scope rather than the
- * shape:
+ * A specialist can appear in BOTH sources for the same company and service —
+ * assigned in the table and holding the standing service-line column — so
+ * companies and specialities are de-duplicated by key rather than concatenated.
+ * Without that, the most correctly-configured accounts would be the ones
+ * showing duplicate rows.
  *
- *   ADMIN       every specialist in the organisation, including those not yet
- *               assigned to anything — the appointment view. `companyId` is
- *               optional and merely narrows it.
- *   EVERYONE    the specialists on ONE named company, which they must have read
- *   ELSE        access to. `companyId` is REQUIRED: there is no "all
- *               specialists" answer for a non-admin, not even a merged one
- *               across their own companies. Each row shows only that company.
- *
- * The `companyId` parameter is the global company filter the frontend already
- * applies elsewhere. It is authorised through the same read rule as every other
- * company read — so it can only ever narrow a caller's scope, never widen it.
- *
- * "Attached" deliberately means either mechanism: an ACTIVE row in the
- * assignment table, or one of the three standing service-line columns on the
- * company. Which one was used is an internal modelling detail, and a directory
- * that consulted only one of them would omit real people.
+ * Shared by the list and the profile so the two can never drift: a specialist
+ * whose companies read one way in the table and another way on their own page
+ * is a bug nobody reports, because each screen looks right on its own.
  */
-async function listSpecialistDirectory({ userId, requestId, query }) {
-  const caller = await loadCaller(userId);
-  const admin = isAdmin(caller);
-
-  /*
-   * Resolve the company scope BEFORE looking at any specialist.
-   *
-   * `null` means "no company restriction" and is reachable only by an admin who
-   * asked for no filter. Everyone else gets a concrete list of ids, and an empty
-   * list is a real answer — a user with no companies sees no specialists, which
-   * is why the empty case returns early instead of falling through to a query
-   * whose `id: { in: [] }` would look like "unrestricted" if it were ever
-   * mistranslated.
-   */
-  let companyIds = null;
-
-  /*
-   * A non-admin must name the company. Only an admin has an "all specialists"
-   * view; for everyone else the directory is always the directory OF a company,
-   * which is what the global company filter already expresses on every screen
-   * that shows one.
-   *
-   * Refused rather than defaulted to "all the companies you can reach". A
-   * customer who owns three companies would otherwise get a merged list with no
-   * indication of which specialist belongs to which account — an answer to a
-   * question the screen never asks, and one that quietly widens as they acquire
-   * companies. Making it explicit costs the client one parameter it already has.
-   */
-  if (!admin && !query.companyId) {
-    throw new ApiError(400, 'companyId is required.', {
-      code: 'COMPANY_ID_REQUIRED',
-      fields: { companyId: 'Select a company.' },
-    });
-  }
-
-  if (query.companyId) {
-    // Authorised exactly like any other read of that company: the filter can
-    // narrow what a caller sees, never widen it.
-    const company = await loadCompany(query.companyId);
-    await assertReadAccess(caller, company);
-    companyIds = [company.id];
-  }
-
-  // Which specialists are in scope at all. Admin with no filter: everyone.
-  const scopedIds = companyIds === null ? null : await repo.listSpecialistIdsForCompanies(prisma, companyIds);
-
-  if (scopedIds !== null && scopedIds.length === 0) {
-    logEvent({ event: 'specialists.read', status: 'success', requestId, userId, detail: '0/0' });
-    return { specialists: [], total: 0 };
-  }
-
-  const [rows, total] = await Promise.all([
-    repo.listSpecialistDirectory(prisma, { userIds: scopedIds, ...query }),
-    repo.countSpecialistDirectory(prisma, { userIds: scopedIds, ...query }),
-  ]);
-
-  const pageIds = rows.map((row) => row.id);
-
-  // The companies each specialist on THIS PAGE serves — two queries for the
-  // whole page, not two per row.
-  const [assignments, standing] = await Promise.all([
-    repo.listAssignmentsForSpecialists(prisma, { specialistUserIds: pageIds, companyIds }),
-    repo.listStandingSpecialistCompanies(prisma, { specialistUserIds: pageIds, companyIds }),
-  ]);
-
-  /*
-   * Fold both attachment mechanisms into one per-specialist view.
-   *
-   * A specialist can appear in BOTH sources for the same company and service —
-   * assigned in the table and holding the standing column — so companies and
-   * specialities are de-duplicated by key rather than concatenated. Without
-   * that, the most correctly-configured accounts would be the ones showing
-   * duplicate rows.
-   */
-  const byUser = new Map(pageIds.map((id) => [id, { companies: new Map(), specialities: new Map() }]));
+function foldSpecialistAttachments({ userIds, assignments, standing }) {
+  const byUser = new Map(userIds.map((id) => [id, { companies: new Map(), specialities: new Map() }]));
 
   for (const assignment of assignments) {
     const entry = byUser.get(assignment.specialistUserId);
@@ -1259,6 +1118,142 @@ async function listSpecialistDirectory({ userId, requestId, query }) {
     }
   }
 
+  return byUser;
+}
+
+/** One folded entry turned into the sorted, plain-array shape the DTOs take. */
+function presentAttachments(entry) {
+  return {
+    specialities: [...entry.specialities.values()].sort((a, b) => a.code.localeCompare(b.code)),
+    companies: [...entry.companies.values()]
+      .map((company) => ({ ...company, services: [...company.services].sort() }))
+      .sort((a, b) => a.companyName.localeCompare(b.companyName)),
+  };
+}
+
+/**
+ * GET /specialists — the specialist directory, scoped to who is asking.
+ *
+ * ONE endpoint, two audiences, and each one has exactly one legal form of the
+ * request:
+ *
+ *   ADMIN       every specialist in the organisation, including those not yet
+ *               assigned to anything — the appointment view. `companyId` is
+ *               REFUSED, not merely optional.
+ *   ACCOUNTING  the specialists on ONE named company, and only a company where
+ *   MANAGER     this caller is the accounting manager. `companyId` is REQUIRED:
+ *               there is no "all specialists" answer for a manager, not even a
+ *               merged one across their own accounts.
+ *
+ * Nobody else at all — the route gate turns other roles away, and the check
+ * below is what actually decides. A company read is deliberately NOT enough:
+ * the owner and the assigned specialists can read the company, but staffing is
+ * the manager's working picture, and the team a customer may see is already
+ * GET /companies/:companyId/team.
+ *
+ * "Attached" deliberately means either mechanism: an ACTIVE row in the
+ * assignment table, or one of the three standing service-line columns on the
+ * company. Which one was used is an internal modelling detail, and a directory
+ * that consulted only one of them would omit real people.
+ */
+async function listSpecialistDirectory({ userId, requestId, query }) {
+  const caller = await loadCaller(userId);
+  const admin = isAdmin(caller);
+
+  /*
+   * Resolve the company scope BEFORE looking at any specialist.
+   *
+   * `null` means "no company restriction" and is reachable only by an admin who
+   * asked for no filter. Everyone else gets a concrete list of ids, and an empty
+   * list is a real answer — a user with no companies sees no specialists, which
+   * is why the empty case returns early instead of falling through to a query
+   * whose `id: { in: [] }` would look like "unrestricted" if it were ever
+   * mistranslated.
+   */
+  let companyIds = null;
+
+  /*
+   * The two callers ask two different questions, and each parameter belongs to
+   * exactly one of them.
+   *
+   * An admin gets the unfiltered roll — every specialist, assigned or not. The
+   * filter is REFUSED rather than honoured: the admin screen has no company
+   * filter, so a `companyId` on an admin request is the frontend sending a
+   * manager's query on an admin's token, and answering it would hide that
+   * confusion behind a plausible-looking page.
+   *
+   * A manager must name the company. Refused rather than defaulted to "all the
+   * companies you manage" — a manager with three accounts would otherwise get a
+   * merged list with no indication of which specialist belongs to which, an
+   * answer to a question no screen asks, and one that quietly widens as they
+   * take on accounts. Making it explicit costs the client one parameter it
+   * already has.
+   */
+  if (admin && query.companyId) {
+    throw new ApiError(400, 'companyId is not supported for an admin.', {
+      code: 'COMPANY_FILTER_NOT_SUPPORTED',
+      fields: { companyId: 'Remove the company filter.' },
+    });
+  }
+
+  if (!admin && !query.companyId) {
+    throw new ApiError(400, 'companyId is required.', {
+      code: 'COMPANY_ID_REQUIRED',
+      fields: { companyId: 'Select a company.' },
+    });
+  }
+
+  if (query.companyId) {
+    /*
+     * Same rule as the staffing picker: THIS company's accounting manager, and
+     * nobody else. Scoped to the company rather than to the role at large —
+     * holding ACCOUNTING_MANAGER makes you eligible to be assigned, it does not
+     * make you responsible for every account in the system.
+     *
+     * Deliberately narrower than a company read. The owner and the assigned
+     * specialists can read the company, and until now that let them read this
+     * directory too; who staffs an account is the manager's working picture, not
+     * the customer's, and the team the customer is entitled to see is already
+     * GET /companies/:companyId/team.
+     */
+    const company = await loadCompany(query.companyId);
+    assertCanReadSpecialistOptions(caller, company);
+    companyIds = [company.id];
+  }
+
+  // Which specialists are in scope at all. Admin with no filter: everyone.
+  const scopedIds = companyIds === null ? null : await repo.listSpecialistIdsForCompanies(prisma, companyIds);
+
+  if (scopedIds !== null && scopedIds.length === 0) {
+    logEvent({ event: 'specialists.read', status: 'success', requestId, userId, detail: '0/0' });
+    return { specialists: [], total: 0 };
+  }
+
+  const [rows, total] = await Promise.all([
+    repo.listSpecialistDirectory(prisma, { userIds: scopedIds, ...query }),
+    repo.countSpecialistDirectory(prisma, { userIds: scopedIds, ...query }),
+  ]);
+
+  const pageIds = rows.map((row) => row.id);
+
+  // The companies each specialist on THIS PAGE serves — two queries for the
+  // whole page, not two per row.
+  const [assignments, standing] = await Promise.all([
+    repo.listAssignmentsForSpecialists(prisma, { specialistUserIds: pageIds, companyIds }),
+    repo.listStandingSpecialistCompanies(prisma, { specialistUserIds: pageIds, companyIds }),
+  ]);
+
+  /*
+   * Fold both attachment mechanisms into one per-specialist view.
+   *
+   * A specialist can appear in BOTH sources for the same company and service —
+   * assigned in the table and holding the standing column — so companies and
+   * specialities are de-duplicated by key rather than concatenated. Without
+   * that, the most correctly-configured accounts would be the ones showing
+   * duplicate rows.
+   */
+  const byUser = foldSpecialistAttachments({ userIds: pageIds, assignments, standing });
+
   logEvent({
     event: 'specialists.read',
     status: 'success',
@@ -1268,18 +1263,117 @@ async function listSpecialistDirectory({ userId, requestId, query }) {
   });
 
   return {
-    specialists: rows.map((user) => {
-      const entry = byUser.get(user.id);
-      return dto.toSpecialistRow({
-        user,
-        specialities: [...entry.specialities.values()].sort((a, b) => a.code.localeCompare(b.code)),
-        companies: [...entry.companies.values()]
-          .map((company) => ({ ...company, services: [...company.services].sort() }))
-          .sort((a, b) => a.companyName.localeCompare(b.companyName)),
-      });
-    }),
+    specialists: rows.map((user) => dto.toSpecialistRow({ user, ...presentAttachments(byUser.get(user.id)) })),
     total,
   };
+}
+
+/**
+ * GET /specialists/:userId — the profile behind a clicked directory row.
+ *
+ * The same two audiences and the same rule as the list, deliberately: an admin
+ * reads any specialist unscoped, an accounting manager reads a specialist ON a
+ * company they manage. Anything looser and the profile would become the way
+ * round the list's scope — the row you may not see, fetched by id.
+ *
+ * A specialist the caller's company has no attachment to is a 404 rather than a
+ * 403. The distinction matters: a 403 would confirm the id belongs to a real
+ * specialist, which is precisely what a manager probing ids should not learn,
+ * and "not on this account" is honestly a missing row from where they stand.
+ */
+async function getSpecialistDetail({ userId, requestId, specialistUserId, query }) {
+  const caller = await loadCaller(userId);
+  const admin = isAdmin(caller);
+
+  // Same contract as the list: the filter belongs to the manager, the unscoped
+  // view belongs to the admin, and neither may borrow the other's form.
+  if (admin && query.companyId) {
+    throw new ApiError(400, 'companyId is not supported for an admin.', {
+      code: 'COMPANY_FILTER_NOT_SUPPORTED',
+      fields: { companyId: 'Remove the company filter.' },
+    });
+  }
+
+  if (!admin && !query.companyId) {
+    throw new ApiError(400, 'companyId is required.', {
+      code: 'COMPANY_ID_REQUIRED',
+      fields: { companyId: 'Select a company.' },
+    });
+  }
+
+  let companyIds = null;
+
+  if (query.companyId) {
+    const company = await loadCompany(query.companyId);
+    assertCanReadSpecialistOptions(caller, company);
+    companyIds = [company.id];
+  }
+
+  const specialist = await repo.findSpecialistProfile(prisma, specialistUserId);
+  if (!specialist) throw specialistNotFound();
+
+  /*
+   * Scope check BEFORE any further read. Authorising the company is not the same
+   * as authorising this person: a manager holds one account, and the profile of
+   * a specialist who has never worked it is not theirs to open.
+   */
+  if (companyIds !== null) {
+    const scopedIds = await repo.listSpecialistIdsForCompanies(prisma, companyIds);
+    if (!scopedIds.includes(specialist.id)) throw specialistNotFound();
+  }
+
+  const [assignments, standing, tasks] = await Promise.all([
+    repo.listAssignmentsForSpecialists(prisma, { specialistUserIds: [specialist.id], companyIds }),
+    repo.listStandingSpecialistCompanies(prisma, { specialistUserIds: [specialist.id], companyIds }),
+    /*
+     * The whole task table for this specialist on this company — every task,
+     * across the company's projects, trimmed to the four columns the profile
+     * renders (see dto.toProfileTask).
+     *
+     * UNPAGED, and bounded by the domain rather than by a `take`: these are the
+     * open and closed tasks of ONE person on ONE account, which is a working
+     * caseload, not a growing archive. A silent cap here would be worse than no
+     * cap — a profile quietly showing the first 50 of 80 tasks looks complete
+     * and is not. If a caseload ever does grow past what one response should
+     * carry, GET /tasks?companyId=&specialistUserId= already pages and filters
+     * it, and the fix is to point the profile at that rather than to truncate
+     * here without saying so.
+     *
+     * Null for an admin: tasks hang off a company, and the admin's view names
+     * none.
+     */
+    companyIds === null
+      ? null
+      : taskRepo.listCompanyTasks(prisma, {
+          companyId: companyIds[0],
+          projectId: null,
+          status: null,
+          specialistUserId: specialist.id,
+          search: null,
+          limit: undefined,
+          offset: undefined,
+          sort: 'deadlineDate',
+          order: 'asc',
+        }),
+  ]);
+
+  const byUser = foldSpecialistAttachments({ userIds: [specialist.id], assignments, standing });
+
+  logEvent({
+    event: 'specialist.detail.read',
+    status: 'success',
+    requestId,
+    userId,
+    detail: `specialist=${specialist.id} tasks=${tasks === null ? 'n/a' : tasks.length}`,
+  });
+
+  return dto.toSpecialistDetail({
+    user: specialist,
+    // The companies are folded but not returned: the fold is what proves the
+    // specialities, and the profile shows the person rather than the account.
+    specialities: presentAttachments(byUser.get(specialist.id)).specialities,
+    tasks: tasks === null ? null : tasks.map(taskDto.toProfileTask),
+  });
 }
 
 /**
@@ -1336,6 +1430,87 @@ async function listCustomerDirectory({ userId, requestId, query }) {
   });
 
   return { customers: rows.map(dto.toCustomerRow), total };
+}
+
+// A customer the caller may not see is the same answer as one who does not
+// exist. Saying "forbidden" would confirm the id belongs to a real customer,
+// which is exactly what a manager walking ids must not learn — and from where
+// they stand, someone who is not on their account genuinely is a missing row.
+function customerNotFound() {
+  return new ApiError(404, 'Customer not found.', { code: 'CUSTOMER_NOT_FOUND' });
+}
+
+/**
+ * Reading a customer profile: the ACCOUNTING MANAGER OF THIS COMPANY, and nobody
+ * else.
+ *
+ * Not assertCompanyAccountingManager, which carries the specialist-assignment
+ * wording — the codes are the same because the rule is the same, but a read that
+ * tells you "only an accounting manager can assign specialists" is a message
+ * about a different endpoint.
+ *
+ * NO ADMIN, unlike the directory this profile hangs off. That is a real
+ * narrowing and it is deliberate: the customer's personal contact details and
+ * home address are working material for the manager who has to reach them, and
+ * an admin's job on the company table — appointing a manager — never needs them.
+ * The admin still sees the customer row itself on GET /customers.
+ */
+function assertCanReadCustomerProfile(caller, company) {
+  if (!hasAccountingManagerRole(caller) || caller.status !== 'ACTIVE') {
+    throw new ApiError(403, 'Only an accounting manager can view a customer profile.', {
+      code: 'ACCOUNTING_MANAGER_ROLE_REQUIRED',
+    });
+  }
+  if (company.accountingManagerUserId !== caller.id) {
+    throw new ApiError(403, 'You are not the accounting manager for this company.', {
+      code: 'NOT_COMPANY_ACCOUNTING_MANAGER',
+    });
+  }
+}
+
+/**
+ * GET /customers/:userId — the profile behind a clicked customer row.
+ *
+ * ONE audience: the accounting manager of the company named in `?companyId=`.
+ * There is no unscoped form of this request and no admin form — a manager's
+ * question is "who is this person on THIS account", and `companyId` is what
+ * makes the answer checkable.
+ *
+ * The scope check runs AFTER the person is loaded but BEFORE anything is
+ * returned, and it is the same one the list uses — authorising the company is
+ * not the same as authorising this person. A customer who is not attached to the
+ * named company is a 404, so the profile cannot become the way round the list:
+ * the row you may not see, fetched by id.
+ */
+async function getCustomerDetail({ userId, requestId, customerUserId, query }) {
+  const caller = await loadCaller(userId);
+
+  if (!query.companyId) {
+    throw new ApiError(400, 'companyId is required.', {
+      code: 'COMPANY_ID_REQUIRED',
+      fields: { companyId: 'Select a company.' },
+    });
+  }
+
+  const company = await loadCompany(query.companyId);
+  assertCanReadCustomerProfile(caller, company);
+
+  const customer = await repo.findCustomerProfile(prisma, customerUserId);
+  if (!customer) throw customerNotFound();
+
+  const scopedIds = await repo.listCustomerIdsForCompanies(prisma, [company.id]);
+  if (!scopedIds.includes(customer.id)) throw customerNotFound();
+
+  logEvent({
+    event: 'customer.detail.read',
+    status: 'success',
+    requestId,
+    userId,
+    companyId: company.id,
+    detail: `customer=${customer.id}`,
+  });
+
+  return dto.toCustomerDetail(customer);
 }
 
 /**
@@ -1946,7 +2121,9 @@ module.exports = {
   // NOT `listSpecialists` — that name is taken by the per-company assignment
   // list below. This one is the cross-company directory.
   listSpecialistDirectory,
+  getSpecialistDetail,
   listCustomerDirectory,
+  getCustomerDetail,
   listOwnedCompanies,
   listTeammates,
   listManagedCompanies,
@@ -1962,8 +2139,6 @@ module.exports = {
   _internals: {
     hasOwnerRole,
     hasAccountingManagerRole,
-    isEligibleAccountingManager,
-    resolveInheritedAccountingManager,
     hasSpecialistRole,
     loadActiveServices,
     isAdmin,
