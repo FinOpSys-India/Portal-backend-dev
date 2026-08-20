@@ -572,10 +572,97 @@ const verifyEmailConnection = async () => {
   await transporter.verify();
 };
 
+/**
+ * Strip HTML down to the plain-text alternative part.
+ *
+ * The database stores only `body_html` — the text version is DERIVED here, at
+ * send time, rather than stored beside it, because a stored copy would drift the
+ * first time a draft was edited and only one of the two was rewritten.
+ *
+ * Deliberately crude, and adequate for what it is: `<br>` and block ends become
+ * newlines, remaining tags are dropped, the five named entities a rich-text
+ * editor actually emits are decoded, and runs of blank lines collapse. This is
+ * the fallback part, shown only by a client that refuses the HTML one — it needs
+ * to be readable, not to be a faithful rendering. Anything cleverer belongs in a
+ * library, and pulling one in for a fallback nobody sees would be the wrong
+ * trade.
+ *
+ * `<script>` and `<style>` bodies are removed WITH their contents rather than
+ * just untagged, or the text part would carry a wall of CSS.
+ */
+function htmlToText(html = "") {
+  return String(html)
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|h[1-6]|li|tr)>/gi, "\n")
+    .replace(/<li[^>]*>/gi, "- ")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Send one composed message from the email screen.
+ *
+ * THE FROM IS RECORDED, NOT OBEYED — the same split every other function in this
+ * file makes, and the reason it is made here too. The envelope sender stays
+ * SMTP_FROM, because the provider will not relay mail claiming an address it
+ * does not authorize; the composer's real address goes in `replyTo`, so a reply
+ * reaches the person who wrote it rather than the service mailbox. A frontend
+ * that let the user type a From would be typing something this function ignores.
+ *
+ * `attachments` arrive as { filename, content, contentType } with `content` a
+ * Buffer — the caller has already fetched the bytes out of the bucket, because
+ * only it knows which keys the message owns and whether the caller may read
+ * them. This function does no storage access and no authorization; it is the
+ * transport and nothing else.
+ *
+ * IT DOES NOT CATCH. A refused send has to reach the caller so the row can be
+ * marked FAILED with the reason on it; swallowing the error here would leave a
+ * message that claims to be sent and never was.
+ */
+const sendComposedEmail = async ({
+  senderEmail,
+  senderName,
+  to = [],
+  cc = [],
+  bcc = [],
+  subject,
+  bodyHtml,
+  attachments = []
+}) => {
+  return transporter.sendMail({
+    from: {
+      name: senderName || process.env.SMTP_FROM_NAME || "FinOpSys Portal",
+      address: process.env.SMTP_FROM || senderEmail
+    },
+
+    replyTo: senderEmail,
+    to,
+    // Omitted entirely when empty. Passing [] makes some transports emit a bare
+    // "Cc:" header, which several spam filters score against.
+    ...(cc.length ? { cc } : {}),
+    ...(bcc.length ? { bcc } : {}),
+
+    subject,
+    html: bodyHtml,
+    text: htmlToText(bodyHtml),
+    attachments
+  });
+};
+
 module.exports = {
   sendInvitationEmail,
   sendOtpEmail,
   sendPasswordResetOtpEmail,
   sendPasswordChangedEmail,
+  sendComposedEmail,
+  htmlToText,
   verifyEmailConnection
 };

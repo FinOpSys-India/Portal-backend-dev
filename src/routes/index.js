@@ -20,6 +20,7 @@ const accountingManagerRoutes = require('./accountingManagerRoutes');
 const projectRoutes = require('./projectRoutes');
 const documentRoutes = require('./documentRoutes');
 const taskRoutes = require('./taskRoutes');
+const emailRoutes = require('./emailRoutes');
 const billingRoutes = require('./billingRoutes');
 
 /**
@@ -120,6 +121,12 @@ router.use('/documents', requireAuth, requirePaidAccount, documentRoutes);
 // specialist performs on them. Gated with /projects for the same reason
 // /documents is — it reads and writes the same work through a different door.
 router.use('/tasks', requireAuth, requirePaidAccount, taskRoutes);
+// The compose-and-send email screen, plus the recipient picker it is built from.
+// Gated with /projects and /documents for the same reason: writing to a client
+// is account work, and an unpaid account has no client to write to. The picker
+// is behind the paywall too, deliberately — an ungated directory of a company's
+// people would be the one way to read its roster without paying for it.
+router.use('/emails', requireAuth, requirePaidAccount, emailRoutes);
 router.use('/invitations', requireAuth, requirePaidAccount, invitationRoutes);
 // POST /billing/webhook is mounted in app.js instead — it needs the raw body,
 // so it must sit ahead of express.json(). Everything else is authenticated here.
