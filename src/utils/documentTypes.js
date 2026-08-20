@@ -77,9 +77,40 @@ function documentKey(projectId, mimeType) {
   return storage.keyFor('projects', projectId, `${crypto.randomBytes(16).toString('hex')}${ext}`);
 }
 
+/**
+ * The storage key for one email attachment:
+ * `emails/outbox/<senderUserId>/<random><ext>`.
+ *
+ * Same shape and same reasoning as `documentKey` above — random name, extension
+ * from the allowlist — with one deliberate difference: the prefix names the
+ * SENDER, not the message.
+ *
+ * IT HAS TO. There is no message to name. The compose screen sends in a single
+ * `POST /emails` that creates the row and hands it to SMTP in the same request,
+ * so at the moment a file is uploaded no id exists yet — and inventing a
+ * placeholder prefix would mean copying every byte to a real one afterwards.
+ *
+ * The sender is what makes the key CHECKABLE, which is the job the message id
+ * used to do. `POST /emails` re-derives this prefix from the authenticated user
+ * and refuses any key that does not match it, so a caller cannot attach an object
+ * somebody else uploaded. See emailMessageService.isKeyForSender.
+ *
+ * `senderUserId` comes from the verified token, never from the request body.
+ */
+function emailAttachmentKey(senderUserId, mimeType) {
+  const ext = EXTENSION_BY_MIME[mimeType] ?? '';
+  return storage.keyFor('emails', 'outbox', senderUserId, `${crypto.randomBytes(16).toString('hex')}${ext}`);
+}
+
 /** Whether a client-declared type may be uploaded at all. */
 function isAllowedMimeType(mimeType) {
   return Boolean(EXTENSION_BY_MIME[mimeType]);
 }
 
-module.exports = { EXTENSION_BY_MIME, ACCEPTED_LABEL, documentKey, isAllowedMimeType };
+module.exports = {
+  EXTENSION_BY_MIME,
+  ACCEPTED_LABEL,
+  documentKey,
+  emailAttachmentKey,
+  isAllowedMimeType,
+};

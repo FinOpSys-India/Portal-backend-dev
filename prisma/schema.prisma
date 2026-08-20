@@ -169,6 +169,13 @@ model User {
 
   uploadedProjectDocuments ProjectDocument[] @relation("ProjectDocumentUploader")
 
+  // Email. `sentEmails` is what this user composed; `receivedEmails` is every
+  // TO/CC/BCC row that resolved to them. Two relations because a sender is named
+  // by a column on the message and a recipient by a row beside it — and because
+  // one user can legitimately be on both sides of the same message.
+  sentEmails     EmailMessage[]   @relation("EmailMessageSender")
+  receivedEmails EmailRecipient[] @relation("EmailRecipientUser")
+
   // Tasks. Same split as projects above, and for the same reason: `createdTasks`
   // is who filed the task, `assignedTasks` is who owns the work.
   createdTasks  ProjectTask[] @relation("ProjectTaskCreatedBy")
@@ -554,6 +561,7 @@ model Company {
   pendingInvitations    InvitationCompany[]
 
   projects              Project[]
+  emailMessages         EmailMessage[]
 
   @@index([ownerUserId])
   @@index([accountingManagerUserId])
@@ -1130,4 +1138,126 @@ enum TaskStatus {
   COMPLETED
 
   @@map("task_status")
+}
+
+/* ========================================================================== */
+/* email — the compose-and-send screen                                        */
+/* ========================================================================== */
+
+/// One composed email: the From, the Subject, the Body, and what became of it.
+///
+/// The From is `senderUserId` and NOT a stored address. There is no `fromEmail`
+/// column beside it for the same reason there is no `email` on EmailRecipient:
+/// `users` already holds it, and a second copy could disagree with the first.
+/// What actually leaves the SMTP host is `SMTP_FROM` with the sender's address
+/// as Reply-To — the split emailService.sendInvitationEmail already makes,
+/// because a provider will not relay mail claiming an address it does not
+/// authorize.
+///
+/// See db/schema/19_add_email_messages.sql for the reasoning behind every
+/// column, and for why the status enum has three values rather than five.
+model EmailMessage {
+  id        Int  @id @default(autoincrement())
+  companyId Int? @map("company_id")
+
+  /// Nullable, with SetNull below: the record that a message was sent is an
+  /// audit fact that outlives both the account it was about and the staff member
+  /// who wrote it. Offboarding must not erase sent mail.
+  senderUserId Int? @map("sender_user_id")
+
+  subject String @map("subject") @db.VarChar(500)
+
+  /// HTML only. The plain-text alternative part is generated at send time rather
+  /// than stored — it is derivable from this, and a stored copy would drift the
+  /// first time a draft was edited.
+  bodyHtml String @map("body_html")
+
+  status EmailStatus @default(DRAFT)
+
+  /// The transport's rejection, verbatim. `status = FAILED` on its own cannot
+  /// tell "mailbox does not exist" (never retry) from "SMTP timeout" (retry).
+  errorMessage String?   @map("error_message")
+  sentAt       DateTime? @map("sent_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  sender  User?    @relation("EmailMessageSender", fields: [senderUserId], references: [id], onDelete: SetNull)
+
+  recipients  EmailRecipient[]
+  attachments EmailAttachment[]
+
+  /// Carries createdAt so the list screen's ORDER BY is served by the index and
+  /// no sort step runs. The database index is (company_id, created_at DESC);
+  /// Prisma cannot express the direction, which costs nothing — it describes the
+  /// index rather than creating it.
+  @@index([companyId, createdAt])
+  @@map("email_messages")
+}
+
+/// One addressee on one message.
+///
+/// Rows, not a comma-separated column: "which emails has this person received"
+/// is a question the account screens ask, and a TEXT column of addresses cannot
+/// be joined, indexed or counted.
+///
+/// NO SURROGATE ID and no createdAt. The composite key IS the identity, and the
+/// message already carries the timestamp. Keyed on recipientType as well as the
+/// user because putting someone on both TO and CC of one message is a real thing
+/// to do, and the mail header carries both.
+model EmailRecipient {
+  emailMessageId Int                @map("email_message_id")
+  userId         Int                @map("user_id")
+  recipientType  EmailRecipientType @default(TO) @map("recipient_type")
+
+  message EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+  /// Cascade, unlike the sender above: a recipient row whose user is gone names
+  /// nobody at all, whereas the message itself still records what was sent.
+  user    User         @relation("EmailRecipientUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Also the "recipients of this message" lookup path, since it leads with
+  /// emailMessageId — which is why there is no separate index on that column.
+  @@id([emailMessageId, userId, recipientType])
+  @@index([userId])
+  @@map("email_recipients")
+}
+
+/// A file attached to a message: metadata here, bytes in the private documents
+/// bucket, joined by `fileKey`. Same division as ProjectDocument, and for the
+/// reasons set out at length in db/schema/18_add_project_documents.sql.
+model EmailAttachment {
+  id             Int    @id @default(autoincrement())
+  emailMessageId Int    @map("email_message_id")
+  /// The generated storage path, "emails/42/9f3c…b1.pdf". Unique, so a retried
+  /// confirm cannot register the same bytes twice.
+  fileKey        String @unique @map("file_key") @db.VarChar(512)
+  originalName   String @map("original_name") @db.VarChar(255)
+  mimeType       String @map("mime_type") @db.VarChar(150)
+  sizeBytes      BigInt @map("size_bytes")
+
+  message EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+
+  @@index([emailMessageId])
+  @@map("email_attachments")
+}
+
+/// Three values, not five. No QUEUED and no SENDING: emailService hands the
+/// message to nodemailer inline in the request, so nothing ever rests in an
+/// in-flight state long enough to be queried for. DRAFT is resumable, FAILED is
+/// retryable, and EmailMessage.errorMessage is what tells them apart.
+enum EmailStatus {
+  DRAFT
+  SENT
+  FAILED
+
+  @@map("email_status")
+}
+
+enum EmailRecipientType {
+  TO
+  CC
+  BCC
+
+  @@map("email_recipient_type")
 }

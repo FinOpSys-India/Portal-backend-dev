@@ -178,6 +178,21 @@ const projectLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 60, label:
  */
 const documentLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 40, label: 'Document upload' });
 
+/*
+ * The compose-and-send email screen: drafts, edits, and the send itself.
+ *
+ * Tighter than projectLimiter despite both being authenticated, because the send
+ * endpoint is the only one in the API that puts mail in a THIRD PARTY'S inbox. A
+ * looping client on any other route wastes this server's time; a looping client
+ * here floods a real client's mailbox and burns the SMTP host's reputation,
+ * which is not something a later fix undoes.
+ *
+ * Attachment upload and confirm deliberately do NOT use this — they carry
+ * `documentLimiter`, since what they bound is bytes written to the bucket and
+ * that is the same work, and the same risk, wherever it is issued from.
+ */
+const emailLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 30, label: 'Email' });
+
 module.exports = {
   invitationLimiter,
   authLimiter,
@@ -191,4 +206,5 @@ module.exports = {
   refreshLimiter,
   projectLimiter,
   documentLimiter,
+  emailLimiter,
 };
