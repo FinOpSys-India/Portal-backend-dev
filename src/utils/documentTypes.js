@@ -102,6 +102,30 @@ function emailAttachmentKey(senderUserId, mimeType) {
   return storage.keyFor('emails', 'outbox', senderUserId, `${crypto.randomBytes(16).toString('hex')}${ext}`);
 }
 
+/**
+ * The storage key for one chat attachment:
+ * `chat/<conversationId>/<random><ext>`.
+ *
+ * Same shape and reasoning as the two above — random name, extension from the
+ * allowlist — and the prefix names the CONVERSATION, which is the one identifier
+ * that already exists when a file is uploaded. Unlike an email attachment there
+ * IS something to hang it off: a thread is opened before anything is typed in
+ * it, so the upload can be scoped to the thread rather than to the sender.
+ *
+ * Scoping it to the thread is also what makes the key checkable at send time
+ * without trusting the client: `POST /chat/conversations/:id/messages` rebuilds
+ * this prefix from the id in its own URL — which it has already authorized the
+ * caller against — and refuses any key that does not match. A key scoped to the
+ * sender instead would let someone attach a file they uploaded for one client's
+ * thread to a different client's thread. See chatService.isKeyForConversation.
+ *
+ * `conversationId` must already be a validated integer.
+ */
+function chatAttachmentKey(conversationId, mimeType) {
+  const ext = EXTENSION_BY_MIME[mimeType] ?? '';
+  return storage.keyFor('chat', conversationId, `${crypto.randomBytes(16).toString('hex')}${ext}`);
+}
+
 /** Whether a client-declared type may be uploaded at all. */
 function isAllowedMimeType(mimeType) {
   return Boolean(EXTENSION_BY_MIME[mimeType]);
@@ -112,5 +136,6 @@ module.exports = {
   ACCEPTED_LABEL,
   documentKey,
   emailAttachmentKey,
+  chatAttachmentKey,
   isAllowedMimeType,
 };

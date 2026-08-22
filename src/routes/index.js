@@ -21,6 +21,7 @@ const projectRoutes = require('./projectRoutes');
 const documentRoutes = require('./documentRoutes');
 const taskRoutes = require('./taskRoutes');
 const emailRoutes = require('./emailRoutes');
+const chatRoutes = require('./chatRoutes');
 const billingRoutes = require('./billingRoutes');
 
 /**
@@ -127,6 +128,17 @@ router.use('/tasks', requireAuth, requirePaidAccount, taskRoutes);
 // is behind the paywall too, deliberately — an ungated directory of a company's
 // people would be the one way to read its roster without paying for it.
 router.use('/emails', requireAuth, requirePaidAccount, emailRoutes);
+/*
+ * Chat between the accounting manager and the people on a company's account.
+ * Gated with /emails and /projects for the same reason, and one more of its own:
+ * talking to the client is the service being paid for, so an unpaid account
+ * having a live line to its accounting manager would be the service without the
+ * subscription.
+ *
+ * An admin reaches nothing here — not by this gate, but because an admin is
+ * never one of a thread's two sides. See chatRoutes.
+ */
+router.use('/chat', requireAuth, requirePaidAccount, chatRoutes);
 router.use('/invitations', requireAuth, requirePaidAccount, invitationRoutes);
 // POST /billing/webhook is mounted in app.js instead — it needs the raw body,
 // so it must sit ahead of express.json(). Everything else is authenticated here.
