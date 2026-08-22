@@ -193,6 +193,27 @@ const documentLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 40, label
  */
 const emailLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 30, label: 'Email' });
 
+/*
+ * Chat: opening a thread, sending, marking read.
+ *
+ * THE LOOSEST LIMITER IN THIS FILE, and deliberately so. Every other endpoint
+ * here is reached by submitting a form; a chat window is reached by typing, and
+ * a real conversation is dozens of short messages in a few minutes. A cap sized
+ * like emailLimiter's would cut off the one legitimate user this API has who
+ * sends thirty requests in a row on purpose.
+ *
+ * It is still capped, because nothing else bounds a client stuck in a send loop
+ * — and unlike email, a message here reaches an inbox nobody has to leave the
+ * portal to see, so a flood is annoying rather than reputationally expensive.
+ * That is the whole difference between the two numbers.
+ *
+ * Attachment uploads do NOT use this: they carry `documentLimiter`, the same as
+ * the project and email upload routes, because what they bound is bytes written
+ * to the bucket and that is the same work and the same risk wherever it is
+ * issued from.
+ */
+const chatLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 300, label: 'Chat' });
+
 module.exports = {
   invitationLimiter,
   authLimiter,
@@ -207,4 +228,5 @@ module.exports = {
   projectLimiter,
   documentLimiter,
   emailLimiter,
+  chatLimiter,
 };

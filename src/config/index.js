@@ -495,6 +495,52 @@ const config = {
      */
     signedUrlTtlSeconds: parseInt(process.env.SUPABASE_SIGNED_URL_TTL_SECONDS, 10) || 60,
   },
+  /*
+   * LIVE CHAT — Supabase Realtime, and why the browser needs a second token.
+   *
+   * This API is deployed to Vercel as serverless functions with a 10-second
+   * ceiling per request (vercel.json), so it cannot hold a WebSocket or an SSE
+   * stream open: the connection would be cut mid-conversation every ten seconds.
+   * services/realtimeService — the admin SSE channel — works only because a long
+   * local `npm run dev` process is where it is used.
+   *
+   * Supabase already holds those sockets and already reads the Postgres
+   * replication stream, so the browser subscribes to it DIRECTLY and this API
+   * stays out of the live path entirely. What it still has to do is say who the
+   * browser is: this application signs its own JWTs, so a Supabase connection
+   * would otherwise arrive anonymous and the RLS policies in
+   * db/schema/21_add_chat_realtime.sql would show it nothing.
+   *
+   * GET /chat/realtime-token mints that bridge — a Supabase-shaped JWT carrying
+   * this user's id — and the secret below is what signs it.
+   */
+  realtime: {
+    /*
+     * The Supabase project's JWT secret (Dashboard -> Project Settings -> API ->
+     * JWT Settings). The SAME secret Supabase verifies its own tokens with,
+     * which is exactly why it is not `JWT_SECRET`: that one is this API's, and a
+     * single secret signing both would mean a token minted for a chat socket was
+     * also a valid access token for every endpoint here.
+     *
+     * No fallback and no default. An unset value disables live chat with a clear
+     * 503 (see chatRealtimeService) rather than minting tokens Supabase will
+     * reject — a signature failure at the socket looks like a network fault and
+     * is diagnosed as one.
+     */
+    supabaseJwtSecret: process.env.SUPABASE_JWT_SECRET || '',
+    /*
+     * How long a realtime token is good for. Thirty minutes: long enough that a
+     * user reading a thread is not interrupted, short enough that a token
+     * scraped out of a browser session stops working within the hour. The client
+     * re-requests one when the socket closes, which costs one call.
+     *
+     * It grants strictly less than an access token does — a read-only
+     * subscription to rows the RLS policies already allow, with no INSERT,
+     * UPDATE or DELETE policy anywhere on the chat tables — so its expiry is
+     * about limiting a leak, not about session length.
+     */
+    tokenTtlSeconds: parseInt(process.env.SUPABASE_REALTIME_TOKEN_TTL_SECONDS, 10) || 30 * 60,
+  },
   db: {
     // When set (e.g. Supabase/Neon), the connection string takes precedence
     // over the individual DB_* fields below.

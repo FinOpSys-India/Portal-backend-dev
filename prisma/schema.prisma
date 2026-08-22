@@ -173,6 +173,15 @@ model User {
   // TO/CC/BCC row that resolved to them. Two relations because a sender is named
   // by a column on the message and a recipient by a row beside it — and because
   // one user can legitimately be on both sides of the same message.
+  // Chat. Three relations rather than two, because this user reaches a thread in
+  // three unrelated ways: as the accounting manager who holds it, as the
+  // customer or specialist on the other side of it, and as whoever typed a given
+  // message — and one person can legitimately be all three at once on different
+  // threads.
+  managedChats     ChatConversation[] @relation("ChatConversationManager")
+  chats            ChatConversation[] @relation("ChatConversationParticipant")
+  chatMessagesSent ChatMessage[]      @relation("ChatMessageSender")
+
   sentEmails     EmailMessage[]   @relation("EmailMessageSender")
   receivedEmails EmailRecipient[] @relation("EmailRecipientUser")
 
@@ -562,6 +571,7 @@ model Company {
 
   projects              Project[]
   emailMessages         EmailMessage[]
+  chatConversations     ChatConversation[]
 
   @@index([ownerUserId])
   @@index([accountingManagerUserId])
@@ -1260,4 +1270,133 @@ enum EmailRecipientType {
   BCC
 
   @@map("email_recipient_type")
+}
+
+/// One chat thread: (company, accounting manager, counterpart).
+///
+/// THE COMPANY IS PART OF THE IDENTITY, not a filter on top of it. One person
+/// can be a teammate at company A and a specialist at company B, and without
+/// companyId in the unique key their messages would merge into one stream — one
+/// client's books discussed in another client's thread. See
+/// db/schema/20_add_chat.sql.
+///
+/// `accountingManagerUserId` is a COLUMN rather than a join to
+/// companies.accountingManagerUserId, which says who manages the account TODAY.
+/// The thread has to record who actually held the conversation, or reassigning a
+/// company silently rewrites the authorship of every past thread. That the
+/// manager is the one currently assigned is checked when the thread is OPENED.
+model ChatConversation {
+  id                      Int                 @id @default(autoincrement())
+  companyId               Int                 @map("company_id")
+  accountingManagerUserId Int                 @map("accounting_manager_user_id")
+  participantUserId       Int                 @map("participant_user_id")
+
+  /// Which of the two sections of the accounting-manager portal this thread
+  /// belongs in. Nearly derivable from the participant's role, and stored anyway:
+  /// a role can change, and that must not retroactively move a finished thread
+  /// into the other section.
+  participantKind ChatParticipantKind @map("participant_kind")
+
+  /// Denormalised so both portal lists sort by recent activity off an index
+  /// instead of a correlated MAX over the messages. Written in the same
+  /// transaction as the message insert. NULL means "opened, nothing said yet".
+  lastMessageAt DateTime? @map("last_message_at") @db.Timestamptz(6)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  /// Restrict on both sides: a thread with one identifiable end is not a thread,
+  /// and this app hibernates accounts rather than deleting them.
+  accountingManager User @relation("ChatConversationManager", fields: [accountingManagerUserId], references: [id], onDelete: Restrict)
+  participant       User @relation("ChatConversationParticipant", fields: [participantUserId], references: [id], onDelete: Restrict)
+
+  messages ChatMessage[]
+
+  /// One thread per pair per company — and what makes "open or reuse the
+  /// conversation with X" a single upsert rather than a select-then-insert race
+  /// that can create two threads.
+  @@unique([companyId, accountingManagerUserId, participantUserId])
+  /// The two portal sections. The database index carries lastMessageAt DESC;
+  /// Prisma cannot express the direction, which costs nothing — this describes
+  /// the index rather than creating it.
+  @@index([companyId, participantKind, lastMessageAt])
+  @@index([participantUserId, lastMessageAt])
+  @@index([accountingManagerUserId, lastMessageAt])
+  @@map("chat_conversations")
+}
+
+/// One message in a thread.
+///
+/// THERE IS NO recipientUserId. A conversation has exactly two sides, so the
+/// receiver is whichever one did not send it — derived in chatDto, never stored,
+/// because a stored copy could disagree with the conversation it hangs off.
+model ChatMessage {
+  /// BigInt, unlike every other id in this schema: messages are the one row type
+  /// produced by ordinary typing rather than by a business event, and a chat
+  /// table is where a 32-bit sequence would eventually run out.
+  id             BigInt @id @default(autoincrement())
+  conversationId Int    @map("conversation_id")
+  senderUserId   Int    @map("sender_user_id")
+
+  /// Nullable: an attachment with no caption is an ordinary message. "Has text
+  /// OR has an attachment" spans two tables and is enforced in chatService,
+  /// inside the transaction that writes both.
+  body String?
+
+  /// ONE read receipt column rather than a reads table, because a thread has two
+  /// sides: the reader is always the one who did not send it. This is the column
+  /// to revisit — and only this one — if group threads are ever added.
+  readAt DateTime? @map("read_at") @db.Timestamptz(6)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// Soft delete. "Delete for me" is deliberately not offered: with two
+  /// participants it is indistinguishable from tampering with the other person's
+  /// copy of the record.
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  conversation ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User             @relation("ChatMessageSender", fields: [senderUserId], references: [id], onDelete: Restrict)
+
+  attachments ChatAttachment[]
+
+  /// The database index is (conversation_id, created_at DESC) WHERE deleted_at
+  /// IS NULL, plus a partial one for the unread badge. Prisma can express
+  /// neither the direction nor the predicate.
+  @@index([conversationId, createdAt])
+  @@map("chat_messages")
+}
+
+/// A document or image on a message: metadata here, bytes in the private
+/// documents bucket, joined by `fileKey`. Same division as EmailAttachment and
+/// ProjectDocument, for the reasons in db/schema/18_add_project_documents.sql.
+model ChatAttachment {
+  id        Int    @id @default(autoincrement())
+  messageId BigInt @map("message_id")
+
+  /// "chat/17/9f3c…b1.pdf", where 17 is the CONVERSATION. Unique, so one
+  /// uploaded object cannot become two attachments on a replayed send.
+  fileKey      String @unique @map("file_key") @db.VarChar(512)
+  originalName String @map("original_name") @db.VarChar(255)
+  mimeType     String @map("mime_type") @db.VarChar(150)
+  sizeBytes    BigInt @map("size_bytes")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  message ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@map("chat_attachments")
+}
+
+/// The two sections of the accounting manager's chat portal. OWNER and TEAMMATE
+/// are not separate values: the first section lists both together, and which one
+/// a person is belongs to the roster (companies.ownerUserId), not to the chat.
+enum ChatParticipantKind {
+  CUSTOMER
+  SPECIALIST
+
+  @@map("chat_participant_kind")
 }
