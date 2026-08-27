@@ -560,11 +560,11 @@ const config = {
      * spurious P2028 "unable to start a transaction" errors.
      */
     poolMax: parseInt(process.env.DB_POOL_MAX, 10) || 10,
-    connectTimeoutMs: parseInt(process.env.DB_CONNECT_TIMEOUT_MS, 10) || 15000,
+    connectTimeoutMs: parseInt(process.env.DB_CONNECT_TIMEOUT_MS, 10) || 10000,
     // maxWait: time allowed to acquire a connection for a transaction.
-    txMaxWaitMs: parseInt(process.env.DB_TX_MAX_WAIT_MS, 10) || 15000,
+    txMaxWaitMs: parseInt(process.env.DB_TX_MAX_WAIT_MS, 10) || 10000,
     // timeout: time allowed for the transaction body once it has started.
-    txTimeoutMs: parseInt(process.env.DB_TX_TIMEOUT_MS, 10) || 20000,
+    txTimeoutMs: parseInt(process.env.DB_TX_TIMEOUT_MS, 10) || 15000,
   },
 };
 
