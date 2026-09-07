@@ -856,3 +856,188 @@ describe('GET /tasks/:taskId', () => {
     expect(res.status).toBe(400);
   });
 });
+
+/* ========================= DELETE /tasks/:taskId =========================== */
+
+/**
+ * The rule this suite holds is the one that is easy to get wrong by copying:
+ * DELETE is NOT the write rule. A task's assigned specialist moves it through
+ * its states and cannot withdraw it; the manager and the person who FILED it
+ * can. Reusing assertTaskWriteAccess here would have quietly given the assignee
+ * a delete, and reusing the delete rule for a status change would have taken the
+ * assignee's own status write away — so both directions are pinned below.
+ */
+describe('DELETE /tasks/:taskId', () => {
+  beforeEach(() => {
+    mockPrisma.projectTask.findFirst.mockResolvedValue(taskAccessRow());
+    mockPrisma.projectTask.update.mockResolvedValue({ id: TASK_ID, deletedAt: new Date() });
+  });
+
+  it('soft deletes rather than removing the row (200)', async () => {
+    // The specialist here is also the task's creator — the fixture files it
+    // under BOOKKEEPER_ID — which is what puts them on the delete list.
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', specialistAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ id: TASK_ID, projectId: PROJECT_ID, deleted: true });
+
+    const call = mockPrisma.projectTask.update.mock.calls[0][0];
+    expect(call.where).toEqual({ id: TASK_ID });
+    // The row survives with a timestamp; there is no second half to this delete,
+    // because a task holds no bytes anywhere.
+    expect(call.data.deletedAt).toBeInstanceOf(Date);
+  });
+
+  it('refuses the company’s OWN accounting manager on someone else’s task (403)', async () => {
+    // They may file tasks here and move them; the fixture files this one under
+    // the specialist, so withdrawing it is not theirs. Creator-only, matching
+    // projects and documents.
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('TASK_DELETE_DENIED');
+    expect(mockPrisma.projectTask.update).not.toHaveBeenCalled();
+  });
+
+  it('lets that manager delete a task they filed themselves (200)', async () => {
+    mockPrisma.projectTask.findFirst.mockResolvedValue(
+      taskAccessRow({ createdByUserId: MANAGER_ID })
+    );
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(200);
+  });
+
+  it('refuses an accounting manager from a different company (403)', async () => {
+    mockPrisma.company.findFirst.mockResolvedValue(company({ accountingManagerUserId: 997 }));
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(403);
+    expect(mockPrisma.projectTask.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses the ASSIGNED specialist when someone else filed the task (403)', async () => {
+    // The asymmetry this endpoint exists to get right, and the one place the
+    // delete rule and the write rule give different answers for the same person:
+    // they may move this task to COMPLETED, and may not withdraw it.
+    mockPrisma.projectTask.findFirst.mockResolvedValue(
+      taskAccessRow({ createdByUserId: MANAGER_ID })
+    );
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', specialistAuth());
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('TASK_DELETE_DENIED');
+    expect(mockPrisma.projectTask.update).not.toHaveBeenCalled();
+  });
+
+  it('still lets that specialist move the same task’s status (200)', async () => {
+    // The other half of the pair above — proof the narrower delete rule did not
+    // leak into the write path.
+    mockPrisma.projectTask.findFirst.mockResolvedValue(
+      taskAccessRow({ createdByUserId: MANAGER_ID })
+    );
+    mockPrisma.projectTask.update.mockResolvedValue(taskRow({ status: 'ACTIVE' }));
+
+    const res = await request(app)
+      .patch(`/api/tasks/${TASK_ID}/status`)
+      .set('Authorization', specialistAuth())
+      .send({ status: 'ACTIVE' });
+
+    expect(res.status).toBe(200);
+  });
+
+  it('refuses a specialist who is not on this project at all (403)', async () => {
+    mockPrisma.company.findFirst.mockResolvedValue(
+      company({ bookkeepingSpecialistUserId: OTHER_SPECIALIST_ID })
+    );
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', otherSpecialistAuth());
+
+    expect(res.status).toBe(403);
+    expect(mockPrisma.projectTask.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses the customer who owns the account (403)', async () => {
+    // They may see the work and may open the project; how the firm breaks it
+    // down, and what it withdraws, is the firm's side of the account.
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(403);
+    expect(mockPrisma.projectTask.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses an admin (403)', async () => {
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', adminAuth());
+
+    // Refused a step earlier still, by the read rule: access here follows from
+    // being on the company, not from rank.
+    expect(res.status).toBe(403);
+    expect(mockPrisma.projectTask.update).not.toHaveBeenCalled();
+  });
+
+  it('404s a missing task (404)', async () => {
+    mockPrisma.projectTask.findFirst.mockResolvedValue(null);
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', specialistAuth());
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('TASK_NOT_FOUND');
+  });
+
+  it('404s a task whose project has since been soft-deleted (404)', async () => {
+    mockPrisma.projectTask.findFirst.mockResolvedValue(
+      taskAccessRow({
+        project: { ...taskAccessRow().project, deletedAt: new Date('2026-08-05T00:00:00Z') },
+      })
+    );
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', specialistAuth());
+
+    // The project delete already marked its tasks; there is nothing left to do
+    // here, and it must not be reachable through a door the lists have closed.
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('PROJECT_NOT_FOUND');
+    expect(mockPrisma.projectTask.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-numeric id (400)', async () => {
+    const res = await request(app)
+      .delete('/api/tasks/abc')
+      .set('Authorization', specialistAuth());
+
+    expect(res.status).toBe(400);
+  });
+
+  it('deletes a COMPLETED task — finished is not the same as correctly filed (200)', async () => {
+    mockPrisma.projectTask.findFirst.mockResolvedValue(taskAccessRow({ status: 'COMPLETED' }));
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', specialistAuth());
+
+    expect(res.status).toBe(200);
+  });
+});

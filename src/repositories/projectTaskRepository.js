@@ -300,6 +300,55 @@ function reassignOpenTaskSpecialist(client, { projectId, specialistUserId }) {
   });
 }
 
+/**
+ * Soft delete one task, matching projects and documents.
+ *
+ * The ROW survives with `deleted_at` set rather than being removed, because a
+ * task is a record of what the firm planned to do on an account and the history
+ * of who withdrew a step is worth the few hundred bytes it costs. There is no
+ * second half to this the way there is for a document — a task holds no bytes
+ * anywhere, so marking the row IS the whole delete.
+ */
+function softDeleteTask(client, taskId, deletedAt) {
+  return client.projectTask.update({
+    where: { id: taskId },
+    data: { deletedAt },
+    select: { id: true, deletedAt: true },
+  });
+}
+
+/**
+ * Soft delete every live task on a project, in one statement.
+ *
+ * Called from the project delete. The tasks were already unreachable once their
+ * project went — both list queries filter `project: { deletedAt: null }`, and
+ * every single-task path refuses on a deleted project — but unreachable is not
+ * deleted: the rows stayed live, so any query that forgot the join would show
+ * work belonging to a project that no longer exists.
+ *
+ * `updateMany` for the same reasons as reassignOpenTaskSpecialist below: one
+ * round trip instead of one per task while a write lock is held, and the rows
+ * are named by a predicate rather than by ids nobody needs to see. It also makes
+ * the cascade atomic with the project row.
+ *
+ * `deletedAt: null` in the filter is not redundant — it stops a task deleted
+ * last month having its timestamp rewritten to the moment the PROJECT went,
+ * which would lose the record of when that task was actually withdrawn.
+ *
+ * COMPLETED TASKS ARE INCLUDED HERE, unlike in the staffing sweep. That sweep
+ * skips them to avoid rewriting who did finished work; this one is not rewriting
+ * history, it is closing the whole project down, and leaving the finished tasks
+ * live would leave exactly the rows a report is most likely to pick up.
+ *
+ * @returns {Promise<{ count: number }>} how many tasks were marked
+ */
+function softDeleteTasksForProject(client, projectId, deletedAt) {
+  return client.projectTask.updateMany({
+    where: { projectId, deletedAt: null },
+    data: { deletedAt },
+  });
+}
+
 module.exports = {
   TASK_SELECT,
   TASK_ACCESS_SELECT,
@@ -314,5 +363,7 @@ module.exports = {
   countTasksAfter,
   createTask,
   updateTask,
+  softDeleteTask,
+  softDeleteTasksForProject,
   reassignOpenTaskSpecialist,
 };

@@ -286,6 +286,43 @@ function softDeleteDocument(client, documentId, deletedAt) {
   });
 }
 
+/**
+ * Every LIVE document on a project, with the storage key its bytes sit under.
+ *
+ * Read by the project delete, which cannot remove the objects after it has
+ * marked the rows: `deletedAt: null` is on this query too, so a moment later
+ * there is nothing left here to tell it what to remove. `fileKey` is otherwise
+ * kept out of every select in this file (see DOCUMENT_SELECT) — it is an
+ * internal path and never leaves the server, which is still true here.
+ */
+function listLiveDocumentKeysForProject(client, projectId) {
+  return client.projectDocument.findMany({
+    where: { projectId, deletedAt: null },
+    select: { id: true, fileKey: true },
+  });
+}
+
+/**
+ * Soft delete every live document on a project, in one statement.
+ *
+ * WHY updateMany RATHER THAN A LOOP. This runs inside the project-delete
+ * transaction, and a project with forty attachments would otherwise be forty
+ * round trips holding a write lock. It also makes the cascade atomic with the
+ * project row: either the project and all of its documents are marked, or none
+ * of them are, so there is no state where a deleted project still has live
+ * documents hanging off it.
+ *
+ * `deletedAt: null` in the filter is not redundant — it stops an already-deleted
+ * document having its timestamp rewritten to the moment the PROJECT went, which
+ * would lose the record of when the file itself was actually removed.
+ */
+function softDeleteDocumentsForProject(client, projectId, deletedAt) {
+  return client.projectDocument.updateMany({
+    where: { projectId, deletedAt: null },
+    data: { deletedAt },
+  });
+}
+
 module.exports = {
   DOCUMENT_SELECT,
   listDocuments,
@@ -298,5 +335,7 @@ module.exports = {
   findDocumentForAccess,
   findDocumentDetail,
   findDocumentsByKeys,
+  listLiveDocumentKeysForProject,
   softDeleteDocument,
+  softDeleteDocumentsForProject,
 };

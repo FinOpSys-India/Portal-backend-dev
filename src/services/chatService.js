@@ -957,8 +957,24 @@ async function markRead({ userId, requestId, conversationId, upToMessageId }) {
  * not make the other person's words yours to remove. An accounting manager is
  * not exempt — they hold the account, not the transcript.
  *
- * Soft, so the row and the bytes survive a mis-click, and idempotent, so a
- * double click is a no-op rather than a 404 on the second one.
+ * The same rule the other three deletes in this API apply — projects, project
+ * documents and tasks are each removable by their creator alone. Whoever made a
+ * thing is the only person who may unmake it, whichever noun it is, so nobody
+ * has to remember which feature has which exception.
+ *
+ * SOFT FOR THE MESSAGE, HARD FOR THE FILES. The row and its body survive a
+ * mis-click and can be brought back by clearing `deleted_at`; the attached
+ * objects cannot, because they are deleted from the bucket here. A file sent to
+ * the wrong thread is the thing a user is actually trying to take back, and
+ * leaving the bytes in storage while hiding the message would make "deleted" a
+ * statement about the UI rather than about the data.
+ *
+ * The attachment ROWS are kept — name, type, size, created_at — with `file_key`
+ * nulled. That is the record of what was sent, which the audit needs and which
+ * lets the thread render a tombstone; see 23_chat_attachment_file_purge.sql.
+ *
+ * Idempotent: a double click is a no-op rather than a 404 on the second one, and
+ * the purge runs only for the call that actually performed the delete.
  */
 async function deleteMessage({ userId, requestId, messageId }) {
   const caller = await loadCaller(userId);
@@ -976,7 +992,31 @@ async function deleteMessage({ userId, requestId, messageId }) {
     });
   }
 
-  await repo.softDeleteMessage(prisma, { id: message.id, deletedAt: new Date() });
+  const result = await repo.softDeleteMessage(prisma, { id: message.id, deletedAt: new Date() });
+
+  /*
+   * PURGE THE BYTES — only on the call that won.
+   *
+   * `count === 0` means the message was already deleted (a second click, a
+   * retried request, a concurrent call), so its files are already gone and the
+   * work below would be a bucket round-trip for nothing.
+   *
+   * Order matters: read the keys, remove the objects, THEN null the column.
+   * `file_key` is the only record of what to remove, so clearing it first would
+   * strand an object that nothing can name again. The reverse leaves an orphan
+   * if the process dies mid-way, which costs storage rather than secrecy — and
+   * `removeObjects` never throws, so a bucket that is down cannot turn a
+   * completed delete into a 500 for the user.
+   */
+  let purgedCount = 0;
+  if (result.count > 0) {
+    const attachments = await repo.findAttachmentKeys(prisma, message.id);
+    if (attachments.length) {
+      await discardStoredObjects(attachments.map((row) => row.fileKey), requestId);
+      const cleared = await repo.clearAttachmentKeys(prisma, message.id);
+      purgedCount = cleared.count;
+    }
+  }
 
   logEvent({
     event: 'chat.message.deleted',
@@ -984,10 +1024,15 @@ async function deleteMessage({ userId, requestId, messageId }) {
     requestId,
     userId,
     companyId: message.conversation.companyId,
-    detail: `conversation ${message.conversation.id}`,
+    detail: `conversation ${message.conversation.id}, ${purgedCount} file(s) purged`,
   });
 
-  return { id: dto.toNumber(message.id), conversationId: message.conversationId, deleted: true };
+  return {
+    id: dto.toNumber(message.id),
+    conversationId: message.conversationId,
+    deleted: true,
+    attachmentsPurged: purgedCount,
+  };
 }
 
 /**
@@ -1119,10 +1164,14 @@ async function createDownloadLink({ userId, requestId, attachmentId }) {
   // conversation must not learn from a different error that the file exists.
   assertParticipant(caller, attachment.message.conversation);
 
-  // A deleted message's files are not reachable, even though the row and the
-  // bytes both survive. Recoverability is for whoever restores the message, not
-  // for a link that outlives it.
+  // A deleted message's files are not reachable. Recoverability is for whoever
+  // restores the message, not for a link that outlives it.
   if (attachment.message.deletedAt) throw attachmentNotFound();
+
+  // The same row after the purge: metadata kept, key nulled, bytes gone. This is
+  // unreachable while the check above stands — it is here because the two facts
+  // are now stored separately, and only this one is about the file existing.
+  if (!attachment.fileKey) throw attachmentNotFound();
 
   const url = await storage.signedUrl({
     bucket: BUCKET,

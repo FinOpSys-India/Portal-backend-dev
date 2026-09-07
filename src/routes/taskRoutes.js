@@ -9,15 +9,17 @@ const {
   getTask,
   createTask,
   updateTaskStatus,
+  deleteTask,
 } = require('../controllers/projectTaskController');
 
 /*
  * Tasks — the pieces of work filed under a project.
  *
- *   GET   /tasks?companyId=42        -> every task on a company, across projects
- *   GET   /tasks/:taskId             -> one task
- *   POST  /tasks                     -> file one (the project's specialist only)
- *   PATCH /tasks/:taskId/status      -> move it through TODO/ACTIVE/COMPLETED
+ *   GET    /tasks?companyId=42       -> every task on a company, across projects
+ *   GET    /tasks/:taskId            -> one task
+ *   POST   /tasks                    -> file one (the project's specialist only)
+ *   PATCH  /tasks/:taskId/status     -> move it through TODO/ACTIVE/COMPLETED
+ *   DELETE /tasks/:taskId            -> soft delete
  *
  * The per-project list lives on the project instead — GET /projects/:projectId/
  * tasks — exactly as the documents feature splits: reads that span a company are
@@ -30,14 +32,18 @@ const {
  * where the project is a dropdown. `companyId` may be sent alongside it and is
  * checked against the project, never used in its place.
  *
- * WHO MAY DO WHAT — two different answers, and the service decides both against
- * the database, because both are per-record:
+ * WHO MAY DO WHAT — three different answers, and the service decides all three
+ * against the database, because every one of them is per-record:
  *
  *   read    anyone on the company: its owner, a teammate, the accounting
  *           manager, or a specialist working the account. Same rule as projects.
  *   write   the company's OWN accounting manager, or the project's ASSIGNED
  *           specialist. Not the customer who opened the project, not a teammate,
  *           not another specialist on the same company.
+ *   delete  narrower than write, mirroring projects: the company's OWN
+ *           accounting manager, or whoever FILED the task. The assignee moves a
+ *           task through its states; withdrawing one from the plan is the
+ *           account's decision, not the person doing it.
  *
  * NO ADMIN, on any route here. Tasks are the client's working material and the
  * firm's plan for it; access follows from being on the company rather than from
@@ -71,5 +77,11 @@ router.post('/', projectLimiter, createTask);
  */
 router.get('/:taskId', getTask);
 router.patch('/:taskId/status', projectLimiter, updateTaskStatus);
+/*
+ * Soft, and with no bytes to chase — a task holds nothing but its own row. It
+ * exists because a status was the only write a task had, so a mistake could only
+ * be "completed", which records work as finished that was never done.
+ */
+router.delete('/:taskId', projectLimiter, deleteTask);
 
 module.exports = router;

@@ -130,10 +130,28 @@ const updateTaskStatus = asyncHandler(async (req, res) => {
   });
 });
 
+/** DELETE /tasks/:taskId — withdraw a task from the plan. Soft; see the service. */
+const deleteTask = asyncHandler(async (req, res) => {
+  const taskId = common.parseId(req.params.taskId, 'taskId');
+
+  const data = await taskService.deleteTask({
+    userId: req.user.id,
+    requestId: req.id,
+    taskId,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Task deleted.',
+    data,
+  });
+});
+
 module.exports = {
   listCompanyTasks,
   listProjectTasks,
   getTask,
   createTask,
   updateTaskStatus,
+  deleteTask,
 };

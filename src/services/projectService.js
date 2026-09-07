@@ -1,11 +1,14 @@
 'use strict';
 
 const { prisma } = require('../config/prisma');
+const config = require('../config');
 const repo = require('../repositories/projectRepository');
 const taskRepo = require('../repositories/projectTaskRepository');
 const companyRepo = require('../repositories/companyRepository');
+const documentRepo = require('../repositories/projectDocumentRepository');
 const catalog = require('../config/serviceCatalog');
 const dto = require('../dto/projectDto');
+const storage = require('../utils/storage');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { logEvent } = require('../utils/auditLog');
@@ -61,6 +64,20 @@ function projectNotFound() {
 function projectAccessDenied() {
   return new ApiError(403, 'You do not have permission to perform this action.', {
     code: 'PROJECT_ACCESS_DENIED',
+  });
+}
+
+/**
+ * The 403 for a DELETE, which is refused by a stricter rule than a write and so
+ * has to say a different thing.
+ *
+ * The generic "you do not have permission" above leaves an accounting manager —
+ * who can edit this very project — with no idea why the delete alone was
+ * refused. Naming the rule is what stops that becoming a bug report.
+ */
+function notTheCreator() {
+  return new ApiError(403, 'Only the person who created this project can delete it.', {
+    code: 'PROJECT_DELETE_DENIED',
   });
 }
 
@@ -181,14 +198,35 @@ function assertWriteAccess(caller, company, project) {
 }
 
 /**
- * DELETE access: narrower than write. A specialist may finish a project; making
- * it disappear from the customer's list is the account's decision, not the
- * assignee's.
+ * DELETE access: THE CREATOR, AND NOBODY ELSE.
+ *
+ * The narrowest rule in this file, and the same one the documents and tasks
+ * features apply to their own deletes — whoever made a thing is the only person
+ * who may unmake it. One rule across all three, so nobody has to remember which
+ * noun has which exception.
+ *
+ * The accounting manager is deliberately NOT here, though they may write the
+ * project and once could delete it. Running the account is authority over what
+ * happens to the work, not over whether the record of it exists; a customer who
+ * opened a project should not find it gone because someone else tidied up.
+ *
+ * The assigned specialist is not here either, for the reason that was always
+ * true: they finish the work, they do not decide it never happened.
+ *
+ * WHAT THIS COSTS, stated plainly because it is a real cost — a project whose
+ * creator has left the company or been deactivated can no longer be deleted by
+ * anyone through this API. That is the deliberate trade: a record that outlives
+ * the people who can remove it, rather than one that can disappear on someone
+ * else's judgment. Removing it then is a database operation, not a request.
+ *
+ * `company` is still a parameter, unused, because every assert in this file
+ * takes the same three and a caller should not have to check which of them this
+ * one happens to read.
  */
+// eslint-disable-next-line no-unused-vars
 function assertDeleteAccess(caller, company, project) {
-  if (company.accountingManagerUserId === caller.id) return;
   if (project.createdByUserId === caller.id) return;
-  throw projectAccessDenied();
+  throw notTheCreator();
 }
 
 /**
@@ -762,23 +800,117 @@ async function updateProject({ userId, requestId, projectId, input }) {
  * a project is a record of work that was requested, and losing it would take
  * the reason for a past charge with it.
  */
+/* -------------------------------------------------------------------------- */
+/* the documents a deleted project takes with it                              */
+/* -------------------------------------------------------------------------- */
+
+const DOCUMENTS_BUCKET = config.storage.documentsBucket;
+
+/*
+ * Supabase takes one list per remove() call. A project with hundreds of
+ * attachments would otherwise send every key in a single request body, which is
+ * the kind of payload a gateway truncates — and a truncated list fails silently
+ * as "some of the files are still there".
+ */
+const REMOVE_BATCH_SIZE = 100;
+
+/**
+ * Delete the stored objects a project's documents pointed at.
+ *
+ * Best effort, exactly like the single-document delete: `storage.removeObjects`
+ * swallows and logs rather than throwing, because the rows are already marked
+ * and committed by the time this runs. Failing the caller's request over a
+ * leftover object would report a completed delete as an error, and their retry
+ * would find nothing left to delete.
+ */
+async function discardProjectDocumentObjects(keys, requestId) {
+  for (let i = 0; i < keys.length; i += REMOVE_BATCH_SIZE) {
+    // Sequential on purpose: this is cleanup on a delete, not a request the user
+    // is waiting on, and firing every batch at the bucket at once is how a
+    // hundred-file project turns into a rate-limit error.
+    // eslint-disable-next-line no-await-in-loop
+    await storage.removeObjects({
+      bucket: DOCUMENTS_BUCKET,
+      keys: keys.slice(i, i + REMOVE_BATCH_SIZE),
+      requestId,
+    });
+  }
+}
+
 async function deleteProject({ userId, requestId, projectId }) {
   const caller = await loadCaller(userId);
 
-  const companyId = await prisma.$transaction(async (tx) => {
+  /*
+   * THE PROJECT'S DOCUMENTS AND TASKS GO WITH IT — rows for both, bytes for the
+   * documents.
+   *
+   * They used to go neither way. Deleting a project hid its attachments (every
+   * document read joins `project: { deletedAt: null }`, and deleteDocument
+   * refuses once the parent is gone) but left their rows live and their objects
+   * in the bucket, with no route left that could reach either. A project with
+   * twenty scans on it was twenty files paid for forever, invisible to the one
+   * person who might have removed them.
+   *
+   * Hiding is not deleting, and the fix is to make the cascade explicit rather
+   * than rely on the join: the rows carry their own `deleted_at` so a later
+   * query cannot resurrect them by forgetting the join, and the bytes are
+   * dropped for the same reason deleteDocument drops them — storage is the
+   * expensive half and the half nobody can see.
+   *
+   * The keys are read INSIDE the transaction and BEFORE the update, because the
+   * update makes them unreadable: `listLiveDocumentKeysForProject` filters on
+   * `deletedAt: null` like every other read in that file, so asking afterwards
+   * returns an empty list and the bytes stay behind — the exact bug being fixed.
+   *
+   * THE TASKS GO THE SAME WAY, and cost nothing to take: a task holds no bytes
+   * anywhere, so marking its row is the whole delete. They were hidden already —
+   * both task lists filter `project: { deletedAt: null }` — but hidden is not
+   * deleted, and a live task under a dead project is a row any query that forgets
+   * the join will happily report.
+   */
+  const { companyId, fileKeys, documentCount, taskCount } = await prisma.$transaction(async (tx) => {
     const project = await repo.findProjectForAccess(tx, projectId);
     if (!project) throw projectNotFound();
 
     const company = await loadCompany(tx, project.companyId);
     assertDeleteAccess(caller, company, project);
 
-    await repo.softDeleteProject(tx, projectId, new Date());
-    return company.id;
+    const documents = await documentRepo.listLiveDocumentKeysForProject(tx, projectId);
+    // One timestamp for the project, every document and every task on it, so the
+    // audit trail reads as the single action it was rather than a scatter of
+    // milliseconds.
+    const deletedAt = new Date();
+
+    await documentRepo.softDeleteDocumentsForProject(tx, projectId, deletedAt);
+    const tasks = await taskRepo.softDeleteTasksForProject(tx, projectId, deletedAt);
+    await repo.softDeleteProject(tx, projectId, deletedAt);
+
+    return {
+      companyId: company.id,
+      fileKeys: documents.map((d) => d.fileKey).filter(Boolean),
+      documentCount: documents.length,
+      taskCount: tasks.count,
+    };
   });
 
-  logEvent({ event: 'project.deleted', status: 'success', requestId, userId, companyId, projectId });
+  /*
+   * ONLY AFTER THE COMMIT. Removing objects inside the transaction would destroy
+   * files that a rollback then decides were never deleted — the one failure the
+   * ordering has to rule out, since a row can be restored and bytes cannot.
+   */
+  await discardProjectDocumentObjects(fileKeys, requestId);
 
-  return { id: projectId, deleted: true };
+  logEvent({
+    event: 'project.deleted',
+    status: 'success',
+    requestId,
+    userId,
+    companyId,
+    projectId,
+    detail: `with ${documentCount} document(s) and ${taskCount} task(s)`,
+  });
+
+  return { id: projectId, deleted: true, documentsDeleted: documentCount, tasksDeleted: taskCount };
 }
 
 /**

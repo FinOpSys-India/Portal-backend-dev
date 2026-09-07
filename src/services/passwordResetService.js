@@ -15,8 +15,8 @@ const { sendPasswordResetOtpEmail, sendPasswordChangedEmail } = require('./email
  * Forgotten-password flow, in three requests:
  *
  *   1. request  — POST /auth/password-reset          { email }
- *      Look the address up. If it belongs to an active account, mint a
- *      PASSWORD_RESET_EMAIL_OTP challenge and email the code.
+ *      Look the address up. Unknown address → 404 EMAIL_NOT_REGISTERED. Active
+ *      account → mint a PASSWORD_RESET_EMAIL_OTP challenge and email the code.
  *
  *   2. verify   — POST /auth/password-reset/otp      { action: 'verify', challengeId, otp }
  *      Check the code. On success consume the challenge and mint a single-use,
@@ -51,25 +51,22 @@ function canResetPassword(user) {
  * Step one. Send a reset code to the address, if it belongs to an account that
  * can use one.
  *
- * The response is identical whether or not the email is registered: same status,
- * same body shape, same challenge id (a throwaway one for the miss). That is the
- * point — a forgotten-password endpoint is unauthenticated and takes an
- * arbitrary address, so any observable difference between hit and miss turns it
- * into a free "does this person have an account here?" oracle. The same reasoning
- * already governs login, which answers INVALID_CREDENTIALS to an unknown email
- * and a wrong password alike.
+ * An address with no row in `users` is answered with 404 EMAIL_NOT_REGISTERED, by
+ * product decision: the reset screen tells the user the address is unknown rather
+ * than implying a code went out. Understand what that costs — this endpoint is
+ * unauthenticated and takes an arbitrary address, so a distinguishable miss makes
+ * it a "does this person have an account here?" oracle. Login still closes that
+ * door (INVALID_CREDENTIALS covers an unknown email and a wrong password alike),
+ * so the oracle lives here alone, and passwordResetLimiter on the route is the
+ * only thing keeping it from being swept at scale.
  *
- * The consequence to keep in mind when reading the code below: this function must
- * not throw on any account-specific condition. A 404 for an unknown address, or a
- * 503 when the mail fails to send, would each re-open the oracle by making the
- * miss distinguishable — so a delivery failure is logged and recorded on the
- * challenge, not raised.
+ * Everything past that check still refuses to distinguish. An address that has an
+ * account but cannot reset — INVITED has no password yet, HIBERNATED is out of
+ * service — gets the silent decoy rather than a status-specific error, and a mail
+ * delivery failure is logged and recorded on the challenge rather than raised, so
+ * an SMTP outage never reads back as "no such account".
  *
- * RESIDUAL, accepted: the hit path does database writes and an SMTP round trip
- * that the miss path does not, so the two differ in latency. Closing that
- * properly means making the response independent of delivery — the transactional
- * outbox already noted in authService.deliverOtp — rather than padding with a
- * sleep, which only adds a second signal to measure.
+ * @throws {ApiError} 404 EMAIL_NOT_REGISTERED when the address has no account.
  *
  * @param {{ email: string, context?: { ip?: string, userAgent?: string } }} params
  * @returns {{ challengeId: string, maskedEmail: string, expiresInSeconds: number,
@@ -83,13 +80,23 @@ async function requestPasswordReset({ email, context = {} }) {
     select: { id: true, email: true, firstName: true, status: true },
   });
 
+  // An address with no row in `users` is refused outright: the product asks for
+  // "that email is not registered" on the screen rather than the neutral
+  // acknowledgement. See the enumeration note above the function — this is the
+  // accepted cost of that choice.
+  if (!user) {
+    logger.warn(`Password reset refused for ${maskEmail(email)} (no such account).`);
+    throw new ApiError(404, 'No account is registered with that email address.', {
+      code: 'EMAIL_NOT_REGISTERED',
+      fields: { email: 'We could not find an account with this email address.' },
+    });
+  }
+
+  // A row exists but cannot reset — an INVITED user has no password yet, a
+  // HIBERNATED one is out of service. "Not registered" would be false for these,
+  // so they keep the silent decoy.
   if (!canResetPassword(user)) {
-    // Logged so the miss is visible to us, at a level that makes a burst of them
-    // stand out — the caller learns nothing.
-    logger.warn(
-      `Password reset ignored for ${maskEmail(email)} ` +
-        `(${user ? `status=${user.status}` : 'no such account'}).`
-    );
+    logger.warn(`Password reset ignored for ${maskEmail(email)} (status=${user.status}).`);
     return decoyChallenge(email);
   }
 
@@ -142,14 +149,16 @@ async function requestPasswordReset({ email, context = {} }) {
 }
 
 /**
- * The response returned for an address that has no resettable account: a random
- * challenge id that was never stored, and the submitted address masked by the
- * same function used on a real one. Nothing is written and nothing is sent.
+ * The response returned for an address whose account exists but cannot reset
+ * (INVITED, HIBERNATED): a random challenge id that was never stored, and the
+ * submitted address masked by the same function used on a real one. Nothing is
+ * written and nothing is sent.
  *
  * Presenting the caller with an id that verifies against nothing is the intended
- * behaviour — someone probing an unregistered address gets the OTP screen, enters
- * a code, and is told the request is no longer active, which is exactly what they
- * would see after letting a real challenge lapse.
+ * behaviour — probing one of these addresses gets the OTP screen, enters a code,
+ * and is told the request is no longer active, which is exactly what a real
+ * challenge left to lapse would give. That keeps account STATUS private even
+ * though existence is now disclosed by the 404 above.
  */
 function decoyChallenge(email) {
   return {
@@ -163,11 +172,13 @@ function decoyChallenge(email) {
 /**
  * Send the reset OTP and record the outcome on the challenge.
  *
- * `throwOnFailure` is false for the initial request (see requestPasswordReset:
- * raising there would leak whether the account exists) and true for a resend,
- * where the caller already holds a real challenge id — the account's existence
- * is not in question by then, so a mail outage may as well be reported honestly.
- * Either way the provider's own error is logged internally and never returned.
+ * `throwOnFailure` is false for the initial request and true for a resend. On the
+ * initial request the account has already been confirmed to exist, so the reason
+ * to swallow is no longer enumeration: it is that a 503 there would strand a
+ * caller who holds a live challenge and can simply resend. By the resend the
+ * caller already holds a real challenge id, so a mail outage may as well be
+ * reported honestly. Either way the provider's own error is logged internally and
+ * never returned.
  */
 async function deliverResetOtp(
   challengeId,
