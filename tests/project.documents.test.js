@@ -30,14 +30,22 @@ const mockPrisma = {
   company: { findFirst: jest.fn() },
   companyMember: { findFirst: jest.fn() },
   companySpecialistAssignment: { findFirst: jest.fn() },
-  project: { findFirst: jest.fn() },
+  // `update` is the soft delete — DELETE /projects/:id, whose document cascade
+  // is the subject of the last suite in this file.
+  project: { findFirst: jest.fn(), update: jest.fn() },
   projectDocument: {
     createManyAndReturn: jest.fn(),
     findMany: jest.fn(),
     findFirst: jest.fn(),
     aggregate: jest.fn(),
     update: jest.fn(),
+    // Deleting a PROJECT marks every document on it in one statement — see the
+    // cascade suite at the bottom of this file.
+    updateMany: jest.fn(),
   },
+  // The same delete takes the project's tasks with it. They hold no bytes, so
+  // the cascade for them is the one statement and nothing else.
+  projectTask: { updateMany: jest.fn() },
   $transaction: jest.fn(async (cb) => cb(mockPrisma)),
 };
 
@@ -892,7 +900,7 @@ describe('DELETE /projects/:projectId/documents/:documentId', () => {
     mockPrisma.user.findUnique.mockResolvedValue(person(TEAMMATE_ID));
     mockPrisma.project.findFirst.mockResolvedValue(project());
     mockPrisma.company.findFirst.mockResolvedValue(company());
-    // Read access comes from company_members; write access does not.
+    // Read access comes from company_members; the delete rule does not.
     mockPrisma.companyMember.findFirst.mockResolvedValue({ id: 1 });
     mockPrisma.projectDocument.findFirst.mockResolvedValue(withProject());
 
@@ -901,7 +909,46 @@ describe('DELETE /projects/:projectId/documents/:documentId', () => {
       .set('Authorization', auth({ userId: TEAMMATE_ID }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error.code).toBe('PROJECT_ACCESS_DENIED');
+    expect(res.body.error.code).toBe('DOCUMENT_DELETE_DENIED');
+    expect(mockPrisma.projectDocument.update).not.toHaveBeenCalled();
+  });
+
+  /*
+   * THE UPLOADER-ONLY RULE, from the two sides most likely to be assumed
+   * otherwise. Both of these people have write access to the project and could
+   * delete someone else's file before; neither can now. This delete destroys the
+   * bytes for good, so it belongs to the one person who knows the file was
+   * theirs to remove.
+   */
+  it('refuses the accounting manager on a file they did not upload (403)', async () => {
+    const MANAGER_ID = 55; // company().accountingManagerUserId
+    mockPrisma.user.findUnique.mockResolvedValue(person(MANAGER_ID, 'ACCOUNTING_MANAGER', null));
+    mockPrisma.project.findFirst.mockResolvedValue(project());
+    mockPrisma.company.findFirst.mockResolvedValue(company());
+    mockPrisma.projectDocument.findFirst.mockResolvedValue(withProject());
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}`)
+      .set('Authorization', auth({ userId: MANAGER_ID, role: 'ACCOUNTING_MANAGER', specificRole: null }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('DOCUMENT_DELETE_DENIED');
+    expect(mockPrisma.projectDocument.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses the assigned specialist on a file they did not upload (403)', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(person(SPECIALIST_ID, 'SPECIALIST', null));
+    mockPrisma.project.findFirst.mockResolvedValue(project());
+    mockPrisma.company.findFirst.mockResolvedValue(company());
+    mockPrisma.projectDocument.findFirst.mockResolvedValue(withProject());
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}/documents/${DOCUMENT_ID}`)
+      .set('Authorization', auth({ userId: SPECIALIST_ID, role: 'SPECIALIST', specificRole: null }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('DOCUMENT_DELETE_DENIED');
+    // They keep every read: the rule takes away the destroy, not the access.
     expect(mockPrisma.projectDocument.update).not.toHaveBeenCalled();
   });
 
@@ -921,5 +968,154 @@ describe('DELETE /projects/:projectId/documents/:documentId', () => {
       .set('Authorization', auth({ userId: TEAMMATE_ID }));
 
     expect(res.status).toBe(200);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* the cascade: deleting the project takes its documents with it              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * DELETE /projects/:projectId is a project endpoint, and it is tested here
+ * rather than in projects.test.js because what it has to get right is entirely
+ * about documents.
+ *
+ * THE BUG THIS SUITE PINS DOWN. A deleted project used to leave its attachments
+ * live in the table and their objects in the bucket. Nothing could reach them —
+ * every document read joins `project: { deletedAt: null }`, and deleting one
+ * individually refuses once the parent is gone — so the files were invisible,
+ * undeletable, and still paid for. Invisible is not deleted.
+ */
+describe('DELETE /projects/:projectId — what it takes with it', () => {
+  function stageDocuments(keys, taskCount = 0) {
+    stageOwnerOnLiveProject();
+    mockPrisma.projectDocument.findMany.mockResolvedValue(
+      keys.map((fileKey, i) => ({ id: i + 1, fileKey }))
+    );
+    mockPrisma.projectDocument.updateMany.mockResolvedValue({ count: keys.length });
+    mockPrisma.projectTask.updateMany.mockResolvedValue({ count: taskCount });
+    mockPrisma.project.update.mockResolvedValue({ id: PROJECT_ID, deletedAt: new Date() });
+  }
+
+  it('soft deletes every document and task on the project, with one timestamp', async () => {
+    stageDocuments([`projects/${PROJECT_ID}/a.pdf`, `projects/${PROJECT_ID}/b.pdf`], 3);
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.documentsDeleted).toBe(2);
+    expect(res.body.data.tasksDeleted).toBe(3);
+
+    const docs = mockPrisma.projectDocument.updateMany.mock.calls[0][0];
+    const tasks = mockPrisma.projectTask.updateMany.mock.calls[0][0];
+    // Only the live ones, on both: an already-deleted row keeps the timestamp
+    // that records when IT went, not when the project did.
+    expect(docs.where).toEqual({ projectId: PROJECT_ID, deletedAt: null });
+    expect(tasks.where).toEqual({ projectId: PROJECT_ID, deletedAt: null });
+
+    // One action, one timestamp, across the project and everything under it.
+    const projectUpdate = mockPrisma.project.update.mock.calls[0][0];
+    expect(docs.data.deletedAt).toEqual(projectUpdate.data.deletedAt);
+    expect(tasks.data.deletedAt).toEqual(projectUpdate.data.deletedAt);
+  });
+
+  it('marks the tasks even on a project that has no documents', async () => {
+    // The two cascades are independent — a project can easily have a plan and no
+    // files, and the task half must not ride on the document half running.
+    stageDocuments([], 4);
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.tasksDeleted).toBe(4);
+    expect(mockPrisma.projectTask.updateMany).toHaveBeenCalled();
+  });
+
+  it('removes the stored files, so a deleted project stops costing storage', async () => {
+    const keys = [`projects/${PROJECT_ID}/scan-1.pdf`, `projects/${PROJECT_ID}/scan-2.pdf`];
+    const paths = keys.map((k) => path.join(DOCUMENTS_DIR, k));
+    paths.forEach((abs) => {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, 'twenty megabytes, pretend');
+    });
+
+    stageDocuments(keys);
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    // The bytes are the half nobody can see and the half that costs money. This
+    // is the assertion the whole cascade exists for.
+    paths.forEach((abs) => expect(fs.existsSync(abs)).toBe(false));
+  });
+
+  it('reads the keys before marking the rows', async () => {
+    // `listLiveDocumentKeysForProject` filters `deletedAt: null` like every other
+    // read in that repository, so asking AFTER the updateMany returns nothing and
+    // the objects stay behind — the original bug, in miniature.
+    stageDocuments([`projects/${PROJECT_ID}/a.pdf`]);
+
+    await request(app).delete(`/api/projects/${PROJECT_ID}`).set('Authorization', ownerAuth());
+
+    const readAt = mockPrisma.projectDocument.findMany.mock.invocationCallOrder[0];
+    const markedAt = mockPrisma.projectDocument.updateMany.mock.invocationCallOrder[0];
+    expect(readAt).toBeLessThan(markedAt);
+  });
+
+  it('deletes a project with no documents without touching storage', async () => {
+    stageDocuments([]);
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.deleted).toBe(true);
+    expect(res.body.data.documentsDeleted).toBe(0);
+  });
+
+  it('refuses the accounting manager - the creator alone deletes (403)', async () => {
+    const MANAGER_ID = 55; // company().accountingManagerUserId
+    stageDocuments([`projects/${PROJECT_ID}/a.pdf`], 2);
+    mockPrisma.user.findUnique.mockResolvedValue(person(MANAGER_ID, 'ACCOUNTING_MANAGER', null));
+    // The project was opened by the owner, not by them.
+    mockPrisma.project.findFirst.mockResolvedValue(project({ createdByUserId: OWNER_ID }));
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', auth({ userId: MANAGER_ID, role: 'ACCOUNTING_MANAGER', specificRole: null }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('PROJECT_DELETE_DENIED');
+    expect(mockPrisma.projectDocument.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.projectTask.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('leaves the files alone when the delete is refused', async () => {
+    // A specialist may finish a project; making it disappear is the creator's
+    // call. The refusal must happen before anything is removed.
+    const fileKey = `projects/${PROJECT_ID}/keepme.pdf`;
+    const abs = path.join(DOCUMENTS_DIR, fileKey);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, 'still needed');
+
+    mockPrisma.user.findUnique.mockResolvedValue(person(SPECIALIST_ID, 'SPECIALIST', null));
+    mockPrisma.project.findFirst.mockResolvedValue(project({ createdByUserId: OWNER_ID }));
+    mockPrisma.company.findFirst.mockResolvedValue(company());
+
+    const res = await request(app)
+      .delete(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', auth({ userId: SPECIALIST_ID, role: 'SPECIALIST', specificRole: null }));
+
+    expect(res.status).toBe(403);
+    expect(mockPrisma.projectDocument.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.projectTask.updateMany).not.toHaveBeenCalled();
+    expect(fs.existsSync(abs)).toBe(true);
   });
 });

@@ -9,7 +9,6 @@ const {
   confirmPasswordReset,
 } = require('../controllers/passwordResetController');
 const requireAuth = require('../middlewares/requireAuth');
-const { requireCsrf } = require('../middlewares/csrf');
 const {
   authLimiter,
   loginLimiter,
@@ -48,10 +47,12 @@ router.post('/otp', otpLimiter, otp);
  *   POST /logout      -> 200 { sessionsRevoked }   revokes this session's family
  *   POST /logout-all  -> 200 { sessionsRevoked }   revokes every session
  *
- * /refresh and /logout carry requireCsrf because they act on the HttpOnly
- * cookie, which a browser attaches to cross-site requests by itself. The check
- * is skipped automatically for callers presenting a Bearer token, which is not
- * attached automatically and therefore not forgeable this way.
+ * /refresh and /logout act on the HttpOnly cookie, which a browser attaches to
+ * cross-site requests by itself, so both are CSRF-forgeable without a guard.
+ * That guard is no longer named here: it is mounted across the whole API in
+ * app.js, so these two are covered by default rather than by remembering. The
+ * check is skipped automatically for callers presenting a Bearer token, which is
+ * not attached automatically and therefore not forgeable this way.
  *
  * /logout-all needs requireAuth instead: it acts on the USER, not on one
  * session, so it must work even when the cookie for this device is gone —
@@ -60,8 +61,8 @@ router.post('/otp', otpLimiter, otp);
  * /refresh gets its own limiter. It is unauthenticated by nature (an expired
  * access token is exactly when it is called), and rotation writes on every hit.
  */
-router.post('/refresh', refreshLimiter, requireCsrf, refresh);
-router.post('/logout', requireCsrf, logout);
+router.post('/refresh', refreshLimiter, refresh);
+router.post('/logout', logout);
 router.post('/logout-all', requireAuth, logoutAll);
 
 /*

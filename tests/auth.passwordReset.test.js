@@ -154,35 +154,34 @@ describe('POST /api/auth/password-reset — request a code', () => {
     expect(JSON.stringify(res.body)).not.toContain(mockSendResetOtp.mock.calls[0][0].otp);
   });
 
-  it('answers an unknown email identically, writing nothing and sending nothing', async () => {
+  it('refuses an unregistered email with 404, writing nothing and sending nothing', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(null);
 
     const res = await request(app).post(REQUEST_URL).send({ email: 'nobody@finopsys.ai' });
 
-    expect(res.status).toBe(202);
-    expect(res.body.data.otpRequired).toBe(true);
-    expect(typeof res.body.data.challengeId).toBe('string');
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('EMAIL_NOT_REGISTERED');
     expect(mockPrisma.loginChallenge.create).not.toHaveBeenCalled();
     expect(mockSendResetOtp).not.toHaveBeenCalled();
   });
 
-  it('is indistinguishable between a registered and an unregistered address', async () => {
+  it('keeps a non-ACTIVE account indistinguishable from a resettable one', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(activeUser());
     const hit = await request(app).post(REQUEST_URL).send({ email: EMAIL });
 
     jest.clearAllMocks();
-    mockPrisma.user.findUnique.mockResolvedValue(null);
-    const miss = await request(app).post(REQUEST_URL).send({ email: EMAIL });
+    mockPrisma.user.findUnique.mockResolvedValue(activeUser({ status: 'HIBERNATED' }));
+    const decoy = await request(app).post(REQUEST_URL).send({ email: EMAIL });
 
-    expect(miss.status).toBe(hit.status);
-    expect(miss.body.message).toBe(hit.body.message);
-    expect(Object.keys(miss.body.data).sort()).toEqual(Object.keys(hit.body.data).sort());
-    expect(miss.body.data.maskedEmail).toBe(hit.body.data.maskedEmail);
+    expect(decoy.status).toBe(hit.status);
+    expect(decoy.body.message).toBe(hit.body.message);
+    expect(Object.keys(decoy.body.data).sort()).toEqual(Object.keys(hit.body.data).sort());
+    expect(decoy.body.data.maskedEmail).toBe(hit.body.data.maskedEmail);
     // Only the random challenge id differs.
-    expect(miss.body.data.challengeId).not.toBe(hit.body.data.challengeId);
+    expect(decoy.body.data.challengeId).not.toBe(hit.body.data.challengeId);
   });
 
-  it('gives a non-ACTIVE account the same silent treatment', async () => {
+  it('gives a non-ACTIVE account the silent decoy rather than the 404', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(activeUser({ status: 'HIBERNATED' }));
 
     const res = await request(app).post(REQUEST_URL).send({ email: EMAIL });

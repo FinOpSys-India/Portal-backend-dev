@@ -12,6 +12,7 @@ const requestId = require('./middlewares/requestId');
 const normalizeRequest = require('./middlewares/normalizeRequest');
 const notFound = require('./middlewares/notFound');
 const errorHandler = require('./middlewares/errorHandler');
+const { requireCsrf } = require('./middlewares/csrf');
 const logger = require('./utils/logger');
 
 // Every feature router is mounted under one prefix, so the public contract is
@@ -152,6 +153,32 @@ app.use(cookieParser());
  * compares against a single canonical name.
  */
 app.use(normalizeRequest);
+
+/*
+ * Double-submit CSRF gate, mounted across the whole API rather than listed on
+ * the handful of routes that happen to need it today.
+ *
+ * It used to be opt-in, named on /auth/refresh and /auth/logout. Those were the
+ * only two cookie-authenticated endpoints, so the coverage was complete — but it
+ * was complete by coincidence, and the next route to read the refresh cookie
+ * would have shipped unprotected with nothing failing to say so. Mounted here,
+ * a new route is covered by default and an exemption has to be written down (see
+ * CSRF_EXEMPT_PATHS in middlewares/csrf).
+ *
+ * Mounting on API_PREFIX, not on '/', so the middleware sees a path relative to
+ * the prefix and the exemption list reads the same whether API_PREFIX is '/' in
+ * development or '/api' on Vercel. It also keeps the static uploads mount out of
+ * scope, which is read-only anyway.
+ *
+ * Costs nothing for the overwhelming majority of traffic: the middleware returns
+ * immediately for safe methods and for Bearer-authenticated requests, which is
+ * every route in this API apart from the session-lifecycle pair.
+ *
+ * Deliberately after cookieParser — it reads req.cookies — and ahead of the
+ * routers, so a rejected request never reaches a handler. The Stripe webhook is
+ * mounted above the body parsers and so never arrives here at all.
+ */
+app.use(API_PREFIX, requireCsrf);
 
 /*
  * Uploaded files — today, profile pictures.

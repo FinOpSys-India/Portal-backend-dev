@@ -66,6 +66,21 @@ function documentNotFound() {
   return new ApiError(404, 'Document not found.', { code: 'DOCUMENT_NOT_FOUND' });
 }
 
+/**
+ * The 403 for a DELETE, which is refused by a stricter rule than any other route
+ * here and so has to say a different thing.
+ *
+ * A project's manager or its assigned specialist can read this document, list
+ * it, and download it. Refusing their delete with a generic "no permission"
+ * leaves them with no idea why that one call failed, which is how a rule becomes
+ * a bug report.
+ */
+function notTheUploader() {
+  return new ApiError(403, 'Only the person who uploaded this file can delete it.', {
+    code: 'DOCUMENT_DELETE_DENIED',
+  });
+}
+
 function companyMismatch(projectId) {
   return new ApiError(400, 'That project does not belong to the company you selected.', {
     code: 'PROJECT_COMPANY_MISMATCH',
@@ -697,15 +712,14 @@ async function createDownloadLinks({ userId, requestId, projectId, documentIds }
 /**
  * DELETE /projects/:projectId/documents/:documentId — soft delete.
  *
- * WHO MAY. Whoever uploaded it, plus anyone with write access to the project
- * (the company's accounting manager, the project's creator, or the assigned
- * specialist). The uploader is on the list because taking back a file
- * you attached by mistake should not require finding a manager; everyone else is
- * on it because they are already responsible for the work the file belongs to.
+ * WHO MAY. THE UPLOADER, and only the uploader — the same creator-only rule
+ * projects and tasks apply to their own deletes.
  *
- * A plain teammate who did not upload it is NOT on the list — they can read the
- * project's documents, and removing someone else's attachment is a different
- * thing from reading it.
+ * Everyone else who can reach this file can still read it, list it and download
+ * it; what they cannot do is destroy it. The reason is specific to this route:
+ * the delete removes the bytes for good, so it is the one operation in the
+ * feature with no way back, and the person who attached a file is the only one
+ * who can know it was theirs to take away.
  */
 async function deleteDocument({ userId, requestId, projectId, documentId }) {
   const document = await repo.findDocumentForAccess(prisma, documentId);
@@ -713,16 +727,34 @@ async function deleteDocument({ userId, requestId, projectId, documentId }) {
     throw documentNotFound();
   }
 
-  const { caller, project, company } = await projectService.loadProjectForRead(prisma, {
+  // `loadProjectForRead` still runs, and still has to: it settles that the caller
+  // is on this project's company at all, and a stranger must get the same 403
+  // here as they do everywhere else rather than a message telling them who the
+  // uploader is. The rule below narrows that decision; it does not replace it.
+  const { caller, company } = await projectService.loadProjectForRead(prisma, {
     userId,
     projectId: document.projectId,
   });
 
-  if (document.uploadedByUserId !== caller.id) {
-    // Throws PROJECT_ACCESS_DENIED for anyone who is neither the uploader nor
-    // responsible for the project.
-    projectService.assertWriteAccess(caller, company, project);
-  }
+  /*
+   * THE UPLOADER, AND NOBODY ELSE.
+   *
+   * The same rule projects and tasks apply to their own deletes — whoever made a
+   * thing is the only person who may unmake it — and it is stricter here than it
+   * was: the company's accounting manager and the project's assigned specialist
+   * could both remove someone else's file, and no longer can.
+   *
+   * That is the point rather than a side effect. This delete does not merely
+   * hide a row; it destroys the bytes, permanently and with no way back. A
+   * capability that unrecoverable belongs to the one person who can know the
+   * file was theirs to remove, not to everyone with authority over the project.
+   *
+   * The cost, stated plainly: a file uploaded by someone who has since left the
+   * company cannot be deleted through this API at all. Deliberate — a record
+   * that outlives the people who can remove it beats one that can vanish on
+   * someone else's judgment.
+   */
+  if (document.uploadedByUserId !== caller.id) throw notTheUploader();
 
   await repo.softDeleteDocument(prisma, document.id, new Date());
 

@@ -1378,7 +1378,11 @@ model ChatAttachment {
 
   /// "chat/17/9f3c…b1.pdf", where 17 is the CONVERSATION. Unique, so one
   /// uploaded object cannot become two attachments on a replayed send.
-  fileKey      String @unique @map("file_key") @db.VarChar(512)
+  ///
+  /// NULL once the message was deleted and the object purged from the bucket —
+  /// the rest of the row is kept as the record of what was sent. Postgres
+  /// allows many NULLs under a UNIQUE index, so purged rows do not collide.
+  fileKey      String? @unique @map("file_key") @db.VarChar(512)
   originalName String @map("original_name") @db.VarChar(255)
   mimeType     String @map("mime_type") @db.VarChar(150)
   sizeBytes    BigInt @map("size_bytes")

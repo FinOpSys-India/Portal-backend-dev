@@ -19,11 +19,11 @@ function requestContext(req) {
  * Step one of the forgotten-password flow: name an address and, if it belongs to
  * an active account, receive a code by email.
  *
- * Always answers 202 (Accepted) with the same body shape, whether or not the
- * address is registered — the request was accepted; whether an email went out is
- * deliberately not disclosed. The `challengeId` returned for an unknown address
- * is a throwaway that verifies against nothing. See the note in
- * passwordResetService.requestPasswordReset for why.
+ * An address with no account is refused with 404 EMAIL_NOT_REGISTERED, so the
+ * screen can say so plainly. An address that has an account but cannot reset
+ * (INVITED, HIBERNATED) still gets the ordinary 202 with a throwaway
+ * `challengeId` that verifies against nothing — status stays private even though
+ * existence does not. See the note in passwordResetService.requestPasswordReset.
  */
 const requestPasswordReset = asyncHandler(async (req, res) => {
   const input = validatePasswordResetRequest(req.body);
@@ -34,7 +34,7 @@ const requestPasswordReset = asyncHandler(async (req, res) => {
 
   return res.status(202).json({
     success: true,
-    message: 'If an account exists for that email, a verification code has been sent.',
+    message: 'A verification code has been sent to your email address.',
     data: {
       otpRequired: true,
       challengeId: result.challengeId,

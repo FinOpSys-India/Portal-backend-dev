@@ -56,7 +56,7 @@ const mockPrisma = {
     groupBy: jest.fn(),
     count: jest.fn(),
   },
-  chatAttachment: { findMany: jest.fn(), findUnique: jest.fn() },
+  chatAttachment: { findMany: jest.fn(), findUnique: jest.fn(), updateMany: jest.fn() },
   /*
    * The preview line on the two contact lists is the one raw query in this
    * feature — DISTINCT ON, because Prisma's `distinct` would drag every message
@@ -951,6 +951,8 @@ describe('chat attachments', () => {
 /* ========================================================================== */
 
 describe('DELETE /chat/messages/:id', () => {
+  let removed;
+
   beforeEach(() => {
     mockPrisma.chatMessage.findUnique.mockResolvedValue({
       id: 5001n,
@@ -965,7 +967,14 @@ describe('DELETE /chat/messages/:id', () => {
       },
     });
     mockPrisma.chatMessage.updateMany.mockResolvedValue({ count: 1 });
+
+    // No attachments unless a test says so.
+    mockPrisma.chatAttachment.findMany.mockResolvedValue([]);
+    mockPrisma.chatAttachment.updateMany.mockResolvedValue({ count: 0 });
+    removed = jest.spyOn(storage, 'removeObjects').mockResolvedValue(undefined);
   });
+
+  afterEach(() => removed.mockRestore());
 
   it('soft deletes the sender’s own message', async () => {
     const res = await request(app)
@@ -978,6 +987,90 @@ describe('DELETE /chat/messages/:id', () => {
     const args = mockPrisma.chatMessage.updateMany.mock.calls[0][0];
     expect(args.where).toEqual({ id: 5001n, deletedAt: null });
     expect(args.data.deletedAt).toBeInstanceOf(Date);
+  });
+
+  /* ------------------------------------------------------------------------ */
+  /* the files                                                                */
+  /* ------------------------------------------------------------------------ */
+
+  it('deletes the attached objects from the bucket and nulls their keys', async () => {
+    mockPrisma.chatAttachment.findMany.mockResolvedValue([
+      { id: 71, fileKey: 'chat/9001/aaaa1111.pdf' },
+      { id: 72, fileKey: 'chat/9001/bbbb2222.png' },
+    ]);
+    mockPrisma.chatAttachment.updateMany.mockResolvedValue({ count: 2 });
+
+    const res = await request(app)
+      .delete('/api/chat/messages/5001')
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.attachmentsPurged).toBe(2);
+
+    // The bytes: both keys handed to the bucket, in one call.
+    expect(removed).toHaveBeenCalledTimes(1);
+    expect(removed.mock.calls[0][0].keys).toEqual([
+      'chat/9001/aaaa1111.pdf',
+      'chat/9001/bbbb2222.png',
+    ]);
+
+    // The metadata: only file_key is touched — no delete, no other column.
+    const cleared = mockPrisma.chatAttachment.updateMany.mock.calls[0][0];
+    expect(cleared).toEqual({
+      where: { messageId: 5001n, fileKey: { not: null } },
+      data: { fileKey: null },
+    });
+  });
+
+  it('removes the objects BEFORE forgetting where they were', async () => {
+    mockPrisma.chatAttachment.findMany.mockResolvedValue([
+      { id: 71, fileKey: 'chat/9001/aaaa1111.pdf' },
+    ]);
+    mockPrisma.chatAttachment.updateMany.mockResolvedValue({ count: 1 });
+
+    const order = [];
+    removed.mockImplementation(async () => { order.push('bucket'); });
+    mockPrisma.chatAttachment.updateMany.mockImplementation(async () => {
+      order.push('null-key');
+      return { count: 1 };
+    });
+
+    await request(app).delete('/api/chat/messages/5001').set('Authorization', managerAuth());
+
+    // Reversed, this would strand an object that nothing can ever name again.
+    expect(order).toEqual(['bucket', 'null-key']);
+  });
+
+  it('does not re-purge a message that was already deleted', async () => {
+    // The second click: the conditional soft delete matched nothing.
+    mockPrisma.chatMessage.updateMany.mockResolvedValue({ count: 0 });
+
+    const res = await request(app)
+      .delete('/api/chat/messages/5001')
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.attachmentsPurged).toBe(0);
+    expect(mockPrisma.chatAttachment.findMany).not.toHaveBeenCalled();
+    expect(removed).not.toHaveBeenCalled();
+    expect(mockPrisma.chatAttachment.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('still reports the delete when the bucket is down', async () => {
+    mockPrisma.chatAttachment.findMany.mockResolvedValue([
+      { id: 71, fileKey: 'chat/9001/aaaa1111.pdf' },
+    ]);
+    mockPrisma.chatAttachment.updateMany.mockResolvedValue({ count: 1 });
+    // storage.removeObjects swallows and logs; it must never surface as a 500
+    // on a delete the database already committed.
+    removed.mockResolvedValue(undefined);
+
+    const res = await request(app)
+      .delete('/api/chat/messages/5001')
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.deleted).toBe(true);
   });
 
   it('refuses to delete the other side’s message', async () => {

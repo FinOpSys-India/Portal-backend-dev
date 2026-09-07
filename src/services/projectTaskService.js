@@ -68,6 +68,21 @@ function notTheSpecialist() {
   });
 }
 
+/**
+ * The 403 for a DELETE, which is refused by a different rule and therefore has
+ * to say a different thing.
+ *
+ * `notTheSpecialist` above names the assignee, and reusing it here would send a
+ * refused caller to the one colleague who also cannot help: the assigned
+ * specialist may move a task through its states but may not withdraw one they
+ * did not file. Naming the person who can is the whole value of the message.
+ */
+function notTheTaskOwner() {
+  return new ApiError(403, 'Only the person who filed this task can delete it.', {
+    code: 'TASK_DELETE_DENIED',
+  });
+}
+
 /* -------------------------------------------------------------------------- */
 /* the rules                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -109,6 +124,40 @@ function assertTaskWriteAccess(caller, company, project) {
     });
   }
   if (project.assignedSpecialistUserId !== caller.id) throw notTheSpecialist();
+}
+
+/**
+ * DELETE access: WHOEVER FILED THE TASK, AND NOBODY ELSE.
+ *
+ * The same rule projects and documents apply to their own deletes — the creator
+ * is the only person who may unmake a thing. One rule across all three, so
+ * nobody has to remember which noun has which exception.
+ *
+ * `createdByUserId` is on the task row precisely because it is a different
+ * question from who owns the work — an accounting manager may open a task the
+ * specialist then works — and this is the rule that reads it.
+ *
+ * NOT the accounting manager, though they may file tasks and move them; and not
+ * the assigned specialist, who moves this task through its states every day.
+ * Both are wider than a delete should be: withdrawing a step from the plan
+ * erases the record that it was ever planned, and that belongs to the person who
+ * planned it.
+ *
+ * The cost is the same one projectService.assertDeleteAccess names: a task filed
+ * by someone who has since left cannot be deleted through this API at all.
+ *
+ * No PROJECT_UNSTAFFED branch here, unlike the write rule. That 409 exists to
+ * tell a specialist why they cannot file work on a project nobody holds; for a
+ * delete the task already exists, and whether the project is staffed says
+ * nothing about who may withdraw it.
+ *
+ * `company` is still a parameter, unused, so every assert in this file takes the
+ * same shape.
+ */
+// eslint-disable-next-line no-unused-vars
+function assertTaskDeleteAccess(caller, company, task) {
+  if (task.createdByUserId === caller.id) return;
+  throw notTheTaskOwner();
 }
 
 /**
@@ -344,13 +393,65 @@ async function updateTaskStatus({ userId, requestId, taskId, input }) {
   return dto.toTask(updated);
 }
 
+/**
+ * DELETE /tasks/:taskId — withdraw a task from the plan.
+ *
+ * SOFT, and there is no second half to it. A document delete has to remove the
+ * bytes as well, because a marked-deleted row that leaves its object in the
+ * bucket means storage only ever grows; a task holds nothing but its own row, so
+ * marking it is the entire operation and the history costs a few hundred bytes.
+ *
+ * WHY THIS EXISTS AT ALL. Until now the only write a task had was its status, so
+ * a task filed by mistake could be moved to COMPLETED and nothing else — which
+ * records that work was finished when it was never done, and leaves the row in
+ * every report that counts completions. "Done" is not a synonym for "never
+ * should have been here".
+ *
+ * The same transaction shape as updateTaskStatus, for the same reason: the
+ * access decision reads the project and the company, and those must not be able
+ * to change between being read and being acted on.
+ */
+async function deleteTask({ userId, requestId, taskId }) {
+  const { companyId, projectId } = await prisma.$transaction(async (tx) => {
+    const task = await repo.findTaskForAccess(tx, taskId);
+    if (!task) throw taskNotFound();
+
+    // A task on a soft-deleted project is not reachable, matching the lists and
+    // the status write. Its rows are marked by the project delete itself.
+    if (!task.project || task.project.deletedAt) throw projectNotFound();
+
+    const { caller, company } = await projectService.loadProjectForRead(tx, {
+      userId,
+      projectId: task.projectId,
+    });
+    assertTaskDeleteAccess(caller, company, task);
+
+    await repo.softDeleteTask(tx, taskId, new Date());
+    return { companyId: company.id, projectId: task.projectId };
+  });
+
+  logEvent({
+    event: 'task.deleted',
+    status: 'success',
+    requestId,
+    userId,
+    companyId,
+    projectId,
+    taskId,
+  });
+
+  return { id: taskId, projectId, deleted: true };
+}
+
 module.exports = {
   listCompanyTasks,
   listProjectTasks,
   getTask,
   createTask,
   updateTaskStatus,
+  deleteTask,
   // Exported for tests and for any future caller that needs the same rule.
   assertDeadlineWithinProject,
   assertTaskWriteAccess,
+  assertTaskDeleteAccess,
 };

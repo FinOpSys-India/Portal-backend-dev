@@ -482,18 +482,55 @@ function countUnreadForUser(client, { companyId, userId }) {
 }
 
 /**
- * Soft delete. The row stays, the bytes stay, the thread keeps its shape.
+ * Soft delete. The row stays and the thread keeps its shape — but the files do
+ * NOT survive it; see `takeAttachmentKeys` and chatService.deleteMessage.
  *
  * Conditional on `deletedAt: null` so a double-clicked delete does not rewrite
  * the timestamp of the first one — the same idempotence `markRead` gets from its
  * own null check. `updateMany` rather than `update` because a conditional update
  * that matches nothing must be a no-op, not a P2025 thrown at a user who clicked
  * twice.
+ *
+ * Returns `{ count }`, and the caller is expected to read it: a count of 0 means
+ * this delete lost the race (or is the second click), and the purge below has
+ * already been done by whoever won.
  */
 function softDeleteMessage(client, { id, deletedAt }) {
   return client.chatMessage.updateMany({
     where: { id, deletedAt: null },
     data: { deletedAt },
+  });
+}
+
+/**
+ * The storage keys still held by one message's attachments.
+ *
+ * `not: null` because a purged row keeps every column except this one, so a
+ * message whose files are already gone yields an empty list rather than a list
+ * of nulls to hand to the bucket.
+ */
+function findAttachmentKeys(client, messageId) {
+  return client.chatAttachment.findMany({
+    where: { messageId, fileKey: { not: null } },
+    select: { id: true, fileKey: true },
+  });
+}
+
+/**
+ * Forget where the bytes were. Everything else about the attachment stays.
+ *
+ * SEPARATE FROM THE OBJECT DELETE ON PURPOSE, and ordered after it: the key is
+ * the only record of what to remove, so dropping it before the bucket call would
+ * turn a failed removal into an object nothing can ever name again. Doing it in
+ * this order can leave an orphaned object if the process dies in between, which
+ * is the cheaper of the two failures.
+ *
+ * Scoped by `fileKey: { not: null }` so a re-run touches nothing.
+ */
+function clearAttachmentKeys(client, messageId) {
+  return client.chatAttachment.updateMany({
+    where: { messageId, fileKey: { not: null } },
+    data: { fileKey: null },
   });
 }
 
@@ -575,6 +612,8 @@ module.exports = {
   findLatestMessages,
   countUnreadForUser,
   softDeleteMessage,
+  findAttachmentKeys,
+  clearAttachmentKeys,
   findAttachmentsByKeys,
   findAttachmentForDownload,
 };

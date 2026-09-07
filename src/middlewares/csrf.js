@@ -33,6 +33,44 @@ const ApiError = require('../utils/ApiError');
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const TOKEN_BYTES = 32;
 
+/*
+ * Endpoints that establish a credential rather than act on one, matched against
+ * the path RELATIVE to the API prefix (this middleware is mounted on the prefix,
+ * so `/api/auth/login` arrives here as `/auth/login`).
+ *
+ * These authenticate from the request BODY — an email and password, an OTP, a
+ * reset ticket — so nothing about them is forgeable by a browser attaching a
+ * cookie on its own, which is the only thing CSRF defends against. They are
+ * exempt because the gate would otherwise lock people out for real: a returning
+ * visitor can easily be holding a stale `refreshToken` cookie without a matching
+ * CSRF cookie (the CSRF cookie is readable by design, so an extension or a
+ * partial cookie clear can remove just that one), and the check keys off the
+ * presence of the refresh cookie. Gating login on it would answer 403 to exactly
+ * the request that would have repaired the situation.
+ *
+ * Login CSRF — forcing a victim's browser to sign in as the attacker — is the
+ * residual risk, and it is accepted here: it does not expose the victim's data,
+ * and the endpoints below all rotate the session cookie anyway.
+ */
+const CSRF_EXEMPT_PATHS = new Set([
+  '/auth/login',
+  '/auth/signup',
+  '/auth/otp',
+  '/auth/password-reset',
+  '/auth/password-reset/otp',
+  '/auth/password-reset/confirm',
+  // Stripe is not a browser: it holds no cookie and authenticates by signature.
+  // Its router is mounted ahead of the body parsers so it never actually reaches
+  // this gate, but naming it here keeps that true if the mount order changes.
+  '/billing/webhook',
+]);
+
+// Trailing slashes and casing must not be a way around the list above.
+function normalizePath(path) {
+  const lowered = String(path || '/').toLowerCase();
+  return lowered.length > 1 ? lowered.replace(/\/+$/, '') : lowered;
+}
+
 /**
  * Mint a token and set it in a readable (NOT HttpOnly) cookie.
  *
@@ -78,12 +116,21 @@ function safeEqual(a, b) {
 /**
  * Guard a state-changing route that authenticates from a cookie.
  *
+ * Mounted GLOBALLY on the API prefix (see app.js) rather than listed per route.
+ * It was previously opt-in, attached by hand to /auth/refresh and /auth/logout —
+ * the only two cookie-authenticated endpoints at the time. That was correct on
+ * the day it was written and silently wrong the moment anyone added a third:
+ * a route that reads the refresh cookie and forgets the middleware is
+ * unprotected, and nothing fails to tell you. A default-on gate inverts that —
+ * a new route is covered unless someone deliberately exempts it.
+ *
  * Skipped entirely when the request carries a Bearer token: that request is not
  * cookie-authenticated, so CSRF does not apply to it.
  */
 function requireCsrf(req, res, next) {
   if (!config.security.csrfEnabled) return next();
   if (SAFE_METHODS.has(req.method)) return next();
+  if (CSRF_EXEMPT_PATHS.has(normalizePath(req.path))) return next();
 
   const authHeader = req.headers.authorization || '';
   if (authHeader.startsWith('Bearer ')) return next();
@@ -117,4 +164,4 @@ function requireCsrf(req, res, next) {
   return next();
 }
 
-module.exports = { requireCsrf, issueCsrfToken };
+module.exports = { requireCsrf, issueCsrfToken, CSRF_EXEMPT_PATHS };
