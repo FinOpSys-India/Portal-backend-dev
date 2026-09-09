@@ -123,7 +123,11 @@ app.use(
       return callback(new Error(`Origin ${origin} is not allowed by CORS.`));
     },
     credentials: true,
-    exposedHeaders: ['X-Request-Id', 'Idempotent-Replay', 'Retry-After'],
+    // Content-Disposition is exposed for the CSV exports. A browser can save a
+    // cross-origin download without it, but a client that fetches the file as a
+    // blob cannot read the filename the server chose unless it is listed here —
+    // and every such download would land as "download" with no extension.
+    exposedHeaders: ['X-Request-Id', 'Idempotent-Replay', 'Retry-After', 'Content-Disposition'],
   })
 );
 

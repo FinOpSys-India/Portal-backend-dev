@@ -948,4 +948,7 @@ module.exports = {
   loadProjectForRead,
   loadCompanyForRead,
   assertWriteAccess,
+  // Shared with projectExportService, for the reason given where it is defined:
+  // a specialist's export must be scoped exactly as their table is.
+  scopeToOwnWork,
 };
