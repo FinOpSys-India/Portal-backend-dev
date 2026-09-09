@@ -5,7 +5,6 @@ const repo = require('../repositories/projectRepository');
 const taskRepo = require('../repositories/projectTaskRepository');
 const projectService = require('./projectService');
 const dto = require('../dto/projectExportDto');
-const csv = require('../utils/csv');
 const ApiError = require('../utils/ApiError');
 const { logEvent } = require('../utils/auditLog');
 
@@ -118,7 +117,10 @@ async function exportProjects({ userId, requestId, query }) {
   });
 
   return {
-    filename: `projects-${csv.slugify(company.companyName, 'company')}-${csv.today()}`,
+    // Named after the account it describes, in the words a person would use:
+    // "ABC Aerospace LLC - list of projects.csv". csv.sendCsv is what makes
+    // that safe to put in a header, so the name is built here unescaped.
+    filename: `${company.companyName} - list of projects`,
     headers: dto.PROJECT_LIST_HEADERS,
     // Passed straight to map, whose (element, index) is exactly what the row
     // builder takes — the index becomes the file's `#` column.
@@ -190,7 +192,10 @@ async function exportProject({ userId, requestId, projectId }) {
   });
 
   return {
-    filename: `project-${project.id}-${csv.slugify(project.projectName, 'project')}-${csv.today()}`,
+    // The project's own name, and nothing else — the file a user downloads from
+    // a project page should be recognisable as that project in a downloads
+    // folder without being read.
+    filename: project.projectName,
     headers: dto.PROJECT_TASK_HEADERS,
     rows: dto.toProjectTaskRows(project, tasks),
   };

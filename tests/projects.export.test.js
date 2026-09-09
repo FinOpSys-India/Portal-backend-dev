@@ -278,9 +278,12 @@ describe('GET /projects/export', () => {
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/csv/);
     expect(res.headers['content-disposition']).toMatch(/^attachment;/);
-    // The filename carries the company and the day, so two downloads a week
-    // apart do not overwrite each other in the browser's downloads folder.
-    expect(res.headers['content-disposition']).toMatch(/projects-abc-aerospace-llc-\d{4}-\d{2}-\d{2}\.csv/);
+    // The file is named after the account it describes, so it is recognisable in
+    // a downloads folder without being opened. The colon a reader would write
+    // between the two halves is not legal in a filename, so it is a hyphen.
+    expect(res.headers['content-disposition']).toMatch(
+      /filename\*=UTF-8''ABC%20Aerospace%20LLC%20-%20list%20of%20projects\.csv/
+    );
     expect(res.headers['cache-control']).toBe('no-store');
 
     const rows = parseCsv(res.text);
@@ -488,8 +491,9 @@ describe('GET /projects/:projectId/export', () => {
 
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/csv/);
+    // The project's own name, spaces and capitals intact.
     expect(res.headers['content-disposition']).toMatch(
-      /project-300-q4-books-close-\d{4}-\d{2}-\d{2}\.csv/
+      /filename\*=UTF-8''Q4%20Books%20Close\.csv/
     );
 
     const rows = parseCsv(res.text);
