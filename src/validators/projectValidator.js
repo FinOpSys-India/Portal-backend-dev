@@ -330,6 +330,55 @@ function validateProjectListQuery(query = {}) {
   };
 }
 
+/**
+ * `?companyId=&status=&search=&assignedSpecialistUserId=&sort=&order=` for
+ * GET /projects/export.
+ *
+ * The table's query minus `limit` and `offset`, and their absence is the point:
+ * an export is the whole result set by definition, so a page window is a
+ * parameter the endpoint would have to ignore — and a parameter that is ignored
+ * is worse than one that is refused, because the client that sent it believes it
+ * did something. The row cap that does apply lives in the service, where it can
+ * refuse an oversized export by name instead of quietly trimming it.
+ *
+ * The filters ARE kept. The export a user wants is almost always the table they
+ * are looking at, and a download that ignores the filters above it hands them
+ * the wrong file.
+ */
+function validateProjectExportQuery(query = {}) {
+  const allowed = ['companyId', 'status', 'search', 'assignedSpecialistUserId', 'sort', 'order'];
+  common.rejectUnknown(query, allowed, 'query string');
+
+  if (query.companyId === undefined || query.companyId === null || query.companyId === '') {
+    throw new ApiError(400, 'companyId is required.', {
+      code: 'VALIDATION_ERROR',
+      fields: { companyId: 'Select a company.' },
+    });
+  }
+
+  // Borrowed for its `sort`/`order` allowlist checking alone; the limit and
+  // offset it also returns are discarded below.
+  const page = common.pagination(query, {
+    defaultLimit: 25,
+    maxLimit: 100,
+    sortable: SORTABLE,
+    defaultSort: 'deadlineDate',
+  });
+
+  return {
+    companyId: common.parseId(query.companyId, 'companyId'),
+    status: query.status ? common.enumValue(query.status, 'status', PROJECT_STATUSES) : null,
+    assignedSpecialistUserId: query.assignedSpecialistUserId
+      ? common.parseId(query.assignedSpecialistUserId, 'assignedSpecialistUserId')
+      : null,
+    search: query.search ? common.str(query.search, 'search', { max: 120 }) : null,
+    sort: page.sort,
+    // Soonest deadline first unless the caller says otherwise — common.pagination
+    // defaults `order` to desc, which is the wrong way round for a due date.
+    order: query.order ? page.order : 'asc',
+  };
+}
+
 /** Just the company id — for the form's service dropdown. */
 function validateCompanyQuery(query = {}) {
   common.rejectUnknown(query, ['companyId'], 'query string');
@@ -422,5 +471,6 @@ module.exports = {
   validateProjectUpdate,
   validateProjectListQuery,
   validateProjectOptionsQuery,
+  validateProjectExportQuery,
   validateCompanyQuery,
 };

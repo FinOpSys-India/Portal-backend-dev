@@ -165,6 +165,17 @@ const refreshLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 60, label:
 const projectLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 60, label: 'Project' });
 
 /*
+ * CSV exports.
+ *
+ * The only reads in this API that carry a limiter at all, and the reason is that
+ * they are the only reads with no page window: one call returns a company's
+ * entire book of work, so the cost of a request is the size of the account
+ * rather than a fixed twenty-five rows. Twenty in a quarter of an hour is far
+ * more than a person clicking a download button and far less than a loop.
+ */
+const exportLimiter = makeLimiter({ windowMs: 15 * 60 * 1000, limit: 20, label: 'Export' });
+
+/*
  * Project document uploads.
  *
  * Tighter than projectLimiter even though both are authenticated, because this
@@ -226,6 +237,7 @@ module.exports = {
   profileLimiter,
   refreshLimiter,
   projectLimiter,
+  exportLimiter,
   documentLimiter,
   emailLimiter,
   chatLimiter,

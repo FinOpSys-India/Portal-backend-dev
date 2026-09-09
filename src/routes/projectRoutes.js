@@ -4,7 +4,7 @@ const express = require('express');
 
 const requireAuth = require('../middlewares/requireAuth');
 const requireRole = require('../middlewares/requireRole');
-const { projectLimiter, documentLimiter } = require('../middlewares/rateLimiter');
+const { projectLimiter, documentLimiter, exportLimiter } = require('../middlewares/rateLimiter');
 const {
   listServices,
   listProjects,
@@ -24,6 +24,10 @@ const {
   deleteDocument,
 } = require('../controllers/projectDocumentController');
 const { listProjectTasks } = require('../controllers/projectTaskController');
+const {
+  exportProjects,
+  exportProject,
+} = require('../controllers/projectExportController');
 
 /*
  * Projects: a unit of work opened against one company, for one service it pays
@@ -32,9 +36,11 @@ const { listProjectTasks } = require('../controllers/projectTaskController');
  *   GET    /projects/services?companyId=42   -> the form's service dropdown
  *   GET    /projects/options?companyId=42    -> the project dropdown: id + name
  *   GET    /projects?companyId=42            -> the table + that same service list
+ *   GET    /projects/export?companyId=42     -> that table as a CSV
  *   POST   /projects                         -> open one (manager or customer)
  *   POST   /projects/sync-specialists        -> re-run the auto-assignment
  *   GET    /projects/:projectId              -> one project
+ *   GET    /projects/:projectId/export       -> that project + its tasks, as CSV
  *   PATCH  /projects/:projectId              -> name / deadline / note / status
  *   DELETE /projects/:projectId              -> soft delete
  *
@@ -72,19 +78,43 @@ const createRoles = requireRole('ACCOUNTING_MANAGER', 'CUSTOMER');
 const staffingRoles = requireRole('ACCOUNTING_MANAGER', 'ADMIN');
 
 /*
- * All three literal paths MUST stay above '/:projectId'. Express matches in
+ * All four literal paths MUST stay above '/:projectId'. Express matches in
  * declaration order, so a parameterised route declared first would swallow
- * "services" and "options" and try to parse them as ids — a 400 on a perfectly
- * valid URL.
+ * "services", "options" and "export" and try to parse them as ids — a 400 on a
+ * perfectly valid URL.
  */
 router.get('/services', listServices);
 router.get('/options', listProjectOptions);
 router.get('/', listProjects);
 
+/*
+ * CSV EXPORTS. Two files, and the split matches the two questions people
+ * actually ask of this screen:
+ *
+ *   GET /projects/export?companyId=42   the account's project list, one row per
+ *                                       project, a summary set of columns
+ *   GET /projects/42/export             one project WITH ITS TASKS, one row per
+ *                                       task
+ *
+ * NO ROLE GATE, matching every other read on this router: who may read a
+ * company's projects is decided per-record in the service, which is where both
+ * of these go for exactly the rule the JSON endpoints use. A specialist's export
+ * is narrowed to their own work by the same function that narrows their table.
+ *
+ * Rate-limited where the JSON reads are not. These are the only reads in the API
+ * with no page window — one call returns the whole account — so the cost of a
+ * request is the size of the client rather than a fixed page.
+ *
+ * '/export' sits with the literal paths above; '/:projectId/export' cannot
+ * collide with '/:projectId' since Express matches the whole path.
+ */
+router.get('/export', exportLimiter, exportProjects);
+
 router.post('/', projectLimiter, createRoles, createProject);
 router.post('/sync-specialists', projectLimiter, staffingRoles, syncSpecialists);
 
 router.get('/:projectId', getProject);
+router.get('/:projectId/export', exportLimiter, exportProject);
 router.patch('/:projectId', projectLimiter, updateProject);
 router.delete('/:projectId', projectLimiter, deleteProject);
 
