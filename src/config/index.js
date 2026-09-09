@@ -572,6 +572,37 @@ config.isProduction = config.env === 'production';
 config.isDevelopment = config.env === 'development';
 
 /*
+ * Cookie attributes for the session pair (refreshToken + csrfToken).
+ *
+ * The frontend is served from a different SITE than this API. On Vercel,
+ * `portal-frontend.vercel.app` and `portal-backend-dev.vercel.app` are
+ * different sites, not merely different origins, because `vercel.app` is on the
+ * Public Suffix List. A SameSite=Lax cookie is not sent on a cross-site fetch,
+ * so the browser holds a perfectly valid 30-day session and never presents it:
+ * a second tab's opening POST /auth/refresh arrives with no cookie, answers
+ * 401, and the user is shown the login screen despite being signed in.
+ *
+ * SameSite=None lifts that, but browsers honour it only alongside Secure, which
+ * cannot be set over plain HTTP — so local development stays on Lax. Nothing is
+ * lost there: localhost:5173 -> localhost:4000 is same-site already (only the
+ * port differs), so a Lax cookie is sent anyway.
+ *
+ * The two are derived from ONE flag rather than written independently, because
+ * `None` without `Secure` is not a weaker cookie — it is a cookie the browser
+ * drops silently, with no error anywhere. Tying them together makes that
+ * combination unreachable.
+ *
+ * This is also why the CSRF gate is not optional here. SameSite=None means the
+ * cookie IS attached to cross-site requests, which is precisely the condition
+ * the double-submit token in middlewares/csrf exists to defend against.
+ */
+config.security.crossSiteCookies = process.env.CROSS_SITE_COOKIES
+  ? process.env.CROSS_SITE_COOKIES === 'true'
+  : config.isProduction;
+config.security.cookieSameSite = config.security.crossSiteCookies ? 'none' : 'lax';
+config.security.cookieSecure = config.security.crossSiteCookies || config.isProduction;
+
+/*
  * Whether error responses may carry a stack trace and the raw message of a
  * server error.
  *
