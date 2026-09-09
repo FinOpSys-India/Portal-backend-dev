@@ -91,8 +91,12 @@ function issueCsrfToken(res, expiresAt) {
   res.cookie(config.security.csrfCookieName, token, {
     // Readable by page JavaScript on purpose — that is the whole mechanism.
     httpOnly: false,
-    secure: config.isProduction,
-    sameSite: 'lax',
+    // Must match the refresh cookie's attributes exactly. The double-submit
+    // check compares this cookie against a header, so a pair that disagrees on
+    // SameSite fails asymmetrically: the refresh cookie arrives and this one
+    // does not, and requireCsrf answers 403 to a request that was legitimate.
+    secure: config.security.cookieSecure,
+    sameSite: config.security.cookieSameSite,
     path: '/',
     ...(expiresAt instanceof Date && !Number.isNaN(expiresAt.getTime())
       ? { expires: expiresAt }

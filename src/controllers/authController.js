@@ -35,17 +35,30 @@ function setRefreshCookie(res, { refreshToken, refreshTokenExpiresAt }) {
 
   res.cookie(REFRESH_COOKIE, refreshToken, {
     httpOnly: true,
-    secure: config.isProduction,
-    sameSite: 'lax',
+    secure: config.security.cookieSecure,
+    sameSite: config.security.cookieSameSite,
     path: '/',
     expires,
   });
   return issueCsrfToken(res, expires);
 }
 
-/** Clear both cookies on logout, with the same attributes they were set with. */
+/**
+ * Clear both cookies on logout, with the same attributes they were set with.
+ *
+ * "The same attributes" is load-bearing, not tidiness: a browser matches a
+ * deletion against name/path/domain and honours it only when the attributes
+ * line up, so a clear that still said SameSite=Lax after the set moved to None
+ * would leave the cookie in place and logout would not log anyone out.
+ * Reading both from config is what keeps the pair from drifting.
+ */
 function clearAuthCookies(res) {
-  const base = { httpOnly: true, secure: config.isProduction, sameSite: 'lax', path: '/' };
+  const base = {
+    httpOnly: true,
+    secure: config.security.cookieSecure,
+    sameSite: config.security.cookieSameSite,
+    path: '/',
+  };
   res.clearCookie(REFRESH_COOKIE, base);
   res.clearCookie(config.security.csrfCookieName, { ...base, httpOnly: false });
 }
