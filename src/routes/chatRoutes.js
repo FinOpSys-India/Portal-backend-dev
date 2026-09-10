@@ -18,6 +18,8 @@ const {
   requestUploadUrls,
   requestDownloadUrl,
   issueRealtimeToken,
+  setReaction,
+  removeReaction,
 } = require('../controllers/chatController');
 
 /*
@@ -32,13 +34,15 @@ const {
  *   POST   /chat/conversations/:id/messages         say something
  *   POST   /chat/conversations/:id/read             clear the badge
  *   DELETE /chat/messages/:id                       remove one of your own
+ *   PUT    /chat/messages/:id/reaction              react, or change your reaction
+ *   DELETE /chat/messages/:id/reaction              take your own reaction back
  *   GET    /chat/unread-count?companyId=            the nav badge
  *   POST   /chat/attachments/upload-url             where to send the files
  *   GET    /chat/attachments/:id/download-url       a short-lived signed link
  *   GET    /chat/realtime-token                     open the live connection
  *
- * THREE PORTALS, TWELVE ROUTES, AND THE DIFFERENCE IS TWO OF THEM. The
- * accounting manager gets all twelve; a customer and a specialist get ten — they
+ * THREE PORTALS, FOURTEEN ROUTES, AND THE DIFFERENCE IS TWO OF THEM. The
+ * accounting manager gets all fourteen; a customer and a specialist get twelve — they
  * never call the two `contacts` lists, because they have nobody to choose
  * between. Their counterpart is the company's assigned accounting manager, and
  * `POST /chat/conversations` resolves it from `companyId` alone.
@@ -96,6 +100,11 @@ router.post('/conversations/:conversationId/messages', chatLimiter, sendMessage)
 router.post('/conversations/:conversationId/read', chatLimiter, markRead);
 
 router.delete('/messages/:messageId', chatLimiter, deleteMessage);
+
+// Either side of the thread may react to any message or file in it; the
+// optional attachmentId (body on PUT, query on DELETE) picks a file.
+router.put('/messages/:messageId/reaction', chatLimiter, setReaction);
+router.delete('/messages/:messageId/reaction', chatLimiter, removeReaction);
 
 /*
  * The attachment routes carry `documentLimiter` rather than `chatLimiter`, the
