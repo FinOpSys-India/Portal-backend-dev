@@ -221,6 +221,16 @@ const MESSAGE_SELECT = {
     select: { id: true, originalName: true, mimeType: true, sizeBytes: true },
     orderBy: { id: 'asc' },
   },
+  /*
+   * Raw rows, not counts. A thread has two sides, so any one target carries at
+   * most two reactions, and loading them with the page is cheaper than a second
+   * GROUP BY round trip. chatDto folds them into { reaction, count, reactedByMe }
+   * per target — message and each file.
+   */
+  reactions: {
+    select: { attachmentId: true, userId: true, reaction: true },
+    orderBy: { id: 'asc' },
+  },
 };
 
 /**
@@ -391,7 +401,7 @@ async function countUnreadByConversation(client, { conversationIds, userId }) {
 /**
  * The newest live message in each of these threads — the preview line.
  *
- * RAW SQL, AND THE ONLY RAW QUERY IN THIS FILE. `findMany` with
+ * RAW SQL, one of two raw queries in this file (setReaction is the other). `findMany` with
  * `distinct: ['conversationId']` expresses exactly this and was the first
  * version of it, but Prisma applies `distinct` in the query engine rather than
  * emitting DISTINCT ON: the database would return EVERY live message of every
@@ -594,6 +604,66 @@ function findAttachmentForDownload(client, id) {
   });
 }
 
+/* -------------------------------------------------------------------------- */
+/* reactions                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Put this person's reaction on a message, or on one of its files — replacing
+ * any reaction they already had on that same target.
+ *
+ * RAW SQL, because "one reaction per person per target" is two PARTIAL unique
+ * indexes (db/schema/24_add_chat_reactions.sql). Prisma cannot declare them, so
+ * `upsert` cannot target them; ON CONFLICT can, in one statement — a
+ * double-click or two tabs racing cannot produce a second row, or a
+ * unique-violation 500.
+ *
+ * Two statements rather than one because the conflict target differs, and its
+ * WHERE has to match the index's own predicate for Postgres to use it.
+ */
+function setReaction(client, { messageId, attachmentId, userId, reaction }) {
+  if (attachmentId === null) {
+    return client.$executeRaw`
+      INSERT INTO chat_reactions (message_id, attachment_id, user_id, reaction)
+      VALUES (${messageId}, NULL, ${userId}, ${reaction}::chat_reaction_kind)
+      ON CONFLICT (message_id, user_id) WHERE attachment_id IS NULL
+      DO UPDATE SET reaction = EXCLUDED.reaction
+    `;
+  }
+
+  return client.$executeRaw`
+    INSERT INTO chat_reactions (message_id, attachment_id, user_id, reaction)
+    VALUES (${messageId}, ${attachmentId}, ${userId}, ${reaction}::chat_reaction_kind)
+    ON CONFLICT (attachment_id, user_id) WHERE attachment_id IS NOT NULL
+    DO UPDATE SET reaction = EXCLUDED.reaction
+  `;
+}
+
+/**
+ * Take this person's reaction off a message or file.
+ *
+ * `userId` in the WHERE is the whole "only whoever reacted can remove it" rule:
+ * another person's row on the same target simply does not match. `attachmentId:
+ * null` compiles to IS NULL, so a message reaction and a file reaction on the
+ * same message are never confused. `deleteMany` so a second click is a count of
+ * 0 rather than a P2025.
+ */
+function removeReaction(client, { messageId, attachmentId, userId }) {
+  return client.chatReaction.deleteMany({ where: { messageId, attachmentId, userId } });
+}
+
+/**
+ * Every reaction on one target — what a reaction write returns, re-read after
+ * the write so the answer includes the other side's reaction too.
+ */
+function listReactionsForTarget(client, { messageId, attachmentId }) {
+  return client.chatReaction.findMany({
+    where: { messageId, attachmentId },
+    select: { attachmentId: true, userId: true, reaction: true },
+    orderBy: { id: 'asc' },
+  });
+}
+
 module.exports = {
   CONVERSATION_SELECT,
   MESSAGE_SELECT,
@@ -616,4 +686,7 @@ module.exports = {
   clearAttachmentKeys,
   findAttachmentsByKeys,
   findAttachmentForDownload,
+  setReaction,
+  removeReaction,
+  listReactionsForTarget,
 };

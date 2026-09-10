@@ -406,8 +406,64 @@ function validateUploadTicketRequest(body = {}, { maxFiles, maxBytes, isAllowedM
   return { conversationId, files };
 }
 
+/* -------------------------------------------------------------------------- */
+/* reactions                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The emoji a message or file can carry: the frontend's REACTIONS keys, in its
+ * order, and exactly the values of the `chat_reaction_kind` enum.
+ */
+const REACTIONS = ['like', 'laugh', 'sad', 'wow', 'love', 'thanks'];
+
+/**
+ * `attachmentId`, optional wherever it appears: absent means the reaction is on
+ * the message itself, present means on that file. Whether the file is actually
+ * on the message is the service's check, not this file's.
+ */
+function optionalAttachmentId(value) {
+  if (value === undefined || value === null || value === '') return null;
+  return common.parseId(value, 'attachmentId');
+}
+
+/**
+ * `PUT /chat/messages/:id/reaction` — `{ reaction, attachmentId? }`
+ *
+ * NO USER ID IS ACCEPTED. Who reacted is the caller, from the verified token —
+ * `rejectUnknown` turns away a body that tries to name anyone.
+ *
+ * Lower-cased by hand rather than through common.enumValue, which upper-cases:
+ * these are the frontend's keys and are stored and returned exactly as sent.
+ */
+function validateSetReaction(body = {}) {
+  common.rejectUnknown(body, ['reaction', 'attachmentId']);
+  common.requireFields(body, ['reaction']);
+
+  const reaction = String(body.reaction).trim().toLowerCase();
+  if (!REACTIONS.includes(reaction)) {
+    throw new ApiError(400, 'reaction is not a supported value.', {
+      code: 'VALIDATION_ERROR',
+      fields: { reaction: `Must be one of: ${REACTIONS.join(', ')}.` },
+      details: { allowed: REACTIONS },
+    });
+  }
+
+  return { reaction, attachmentId: optionalAttachmentId(body.attachmentId) };
+}
+
+/**
+ * `?attachmentId=` on `DELETE /chat/messages/:id/reaction`. A query string
+ * rather than a body, because some proxies and HTTP clients drop the body of a
+ * DELETE.
+ */
+function validateReactionTarget(query = {}) {
+  common.rejectUnknown(query, ['attachmentId'], 'query string');
+  return { attachmentId: optionalAttachmentId(query.attachmentId) };
+}
+
 module.exports = {
   LIMITS,
+  REACTIONS,
   encodeCursor,
   decodeCursor,
   validateCompanyQuery,
@@ -416,4 +472,6 @@ module.exports = {
   validateSendMessage,
   validateMarkRead,
   validateUploadTicketRequest,
+  validateSetReaction,
+  validateReactionTarget,
 };

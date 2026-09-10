@@ -57,13 +57,17 @@ const mockPrisma = {
     count: jest.fn(),
   },
   chatAttachment: { findMany: jest.fn(), findUnique: jest.fn(), updateMany: jest.fn() },
+  chatReaction: { findMany: jest.fn(), deleteMany: jest.fn() },
   /*
-   * The preview line on the two contact lists is the one raw query in this
+   * The preview line on the two contact lists is the one raw READ in this
    * feature — DISTINCT ON, because Prisma's `distinct` would drag every message
    * of every listed thread across the wire to render forty lines. See
    * chatRepository.findLatestMessages.
    */
   $queryRaw: jest.fn(),
+  // The reaction write — INSERT … ON CONFLICT on a partial unique index, which
+  // Prisma's `upsert` cannot target. See chatRepository.setReaction.
+  $executeRaw: jest.fn(),
   $transaction: jest.fn(async (cb) => cb(mockPrisma)),
 };
 
@@ -262,6 +266,9 @@ beforeEach(() => {
   mockPrisma.chatMessage.count.mockResolvedValue(0);
   mockPrisma.chatAttachment.findMany.mockResolvedValue([]);
   mockPrisma.$queryRaw.mockResolvedValue([]);
+  mockPrisma.$executeRaw.mockResolvedValue(1);
+  mockPrisma.chatReaction.findMany.mockResolvedValue([]);
+  mockPrisma.chatReaction.deleteMany.mockResolvedValue({ count: 0 });
   mockPrisma.$transaction.mockImplementation(async (cb) => cb(mockPrisma));
 });
 
@@ -1146,5 +1153,210 @@ describe('GET /chat/realtime-token', () => {
   it('needs a session of its own', async () => {
     const res = await request(app).get('/api/chat/realtime-token');
     expect(res.status).toBe(401);
+  });
+});
+
+/* ========================================================================== */
+/* reactions                                                                  */
+/* ========================================================================== */
+
+describe('chat reactions', () => {
+  // The manager's message 5001 in the manager/owner thread.
+  function accessRow(overrides = {}) {
+    return {
+      id: 5001n,
+      conversationId: CONVERSATION_ID,
+      senderUserId: MANAGER_ID,
+      deletedAt: null,
+      conversation: {
+        id: CONVERSATION_ID,
+        companyId: COMPANY_ID,
+        accountingManagerUserId: MANAGER_ID,
+        participantUserId: OWNER_ID,
+      },
+      ...overrides,
+    };
+  }
+
+  // A file on that message, in the shape findAttachmentForDownload returns.
+  function attachmentRow(overrides = {}) {
+    return {
+      id: ATTACHMENT_ID,
+      fileKey: chatKey(),
+      originalName: 'statement.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: 2048n,
+      message: { id: 5001n, deletedAt: null, conversation: accessRow().conversation },
+      ...overrides,
+    };
+  }
+
+  function reactionRow(userId, reaction, attachmentId = null) {
+    return { attachmentId, userId, reaction };
+  }
+
+  /** The SQL text of one tagged-template $executeRaw call. */
+  const sqlOf = (call) => call[0].join('?');
+
+  beforeEach(() => {
+    mockPrisma.chatMessage.findUnique.mockResolvedValue(accessRow());
+    mockPrisma.chatAttachment.findUnique.mockResolvedValue(attachmentRow());
+  });
+
+  it('lets the other side react to a message, as themselves', async () => {
+    mockPrisma.chatReaction.findMany.mockResolvedValue([reactionRow(OWNER_ID, 'love')]);
+
+    const res = await request(app)
+      .put('/api/chat/messages/5001/reaction')
+      .set('Authorization', ownerAuth())
+      .send({ reaction: 'love' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual({
+      messageId: 5001,
+      attachmentId: null,
+      reactions: [{ reaction: 'love', count: 1, reactedByMe: true }],
+    });
+
+    const call = mockPrisma.$executeRaw.mock.calls[0];
+    expect(sqlOf(call)).toContain('ON CONFLICT (message_id, user_id) WHERE attachment_id IS NULL');
+    // Message, reactor, emoji — and the reactor is the token's user.
+    expect(call.slice(1)).toEqual([5001n, OWNER_ID, 'love']);
+  });
+
+  it('reacts to one file on the message, keyed on that file', async () => {
+    const res = await request(app)
+      .put('/api/chat/messages/5001/reaction')
+      .set('Authorization', managerAuth())
+      .send({ reaction: 'like', attachmentId: ATTACHMENT_ID });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.attachmentId).toBe(ATTACHMENT_ID);
+
+    const call = mockPrisma.$executeRaw.mock.calls[0];
+    expect(sqlOf(call)).toContain('ON CONFLICT (attachment_id, user_id) WHERE attachment_id IS NOT NULL');
+    expect(call.slice(1)).toEqual([5001n, ATTACHMENT_ID, MANAGER_ID, 'like']);
+  });
+
+  it('refuses a file that belongs to a different message', async () => {
+    mockPrisma.chatAttachment.findUnique.mockResolvedValue(
+      attachmentRow({ message: { id: 6000n, deletedAt: null, conversation: accessRow().conversation } })
+    );
+
+    const res = await request(app)
+      .put('/api/chat/messages/5001/reaction')
+      .set('Authorization', managerAuth())
+      .send({ reaction: 'like', attachmentId: ATTACHMENT_ID });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe('CHAT_ATTACHMENT_NOT_FOUND');
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('refuses an emoji that is not on the list', async () => {
+    const res = await request(app)
+      .put('/api/chat/messages/5001/reaction')
+      .set('Authorization', ownerAuth())
+      .send({ reaction: 'angry' });
+
+    expect(res.status).toBe(400);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('refuses a body that names a different reactor', async () => {
+    const res = await request(app)
+      .put('/api/chat/messages/5001/reaction')
+      .set('Authorization', ownerAuth())
+      .send({ reaction: 'love', userId: MANAGER_ID });
+
+    expect(res.status).toBe(400);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('refuses someone who is not in the thread', async () => {
+    const res = await request(app)
+      .put('/api/chat/messages/5001/reaction')
+      .set('Authorization', outsiderAuth())
+      .send({ reaction: 'love' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('CHAT_ACCESS_DENIED');
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('refuses a deleted message', async () => {
+    mockPrisma.chatMessage.findUnique.mockResolvedValue(accessRow({ deletedAt: new Date() }));
+
+    const res = await request(app)
+      .put('/api/chat/messages/5001/reaction')
+      .set('Authorization', ownerAuth())
+      .send({ reaction: 'love' });
+
+    expect(res.status).toBe(404);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('removes only the caller’s own reaction', async () => {
+    mockPrisma.chatReaction.deleteMany.mockResolvedValue({ count: 1 });
+
+    const res = await request(app)
+      .delete('/api/chat/messages/5001/reaction')
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.removed).toBe(true);
+    // The caller's id is in the WHERE — the other side's reaction cannot match.
+    expect(mockPrisma.chatReaction.deleteMany.mock.calls[0][0].where).toEqual({
+      messageId: 5001n,
+      attachmentId: null,
+      userId: OWNER_ID,
+    });
+  });
+
+  it('removes a file reaction when the file is named in the query', async () => {
+    mockPrisma.chatReaction.deleteMany.mockResolvedValue({ count: 1 });
+
+    const res = await request(app)
+      .delete(`/api/chat/messages/5001/reaction?attachmentId=${ATTACHMENT_ID}`)
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(200);
+    expect(mockPrisma.chatReaction.deleteMany.mock.calls[0][0].where).toEqual({
+      messageId: 5001n,
+      attachmentId: ATTACHMENT_ID,
+      userId: MANAGER_ID,
+    });
+  });
+
+  it('treats removing a reaction you do not have as a no-op, not a 404', async () => {
+    const res = await request(app)
+      .delete('/api/chat/messages/5001/reaction')
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.removed).toBe(false);
+  });
+
+  it('folds reactions onto the message and each file in a thread page', async () => {
+    mockPrisma.chatConversation.findUnique.mockResolvedValue(conversationRow());
+    mockPrisma.chatMessage.findMany.mockResolvedValue([
+      messageRow({
+        attachments: [{ id: ATTACHMENT_ID, originalName: 'statement.pdf', mimeType: 'application/pdf', sizeBytes: 2048n }],
+        reactions: [
+          { attachmentId: null, userId: OWNER_ID, reaction: 'love' },
+          { attachmentId: null, userId: MANAGER_ID, reaction: 'love' },
+          { attachmentId: ATTACHMENT_ID, userId: MANAGER_ID, reaction: 'like' },
+        ],
+      }),
+    ]);
+
+    const res = await request(app)
+      .get(`/api/chat/conversations/${CONVERSATION_ID}/messages`)
+      .set('Authorization', ownerAuth());
+
+    expect(res.status).toBe(200);
+    const [message] = res.body.data.messages;
+    expect(message.reactions).toEqual([{ reaction: 'love', count: 2, reactedByMe: true }]);
+    expect(message.attachments[0].reactions).toEqual([{ reaction: 'like', count: 1, reactedByMe: false }]);
   });
 });

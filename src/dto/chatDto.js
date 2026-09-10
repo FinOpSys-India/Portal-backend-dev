@@ -1,6 +1,7 @@
 'use strict';
 
 const { toPerson } = require('./projectDto');
+const { REACTIONS } = require('../validators/chatValidator');
 
 /**
  * Response shapes for chat.
@@ -35,8 +36,26 @@ function toNumber(value) {
   return Number(value);
 }
 
-/** One attachment as the client sees it. */
-function toAttachment(attachment) {
+/**
+ * The reaction rows on ONE target folded into `[{ reaction, count, reactedByMe }]`.
+ *
+ * In the frontend's REACTIONS order, so the chips under a bubble do not
+ * reshuffle as counts change. Emojis nobody used are left out, so an untouched
+ * message or file is `[]`.
+ */
+function summarizeReactions(rows, viewerUserId = null) {
+  const byKind = new Map();
+  for (const row of rows ?? []) {
+    const entry = byKind.get(row.reaction) ?? { reaction: row.reaction, count: 0, reactedByMe: false };
+    entry.count += 1;
+    if (viewerUserId !== null && row.userId === viewerUserId) entry.reactedByMe = true;
+    byKind.set(row.reaction, entry);
+  }
+  return REACTIONS.filter((kind) => byKind.has(kind)).map((kind) => byKind.get(kind));
+}
+
+/** One attachment as the client sees it, with the reactions on that file. */
+function toAttachment(attachment, { reactions = [], viewerUserId = null } = {}) {
   return {
     id: attachment.id,
     // `fileName` rather than `originalName`: the column is named for what it
@@ -51,6 +70,7 @@ function toAttachment(attachment) {
     // be signed for every attachment in every message of every page — most of
     // which nobody opens — and would still be expired by the time they did.
     downloadPath: `/chat/attachments/${attachment.id}/download-url`,
+    reactions: summarizeReactions(reactions, viewerUserId),
   };
 }
 
@@ -86,6 +106,10 @@ function receiverOf(message, conversation) {
  * a context where it may not have it.
  */
 function toMessage(message, { conversation, viewerUserId = null } = {}) {
+  // Every reaction on the message, split by target below: the message's own
+  // carry no attachmentId, a file's carry that file's id.
+  const reactionRows = message.reactions ?? [];
+
   return {
     id: toNumber(message.id),
     conversationId: message.conversationId,
@@ -97,7 +121,16 @@ function toMessage(message, { conversation, viewerUserId = null } = {}) {
     // Null when the message carried only files. The client renders the
     // attachments and no bubble text, rather than an empty line.
     body: message.body ?? null,
-    attachments: (message.attachments ?? []).map(toAttachment),
+    reactions: summarizeReactions(
+      reactionRows.filter((row) => row.attachmentId === null),
+      viewerUserId
+    ),
+    attachments: (message.attachments ?? []).map((attachment) =>
+      toAttachment(attachment, {
+        reactions: reactionRows.filter((row) => row.attachmentId === attachment.id),
+        viewerUserId,
+      })
+    ),
 
     /*
      * Whether there are files at all, which is not always answerable from the
@@ -233,8 +266,22 @@ function toMessagePage({ conversation, messages, viewerUserId, nextCursor, unrea
   };
 }
 
+/**
+ * What a reaction write returns: the target and its reactions as they now
+ * stand, so the client redraws the chips from the server's answer — the other
+ * side may have reacted in the same moment.
+ */
+function toReactionTarget({ messageId, attachmentId, rows, viewerUserId }) {
+  return {
+    messageId: toNumber(messageId),
+    attachmentId: attachmentId ?? null,
+    reactions: summarizeReactions(rows, viewerUserId),
+  };
+}
+
 module.exports = {
   toNumber,
+  summarizeReactions,
   toAttachment,
   toMessage,
   toConversation,
@@ -242,4 +289,5 @@ module.exports = {
   toContactList,
   toConversationList,
   toMessagePage,
+  toReactionTarget,
 };

@@ -181,6 +181,8 @@ model User {
   managedChats     ChatConversation[] @relation("ChatConversationManager")
   chats            ChatConversation[] @relation("ChatConversationParticipant")
   chatMessagesSent ChatMessage[]      @relation("ChatMessageSender")
+  // Every emoji this user has put on a chat message or file.
+  chatReactions    ChatReaction[]     @relation("ChatReactionUser")
 
   sentEmails     EmailMessage[]   @relation("EmailMessageSender")
   receivedEmails EmailRecipient[] @relation("EmailRecipientUser")
@@ -1361,6 +1363,9 @@ model ChatMessage {
   sender       User             @relation("ChatMessageSender", fields: [senderUserId], references: [id], onDelete: Restrict)
 
   attachments ChatAttachment[]
+  /// Reactions on the message AND on its files — a file reaction carries
+  /// `attachmentId` as well, and chatDto splits the two apart.
+  reactions   ChatReaction[]
 
   /// The database index is (conversation_id, created_at DESC) WHERE deleted_at
   /// IS NULL, plus a partial one for the unread badge. Prisma can express
@@ -1391,8 +1396,35 @@ model ChatAttachment {
 
   message ChatMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
 
+  reactions ChatReaction[]
+
   @@index([messageId])
   @@map("chat_attachments")
+}
+
+/// One person's emoji on a chat message, or on one file in it.
+///
+/// The target is the message when `attachmentId` is null, or that file when it
+/// is set; `messageId` is filled in both cases, so a page of messages loads every
+/// reaction with one lookup. ONE REACTION PER PERSON PER TARGET, enforced by two
+/// PARTIAL unique indexes (db/schema/24_add_chat_reactions.sql) that Prisma
+/// cannot express — which is also why the write is a raw INSERT … ON CONFLICT in
+/// chatRepository.setReaction rather than an `upsert`.
+model ChatReaction {
+  id           BigInt           @id @default(autoincrement())
+  messageId    BigInt           @map("message_id")
+  attachmentId Int?             @map("attachment_id")
+  /// Whoever reacted — from the verified token, never from the request body.
+  userId       Int              @map("user_id")
+  reaction     ChatReactionKind
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  message    ChatMessage     @relation(fields: [messageId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  attachment ChatAttachment? @relation(fields: [attachmentId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  user       User            @relation("ChatReactionUser", fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([messageId])
+  @@map("chat_reactions")
 }
 
 /// The two sections of the accounting manager's chat portal. OWNER and TEAMMATE
@@ -1403,4 +1435,17 @@ enum ChatParticipantKind {
   SPECIALIST
 
   @@map("chat_participant_kind")
+}
+
+/// The six emoji a chat message or file can carry. Lower-case because they are
+/// the frontend's REACTIONS keys, sent and returned verbatim.
+enum ChatReactionKind {
+  like
+  laugh
+  sad
+  wow
+  love
+  thanks
+
+  @@map("chat_reaction_kind")
 }

@@ -1208,6 +1208,111 @@ async function createDownloadLink({ userId, requestId, attachmentId }) {
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/* reactions                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The message — and, when one is named, the file on it — that a reaction is
+ * about, or a throw.
+ *
+ * THE SAME GATE AS EVERY OTHER WRITE HERE: one of the thread's two sides. Either
+ * side may react to anything in the thread, the other person's messages
+ * included — that is what a reaction is for. The thread is checked before
+ * anything else, as in deleteMessage, so an outsider cannot tell from the error
+ * code whether the message exists.
+ *
+ * A deleted message takes no reactions, and neither does a file that is not on
+ * THIS message: an attachment id is a claim, and without the check a reaction
+ * could be filed under one message while pointing at another message's file.
+ */
+async function loadReactionTarget({ userId, messageId, attachmentId }) {
+  const caller = await loadCaller(userId);
+
+  const message = await repo.findMessageForAccess(prisma, messageId);
+  if (!message) throw messageNotFound();
+
+  assertParticipant(caller, message.conversation);
+
+  if (message.deletedAt) throw messageNotFound();
+
+  if (attachmentId !== null) {
+    const attachment = await repo.findAttachmentForDownload(prisma, attachmentId);
+    // A null `fileKey` means purged, which today only follows a message delete —
+    // checked anyway, as in createDownloadLink.
+    if (!attachment || attachment.message.id !== message.id || !attachment.fileKey) {
+      throw attachmentNotFound();
+    }
+  }
+
+  return { caller, message };
+}
+
+/** "message 5001" or "message 5001, attachment 61" — for the audit line. */
+function reactionTargetLabel(messageId, attachmentId) {
+  return attachmentId ? `message ${messageId}, attachment ${attachmentId}` : `message ${messageId}`;
+}
+
+/**
+ * PUT /chat/messages/:id/reaction — react, or change your reaction.
+ *
+ * ONE REACTION PER PERSON PER TARGET: a different emoji REPLACES the old one
+ * rather than adding a second (the ON CONFLICT in chatRepository.setReaction).
+ * The reactor is the caller, always — no request field can name anyone else.
+ *
+ * Returns the target's reactions as they now stand rather than echoing the
+ * request, so the client redraws from the server's answer. The other side sees
+ * the change through Supabase Realtime — chat_reactions is published, see
+ * db/schema/24_add_chat_reactions.sql.
+ */
+async function setReaction({ userId, requestId, messageId, body }) {
+  const { attachmentId, reaction } = body;
+  const { caller, message } = await loadReactionTarget({ userId, messageId, attachmentId });
+
+  await repo.setReaction(prisma, { messageId: message.id, attachmentId, userId: caller.id, reaction });
+  const rows = await repo.listReactionsForTarget(prisma, { messageId: message.id, attachmentId });
+
+  logEvent({
+    event: 'chat.reaction.set',
+    status: 'success',
+    requestId,
+    userId,
+    companyId: message.conversation.companyId,
+    detail: `${reactionTargetLabel(message.id, attachmentId)}: ${reaction}`,
+  });
+
+  return dto.toReactionTarget({ messageId: message.id, attachmentId, rows, viewerUserId: caller.id });
+}
+
+/**
+ * DELETE /chat/messages/:id/reaction?attachmentId= — take your reaction back.
+ *
+ * YOUR OWN ONLY, and not by a check that could be forgotten: the caller's id is
+ * in the DELETE's WHERE, so the other person's reaction on the same target
+ * simply does not match. Idempotent — removing a reaction you do not have is a
+ * 200 with `removed: false`, not a 404, so a double click is harmless.
+ */
+async function removeReaction({ userId, requestId, messageId, attachmentId }) {
+  const { caller, message } = await loadReactionTarget({ userId, messageId, attachmentId });
+
+  const result = await repo.removeReaction(prisma, { messageId: message.id, attachmentId, userId: caller.id });
+  const rows = await repo.listReactionsForTarget(prisma, { messageId: message.id, attachmentId });
+
+  logEvent({
+    event: 'chat.reaction.removed',
+    status: 'success',
+    requestId,
+    userId,
+    companyId: message.conversation.companyId,
+    detail: `${reactionTargetLabel(message.id, attachmentId)}, ${result.count} removed`,
+  });
+
+  return {
+    ...dto.toReactionTarget({ messageId: message.id, attachmentId, rows, viewerUserId: caller.id }),
+    removed: result.count > 0,
+  };
+}
+
 module.exports = {
   listCustomerContacts,
   listSpecialistContacts,
@@ -1220,4 +1325,6 @@ module.exports = {
   unreadCount,
   createUploadTickets,
   createDownloadLink,
+  setReaction,
+  removeReaction,
 };

@@ -10,6 +10,8 @@ const {
   validateSendMessage,
   validateMarkRead,
   validateUploadTicketRequest,
+  validateSetReaction,
+  validateReactionTarget,
 } = require('../validators/chatValidator');
 const { isAllowedMimeType, ACCEPTED_LABEL } = require('../utils/documentTypes');
 const chatService = require('../services/chatService');
@@ -338,6 +340,54 @@ const issueRealtimeToken = asyncHandler(async (req, res) => {
   });
 });
 
+/* -------------------------------------------------------------------------- */
+/* reactions                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * PUT /chat/messages/:messageId/reaction — `{ reaction, attachmentId? }`
+ *
+ * PUT because it is idempotent: the same reaction sent twice leaves one row, and
+ * a different one replaces it. 200 with the target's reactions as they now
+ * stand.
+ */
+const setReaction = asyncHandler(async (req, res) => {
+  const messageId = parseMessageId(req.params.messageId);
+  const body = validateSetReaction(req.body);
+
+  const data = await chatService.setReaction({
+    userId: req.user.id,
+    requestId: req.id,
+    messageId,
+    body,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Reaction saved.',
+    data,
+  });
+});
+
+/** DELETE /chat/messages/:messageId/reaction?attachmentId= — your own only. */
+const removeReaction = asyncHandler(async (req, res) => {
+  const messageId = parseMessageId(req.params.messageId);
+  const { attachmentId } = validateReactionTarget(req.query);
+
+  const data = await chatService.removeReaction({
+    userId: req.user.id,
+    requestId: req.id,
+    messageId,
+    attachmentId,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: data.removed ? 'Reaction removed.' : 'No reaction to remove.',
+    data,
+  });
+});
+
 module.exports = {
   listCustomerContacts,
   listSpecialistContacts,
@@ -351,4 +401,6 @@ module.exports = {
   requestUploadUrls,
   requestDownloadUrl,
   issueRealtimeToken,
+  setReaction,
+  removeReaction,
 };
