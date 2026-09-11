@@ -49,7 +49,7 @@ const sendInvitationEmail = async ({
      * inviter's real address.
      */
     from: {
-      name: process.env.SMTP_FROM_NAME || "Admin",
+      name: process.env.SMTP_FROM_NAME || "FinOpSys Portal",
       address: process.env.SMTP_FROM || senderEmail
     },
 
