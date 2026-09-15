@@ -10,6 +10,7 @@ const mockPrisma = {
   user: { findUnique: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   company: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), create: jest.fn(), update: jest.fn() },
   companySubscription: { findMany: jest.fn() },
+  companyMember: { findFirst: jest.fn(), findMany: jest.fn() },
   companySpecialistAssignment: {
     findFirst: jest.fn(),
     findMany: jest.fn(),
@@ -195,6 +196,8 @@ beforeEach(() => {
   mockPrisma.companySubscription.findMany.mockResolvedValue([]);
   mockPrisma.companySpecialistAssignment.findMany.mockResolvedValue([]);
   mockPrisma.companySpecialistAssignment.updateMany.mockResolvedValue({ count: 0 });
+  mockPrisma.companyMember.findFirst.mockResolvedValue(null);
+  mockPrisma.companyMember.findMany.mockResolvedValue([]);
   mockPrisma.specificRole.findMany.mockResolvedValue([]);
   realtime.reset();
 });
@@ -241,6 +244,31 @@ describe('GET /admin/company-accounts', () => {
         where: { status: 'ACTIVE', role: { code: 'ACCOUNTING_MANAGER' } },
       })
     );
+  });
+
+  it('includes teammates in the team and the count', async () => {
+    stageUsers({ [ADMIN_ID]: person(ADMIN_ID, 'Root', 'Admin', 'ADMIN') });
+    mockPrisma.company.findMany.mockResolvedValue([
+      company({ accountingManagerUserId: MANAGER_ID, accountingManager: managerPerson() }),
+    ]);
+    mockPrisma.company.count.mockResolvedValue(1);
+    mockPrisma.user.findMany.mockResolvedValue([]);
+    mockPrisma.companySubscription.findMany.mockResolvedValue([]);
+    mockPrisma.companyMember.findMany.mockResolvedValue([
+      { companyId: COMPANY_ID, user: { id: 88, firstName: 'Ravi', lastName: 'K', email: 'ravi@finopsys.ai' } },
+    ]);
+
+    const res = await request(app).get('/api/admin/company-accounts').set('Authorization', auth());
+    const row = res.body.data.companies[0];
+
+    expect(res.status).toBe(200);
+    expect(row.teamMembers.teammates).toEqual([
+      { userId: 88, firstName: 'Ravi', lastName: 'K', email: 'ravi@finopsys.ai' },
+    ]);
+    // Owner + accounting manager + one teammate.
+    expect(row.teamMemberCount).toBe(3);
+    // Batched with the rest of the page, not one query per row.
+    expect(mockPrisma.companyMember.findMany).toHaveBeenCalledTimes(1);
   });
 
   it('returns active services, the billing date and the team for each row', async () => {

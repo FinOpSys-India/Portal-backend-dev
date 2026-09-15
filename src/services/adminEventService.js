@@ -99,11 +99,11 @@ function companyServicesChanged({ companyId, subscriptionId, status }) {
  * GET /companies/:companyId/team returns — so the "Team Members" cell redraws
  * without a follow-up request.
  */
-function companyTeamChanged(company, assignments) {
+function companyTeamChanged(company, assignments, members) {
   if (!company) return;
   realtime.publish('company.team.changed', {
     companyId: company.id,
-    team: dto.toTeam({ company, assignments: assignments ?? [] }),
+    team: dto.toTeam({ company, assignments: assignments ?? [], members: members ?? [] }),
   });
 }
 

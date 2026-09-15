@@ -167,7 +167,7 @@ function toAssignment(assignment) {
  * rendered from this payload has the id it needs — previously it did not, and
  * the client had to call the specialists endpoint as well.
  */
-function toTeam({ company, assignments }) {
+function toTeam({ company, assignments, members = [] }) {
   const bySpecialist = new Map();
   for (const a of assignments) {
     const key = a.specialistUserId;
@@ -190,6 +190,9 @@ function toTeam({ company, assignments }) {
     owner: toPerson(company.owner),
     accountingManager: toPerson(company.accountingManager),
     specialists: [...bySpecialist.values()],
+    // Customer-side teammates (company_members). The owner is linked through
+    // companies.owner_user_id instead, so never appears here twice.
+    teammates: members.map((m) => toPerson(m.user)).filter(Boolean),
   };
 }
 
@@ -292,15 +295,18 @@ function toBillingSummary(subscription) {
  * rather than left to the client to add up, because who counts as a member (the
  * owner? an accounting manager with no specialists?) is a server-side rule.
  */
-function toCompanyAccountRow({ company, address, subscription, assignments, accessRole }) {
-  const team = toTeam({ company, assignments });
+function toCompanyAccountRow({ company, address, subscription, assignments, members = [], accessRole }) {
+  const team = toTeam({ company, assignments, members });
+  const servicePlans = toServicePlans(subscription);
   return {
     ...toCompanyDetail({ company, address, accessRole }),
     activeServices: toActiveServices(subscription),
+    servicePlans,
+    servicesTotal: toServicesTotal(servicePlans),
     billing: toBillingSummary(subscription),
     teamMembers: team,
     teamMemberCount:
-      (team.owner ? 1 : 0) + (team.accountingManager ? 1 : 0) + team.specialists.length,
+      (team.owner ? 1 : 0) + (team.accountingManager ? 1 : 0) + team.specialists.length + team.teammates.length,
   };
 }
 
@@ -374,6 +380,19 @@ function toServicePlans(subscription) {
 }
 
 /**
+ * The whole subscription's price: the sum of every service line, in minor units.
+ * Null when there is nothing to price. A Stripe subscription bills in a single
+ * currency, so the services never need converting before they are added up.
+ */
+function toServicesTotal(servicePlans) {
+  if (!servicePlans.length) return null;
+  return {
+    totalAmountMinor: servicePlans.reduce((sum, service) => sum + service.totalAmountMinor, 0),
+    currency: servicePlans[0].currency,
+  };
+}
+
+/**
  * Everyone working on an account, with enough detail to contact them.
  *
  * `toTeam` groups specialists by person for a compact team panel; this keeps
@@ -424,9 +443,11 @@ function toCompanyMembers({ company, assignments }) {
  * view needs and the admin's does not.
  */
 function toManagedCompany({ company, address, subscription, assignments }) {
+  const servicePlans = toServicePlans(subscription);
   return {
     ...toCompanyDetail({ company, address, accessRole: 'ACCOUNTING_MANAGER' }),
-    servicePlans: toServicePlans(subscription),
+    servicePlans,
+    servicesTotal: toServicesTotal(servicePlans),
     // Kept alongside the priced view so one client can render either without a
     // second request — the compact form for a list, the priced form for detail.
     activeServices: toActiveServices(subscription),

@@ -34,9 +34,11 @@ router.use(requireAuth);
 router.get('/', listCustomerDirectory);
 
 /*
- * The profile. NARROWER than the list above, and deliberately so — this one is
- * the ACCOUNTING MANAGER of the named company and nobody else, where the list
- * also answers an admin and anyone else who can read the company.
+ * The profile. NARROWER than the list above — this one is the ACCOUNTING
+ * MANAGER of the named company, or an ADMIN, where the list also answers anyone
+ * else who can read the company. An admin may omit `companyId` and read any
+ * customer's profile; if they pass one, it scopes the lookup as it does for a
+ * manager.
  *
  * The reason is what the profile carries: the customer's personal phone number
  * and their own home address, which is the manager's working material for
@@ -50,6 +52,6 @@ router.get('/', listCustomerDirectory);
  * same answer. A customer who is not on the named company is a 404, not a 403 —
  * the profile must not become a way to confirm ids the list would not show.
  */
-router.get('/:userId', requireRole('ACCOUNTING_MANAGER'), getCustomerDetail);
+router.get('/:userId', requireRole('ACCOUNTING_MANAGER', 'ADMIN'), getCustomerDetail);
 
 module.exports = router;

@@ -524,6 +524,19 @@ function listActiveAssignmentsForCompanies(client, companyIds) {
   });
 }
 
+/** ACTIVE teammates (company_members) across several companies, in one query. */
+function listMembersForCompanies(client, companyIds) {
+  if (!companyIds.length) return Promise.resolve([]);
+  return client.companyMember.findMany({
+    where: { companyId: { in: companyIds }, user: { status: 'ACTIVE' } },
+    select: {
+      companyId: true,
+      user: { select: { id: true, firstName: true, lastName: true, email: true } },
+    },
+    orderBy: [{ companyId: 'asc' }, { user: { firstName: 'asc' } }],
+  });
+}
+
 /* --------------------------- specialist eligibility ----------------------- */
 
 /**
@@ -1160,6 +1173,7 @@ module.exports = {
   findUnpaidCompanyForOwner,
   listActiveSubscriptionsForCompanies,
   listActiveAssignmentsForCompanies,
+  listMembersForCompanies,
   listEligibleSpecialists,
   findSpecificRolesByCodes,
   deactivateOtherAssignments,

@@ -572,16 +572,17 @@ async function accessRoleFor(caller, company) {
  * read, and the admin table. Asking per company would make a 25-row page fifty
  * round trips.
  *
- * @returns {{ subscriptionFor: (id: number) => object|null, assignmentsFor: (id: number) => object[] }}
+ * @returns {{ subscriptionFor: (id: number) => object|null, assignmentsFor: (id: number) => object[], membersFor: (id: number) => object[] }}
  */
 async function loadCompanyContext(companyIds) {
   if (!companyIds.length) {
-    return { subscriptionFor: () => null, assignmentsFor: () => [] };
+    return { subscriptionFor: () => null, assignmentsFor: () => [], membersFor: () => [] };
   }
 
-  const [subscriptions, assignments] = await Promise.all([
+  const [subscriptions, assignments, members] = await Promise.all([
     repo.listActiveSubscriptionsForCompanies(prisma, companyIds),
     repo.listActiveAssignmentsForCompanies(prisma, companyIds),
+    repo.listMembersForCompanies(prisma, companyIds),
   ]);
 
   const subscriptionByCompany = new Map(subscriptions.map((s) => [s.companyId, s]));
@@ -590,10 +591,16 @@ async function loadCompanyContext(companyIds) {
     if (!assignmentsByCompany.has(assignment.companyId)) assignmentsByCompany.set(assignment.companyId, []);
     assignmentsByCompany.get(assignment.companyId).push(assignment);
   }
+  const membersByCompany = new Map();
+  for (const member of members) {
+    if (!membersByCompany.has(member.companyId)) membersByCompany.set(member.companyId, []);
+    membersByCompany.get(member.companyId).push(member);
+  }
 
   return {
     subscriptionFor: (id) => subscriptionByCompany.get(id) ?? null,
     assignmentsFor: (id) => assignmentsByCompany.get(id) ?? [],
+    membersFor: (id) => membersByCompany.get(id) ?? [],
   };
 }
 
@@ -632,6 +639,7 @@ async function listCompanies({ userId, requestId, query }) {
         address: company.addresses?.[0]?.address ?? null,
         subscription: context.subscriptionFor(company.id),
         assignments: context.assignmentsFor(company.id),
+        members: context.membersFor(company.id),
         accessRole: await accessRoleFor(caller, company),
       })
     );
@@ -664,6 +672,7 @@ async function getCompany({ userId, requestId, companyId }) {
     address: company.addresses?.[0]?.address ?? null,
     subscription: context.subscriptionFor(companyId),
     assignments: context.assignmentsFor(companyId),
+    members: context.membersFor(companyId),
     accessRole: await accessRoleFor(caller, company),
   });
 }
@@ -1022,6 +1031,7 @@ async function listCompanyAccounts({ userId, requestId, query }) {
         address: company.addresses?.[0]?.address ?? null,
         subscription: context.subscriptionFor(company.id),
         assignments: context.assignmentsFor(company.id),
+        members: context.membersFor(company.id),
         // Always ADMIN here — the caller could not have got this far otherwise.
         accessRole: 'ADMIN',
       })
@@ -1460,13 +1470,11 @@ function customerNotFound() {
  * tells you "only an accounting manager can assign specialists" is a message
  * about a different endpoint.
  *
- * NO ADMIN, unlike the directory this profile hangs off. That is a real
- * narrowing and it is deliberate: the customer's personal contact details and
- * home address are working material for the manager who has to reach them, and
- * an admin's job on the company table — appointing a manager — never needs them.
- * The admin still sees the customer row itself on GET /customers.
+ * An ADMIN passes as well: the admin customer screen shows the customer's phone
+ * and address, which only this profile carries.
  */
 function assertCanReadCustomerProfile(caller, company) {
+  if (isAdmin(caller)) return;
   if (!hasAccountingManagerRole(caller) || caller.status !== 'ACTIVE') {
     throw new ApiError(403, 'Only an accounting manager can view a customer profile.', {
       code: 'ACCOUNTING_MANAGER_ROLE_REQUIRED',
@@ -1482,10 +1490,9 @@ function assertCanReadCustomerProfile(caller, company) {
 /**
  * GET /customers/:userId — the profile behind a clicked customer row.
  *
- * ONE audience: the accounting manager of the company named in `?companyId=`.
- * There is no unscoped form of this request and no admin form — a manager's
- * question is "who is this person on THIS account", and `companyId` is what
- * makes the answer checkable.
+ * Two audiences: the accounting manager of the company named in `?companyId=`
+ * (required — a manager's question is "who is this person on THIS account"),
+ * and an ADMIN, for whom `companyId` is optional and only narrows the lookup.
  *
  * The scope check runs AFTER the person is loaded but BEFORE anything is
  * returned, and it is the same one the list uses — authorising the company is
@@ -1495,29 +1502,37 @@ function assertCanReadCustomerProfile(caller, company) {
  */
 async function getCustomerDetail({ userId, requestId, customerUserId, query }) {
   const caller = await loadCaller(userId);
+  const admin = isAdmin(caller);
 
-  if (!query.companyId) {
+  if (!admin && !query.companyId) {
     throw new ApiError(400, 'companyId is required.', {
       code: 'COMPANY_ID_REQUIRED',
       fields: { companyId: 'Select a company.' },
     });
   }
 
-  const company = await loadCompany(query.companyId);
-  assertCanReadCustomerProfile(caller, company);
+  // An admin without a companyId reads any customer; with one, the lookup is
+  // scoped exactly as it is for a manager.
+  let company = null;
+  if (query.companyId) {
+    company = await loadCompany(query.companyId);
+    assertCanReadCustomerProfile(caller, company);
+  }
 
   const customer = await repo.findCustomerProfile(prisma, customerUserId);
   if (!customer) throw customerNotFound();
 
-  const scopedIds = await repo.listCustomerIdsForCompanies(prisma, [company.id]);
-  if (!scopedIds.includes(customer.id)) throw customerNotFound();
+  if (company) {
+    const scopedIds = await repo.listCustomerIdsForCompanies(prisma, [company.id]);
+    if (!scopedIds.includes(customer.id)) throw customerNotFound();
+  }
 
   logEvent({
     event: 'customer.detail.read',
     status: 'success',
     requestId,
     userId,
-    companyId: company.id,
+    companyId: company?.id ?? null,
     detail: `customer=${customer.id}`,
   });
 
@@ -1641,6 +1656,7 @@ async function listManagedCompanies({ userId, requestId, query }) {
         address: company.addresses?.[0]?.address ?? null,
         subscription: context.subscriptionFor(company.id),
         assignments: context.assignmentsFor(company.id),
+        members: context.membersFor(company.id),
       })
     ),
     total,
@@ -1937,10 +1953,12 @@ async function setCompanySpecialists({ userId, requestId, companyId, assignments
    */
   await projectService.backfillAfterStaffingChange(companyId, { requestId });
 
+  const members = await repo.listMembersForCompanies(prisma, [companyId]);
+
   return {
     companyId,
     assignmentCount: result.count,
-    team: dto.toTeam({ company: result.company, assignments: result.team }),
+    team: dto.toTeam({ company: result.company, assignments: result.team, members }),
   };
 }
 
@@ -1955,11 +1973,12 @@ async function setCompanySpecialists({ userId, requestId, companyId, assignments
  * company as the next page load will find it.
  */
 async function publishTeamChange(companyId) {
-  const [company, assignments] = await Promise.all([
+  const [company, assignments, members] = await Promise.all([
     repo.findCompanyWithPeople(prisma, companyId),
     repo.listActiveAssignments(prisma, companyId),
+    repo.listMembersForCompanies(prisma, [companyId]),
   ]);
-  if (company) adminEvents.companyTeamChanged(company, assignments);
+  if (company) adminEvents.companyTeamChanged(company, assignments, members);
 }
 
 /**
@@ -2055,8 +2074,11 @@ async function getTeam({ userId, companyId }) {
   const company = await loadCompany(companyId, { withPeople: true });
   await assertReadAccess(caller, company);
 
-  const assignments = await repo.listActiveAssignments(prisma, companyId);
-  return dto.toTeam({ company, assignments });
+  const [assignments, members] = await Promise.all([
+    repo.listActiveAssignments(prisma, companyId),
+    repo.listMembersForCompanies(prisma, [companyId]),
+  ]);
+  return dto.toTeam({ company, assignments, members });
 }
 
 /** GET /companies/:companyId/specialists — paginated list of assignments. */
