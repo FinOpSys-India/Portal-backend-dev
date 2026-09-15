@@ -2,6 +2,7 @@
 
 const { prisma } = require('../config/prisma');
 const repo = require('../repositories/projectTaskRepository');
+const projectRepo = require('../repositories/projectRepository');
 const projectService = require('./projectService');
 const dto = require('../dto/projectTaskDto');
 const ApiError = require('../utils/ApiError');
@@ -206,6 +207,84 @@ function assertCompanyMatches(sentCompanyId, project) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* the project's status follows its tasks                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The status a project should hold, given how its live tasks stand.
+ *
+ *   every task COMPLETED                        -> COMPLETED
+ *   any task started, or some finished while
+ *   others are open                             -> ACTIVE
+ *   a COMPLETED project that has open work
+ *   again (a task reopened or newly filed)      -> ACTIVE
+ *   nothing started yet                         -> unchanged
+ *
+ * A project with no tasks is left alone — there is nothing to derive from, so it
+ * keeps whatever was set on it by hand. It is never moved back to TODO: a
+ * project that has started stays started.
+ */
+function projectStatusFromTasks(counts, current) {
+  const total = counts.TODO + counts.ACTIVE + counts.COMPLETED;
+  if (!total) return current;
+  if (counts.COMPLETED === total) return 'COMPLETED';
+  if (counts.ACTIVE || counts.COMPLETED || current === 'COMPLETED') return 'ACTIVE';
+  return current;
+}
+
+/**
+ * The progress bar a project should show, in HUNDREDTHS of a percent: the share
+ * of its live tasks that are COMPLETED.
+ *
+ *   progressBar = completed / total × 100, rounded DOWN to two decimals
+ *
+ * Rounded down so the bar reads 100 only when every task is done — the same
+ * moment the status becomes COMPLETED — never on a 99.995 that rounded up.
+ * Integer arithmetic, so no binary float sits between the counts and the
+ * NUMERIC(5,2) column.
+ */
+function progressFromTasks(counts, total) {
+  return Math.floor((counts.COMPLETED * 10000) / total);
+}
+
+/**
+ * Re-derive a project's status and progress bar from its tasks, inside the
+ * caller's transaction, after every task write that can change the answer —
+ * create, status move and delete — so the project cannot drift from the work
+ * under it.
+ *
+ * A project with no tasks is left alone entirely: there is nothing to derive
+ * from, so it keeps whatever was set on it by hand.
+ *
+ * @returns {Promise<string>} the project's status after the sync
+ */
+async function syncProjectFromTasks(tx, project) {
+  const counts = dto.toStatusCounts(await repo.summarizeProjectTasks(tx, { projectId: project.id }));
+  const total = counts.TODO + counts.ACTIVE + counts.COMPLETED;
+  if (!total) return project.status;
+
+  const status = projectStatusFromTasks(counts, project.status);
+  const hundredths = progressFromTasks(counts, total);
+
+  const unchanged =
+    status === project.status && hundredths === Math.round(Number(project.progressBar) * 100);
+  if (!unchanged) {
+    // A string for the Decimal column, the same rule validateProgress follows.
+    await projectRepo.setProjectProgress(tx, project.id, {
+      status,
+      progressBar: (hundredths / 100).toFixed(2),
+    });
+  }
+  return status;
+}
+
+// A task row read before the sync carries its project's old status; correct it
+// rather than read the row again.
+function withProjectStatus(task, status) {
+  return task.project ? { ...task, project: { ...task.project, status } } : task;
+}
+
+/* -------------------------------------------------------------------------- */
 /* the endpoints                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -325,7 +404,7 @@ async function createTask({ userId, requestId, input }) {
     assertTaskWriteAccess(caller, company, project);
     assertDeadlineWithinProject(input.deadlineDate, project.deadlineDate);
 
-    return repo.createTask(tx, {
+    const task = await repo.createTask(tx, {
       projectId: project.id,
       taskName: input.taskName,
       description: input.description,
@@ -334,6 +413,8 @@ async function createTask({ userId, requestId, input }) {
       specialistUserId: project.assignedSpecialistUserId,
       createdByUserId: caller.id,
     });
+
+    return withProjectStatus(task, await syncProjectFromTasks(tx, project));
   });
 
   logEvent({
@@ -376,7 +457,8 @@ async function updateTaskStatus({ userId, requestId, taskId, input }) {
     });
     assertTaskWriteAccess(caller, company, project);
 
-    return repo.updateTask(tx, taskId, { status: input.status });
+    const moved = await repo.updateTask(tx, taskId, { status: input.status });
+    return withProjectStatus(moved, await syncProjectFromTasks(tx, project));
   });
 
   logEvent({
@@ -420,13 +502,16 @@ async function deleteTask({ userId, requestId, taskId }) {
     // the status write. Its rows are marked by the project delete itself.
     if (!task.project || task.project.deletedAt) throw projectNotFound();
 
-    const { caller, company } = await projectService.loadProjectForRead(tx, {
+    const { caller, project, company } = await projectService.loadProjectForRead(tx, {
       userId,
       projectId: task.projectId,
     });
     assertTaskDeleteAccess(caller, company, task);
 
     await repo.softDeleteTask(tx, taskId, new Date());
+    // One task fewer changes the total the progress bar is a share of, and
+    // withdrawing the last open one leaves only finished work behind.
+    await syncProjectFromTasks(tx, project);
     return { companyId: company.id, projectId: task.projectId };
   });
 

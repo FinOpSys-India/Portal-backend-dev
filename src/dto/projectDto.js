@@ -196,8 +196,8 @@ function toProject(project) {
     createdBy: toPerson(project.createdBy),
 
     status: project.status,
-    // 0–100, the number the bar is drawn from. Independent of `status` — see
-    // the note on the column in prisma/schema.prisma.
+    // 0–100, the number the bar is drawn from. On a project with tasks it is
+    // the share of them COMPLETED, kept in step by projectTaskService.
     progressBar: toPercent(project.progressBar),
 
     createdAt: project.createdAt,

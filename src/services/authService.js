@@ -21,14 +21,45 @@ const adminEvents = require('./adminEventService');
 const LOGIN_PURPOSE = 'LOGIN_EMAIL_OTP';
 
 /**
- * The single generic error used for every login-credential failure — unknown
- * email, wrong password, or an account that may not log in. Returning one
- * identical response (same code, message, and status) is what stops an attacker
- * probing which emails are registered. A fresh instance per call keeps each
- * error's own request-scoped stack.
+ * The generic credential error, used for an unknown email and for a correct
+ * password on an account that may not log in. A fresh instance per call keeps
+ * each error's own request-scoped stack.
  */
 function invalidCredentials() {
   return new ApiError(401, 'Invalid email or password.', { code: 'INVALID_CREDENTIALS' });
+}
+
+/**
+ * A wrong password on a real account, with the number of tries left before the
+ * temporary lock so the client can warn the user. Only real accounts have a
+ * counter, so this does let a caller tell a registered email from an unknown
+ * one — a trade-off accepted in exchange for the warning.
+ */
+function wrongPassword(attemptsRemaining) {
+  const noun = attemptsRemaining === 1 ? 'attempt' : 'attempts';
+  return new ApiError(
+    401,
+    `Invalid email or password. ${attemptsRemaining} ${noun} left before your account is locked for ${config.auth.loginLockMinutes} minutes.`,
+    {
+      code: 'INVALID_CREDENTIALS',
+      details: { attemptsRemaining, maxAttempts: config.auth.maxLoginAttempts },
+    }
+  );
+}
+
+/** The account is inside its temporary lock window. */
+function accountLocked(lockedUntil) {
+  const retryAfterSeconds = Math.max(1, Math.ceil((lockedUntil.getTime() - Date.now()) / 1000));
+  const minutes = Math.ceil(retryAfterSeconds / 60);
+  return new ApiError(
+    423,
+    `Too many failed attempts. Your account is locked. Try again in ${minutes} minute${minutes === 1 ? '' : 's'} or reset your password.`,
+    {
+      code: 'ACCOUNT_LOCKED',
+      details: { attemptsRemaining: 0, retryAfterSeconds, lockedUntil: lockedUntil.toISOString() },
+      headers: { 'Retry-After': String(retryAfterSeconds) },
+    }
+  );
 }
 
 // Invitation statuses from which a sign-up may still proceed. Anything else
@@ -251,10 +282,10 @@ const USER_LOGIN_FIELDS = {
  * access token, no refresh token, no last_login update. All it returns is what
  * the client needs to drive the OTP screen.
  *
- * Every credential failure funnels through invalidCredentials() so the response
- * is identical whether the email is unknown, the password is wrong, or the
- * account may not log in. On the unknown-email branch a dummy hash is compared
- * so that path takes about as long as a real one.
+ * An unknown email and a non-ACTIVE account get the same generic error; on the
+ * unknown-email branch a dummy hash is compared so that path takes about as
+ * long as a real one. A wrong password reports the attempts left, and a locked
+ * account is told how long the lock has to run.
  *
  * @param {{ email: string, password: string, context?: { ip?: string, userAgent?: string } }} params
  * @returns {{ challengeId: string, maskedEmail: string, expiresInSeconds: number,
@@ -276,19 +307,25 @@ async function login({ email, password, context = {} }) {
     throw invalidCredentials();
   }
 
+  // Inside the lock window the account is refused before the password is
+  // checked, so guesses made during the lock are neither tested nor counted.
+  if (user.lockedUntil && user.lockedUntil > new Date()) {
+    logger.warn(`Login blocked (locked until ${user.lockedUntil.toISOString()}) for user ${user.id}.`);
+    throw accountLocked(user.lockedUntil);
+  }
+
   const passwordOk = await verifyPassword(password, user.passwordHash);
 
   if (!passwordOk) {
-    await registerFailedPassword(user);
-    logger.warn(`Login failed (bad password) for user ${user.id}.`);
-    throw invalidCredentials();
+    const { attemptsRemaining, lockedUntil } = await registerFailedPassword(user);
+    logger.warn(`Login failed (bad password, ${attemptsRemaining} left) for user ${user.id}.`);
+    throw lockedUntil ? accountLocked(lockedUntil) : wrongPassword(attemptsRemaining);
   }
 
-  // Password is correct. An account that is locked or not ACTIVE still gets the
-  // same generic error — its status is never disclosed to the caller.
-  const locked = user.lockedUntil && user.lockedUntil > new Date();
-  if (locked || user.status !== 'ACTIVE') {
-    logger.warn(`Login blocked (status=${user.status}, locked=${Boolean(locked)}) for user ${user.id}.`);
+  // Password is correct. An account that is not ACTIVE still gets the generic
+  // error — its status is never disclosed to the caller.
+  if (user.status !== 'ACTIVE') {
+    logger.warn(`Login blocked (status=${user.status}) for user ${user.id}.`);
     throw invalidCredentials();
   }
 
@@ -340,13 +377,17 @@ async function login({ email, password, context = {} }) {
  * Record a failed password attempt and, once the threshold is reached, apply a
  * temporary lock (never a permanent one, which could be abused to lock a
  * legitimate user out). Best-effort: a failure to write the counter must not
- * change the generic error the caller ultimately receives.
+ * change the error the caller ultimately receives.
+ *
+ * @returns {Promise<{ attemptsRemaining: number, lockedUntil: Date|null }>}
  */
 async function registerFailedPassword(user) {
   const attempts = user.failedLoginAttempts + 1;
   const data = { failedLoginAttempts: attempts };
+  let lockedUntil = null;
   if (attempts >= config.auth.maxLoginAttempts) {
-    data.lockedUntil = new Date(Date.now() + config.auth.loginLockMinutes * 60 * 1000);
+    lockedUntil = new Date(Date.now() + config.auth.loginLockMinutes * 60 * 1000);
+    data.lockedUntil = lockedUntil;
     // Reset the counter alongside the lock so the account is not immediately
     // re-locked on the first attempt after the lock expires.
     data.failedLoginAttempts = 0;
@@ -356,6 +397,7 @@ async function registerFailedPassword(user) {
   } catch (err) {
     logger.error(`Failed to record login failure for user ${user.id}: ${err.message}`);
   }
+  return { attemptsRemaining: Math.max(0, config.auth.maxLoginAttempts - attempts), lockedUntil };
 }
 
 /**

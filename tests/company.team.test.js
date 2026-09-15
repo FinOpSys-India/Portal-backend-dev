@@ -100,7 +100,10 @@ describe('PUT /companies/:id/accounting-manager', () => {
     expect(res.status).toBe(200);
     expect(res.body.data.company.accountingManagerUserId).toBe(MANAGER_ID);
     expect(mockPrisma.company.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: COMPANY_ID }, data: { accountingManagerUserId: MANAGER_ID } })
+      expect.objectContaining({
+        where: { id: COMPANY_ID, accountingManagerUserId: null },
+        data: { accountingManagerUserId: MANAGER_ID },
+      })
     );
   });
 
@@ -239,9 +242,9 @@ describe('POST /companies/:id/specialists', () => {
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
   });
 
-  it('skips an already-active assignment instead of duplicating it', async () => {
+  it('refuses a service this specialist already holds (409)', async () => {
     stageSpecialistOk();
-    // BOOKKEEPING (spec id 1) is already active.
+    // BOOKKEEPING (spec id 1) is already active for this specialist.
     mockPrisma.companySpecialistAssignment.findMany.mockResolvedValue([
       { id: 999, companyId: COMPANY_ID, specialistUserId: SPECIALIST_ID, specializationId: 1, assignmentStatus: 'ACTIVE' },
     ]);
@@ -251,11 +254,29 @@ describe('POST /companies/:id/specialists', () => {
       .set('Authorization', managerAuth())
       .send({ specialist_user_id: SPECIALIST_ID, specialization_codes: ['BOOKKEEPING', 'PAYROLL'] });
 
-    expect(res.status).toBe(201);
-    expect(res.body.data.assignments).toHaveLength(1);
-    expect(res.body.data.assignments[0].specializationCode).toBe('PAYROLL');
-    expect(res.body.data.skipped).toContain('BOOKKEEPING');
-    expect(mockPrisma.companySpecialistAssignment.create).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('SPECIALIST_ALREADY_ASSIGNED');
+    expect(res.body.error.details.taken).toEqual([{ specializationCode: 'BOOKKEEPING', specialistUserId: SPECIALIST_ID }]);
+    // Nothing is written — not even the service that was free.
+    expect(mockPrisma.companySpecialistAssignment.create).not.toHaveBeenCalled();
+  });
+
+  it('refuses a service another specialist already holds (409)', async () => {
+    stageSpecialistOk();
+    // PAYROLL (spec id 2) is held by someone else.
+    mockPrisma.companySpecialistAssignment.findMany.mockResolvedValue([
+      { id: 998, companyId: COMPANY_ID, specialistUserId: 88, specializationId: 2, assignmentStatus: 'ACTIVE' },
+    ]);
+
+    const res = await request(app)
+      .post(`/api/companies/${COMPANY_ID}/specialists`)
+      .set('Authorization', managerAuth())
+      .send({ specialist_user_id: SPECIALIST_ID, specialization_codes: ['PAYROLL'] });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('SPECIALIST_ALREADY_ASSIGNED');
+    expect(res.body.error.details.taken).toEqual([{ specializationCode: 'PAYROLL', specialistUserId: 88 }]);
+    expect(mockPrisma.companySpecialistAssignment.create).not.toHaveBeenCalled();
   });
 
   it('rejects an unknown specialization code (400)', async () => {

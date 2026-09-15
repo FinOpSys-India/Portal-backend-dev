@@ -1041,6 +1041,32 @@ describe('PATCH /projects/:projectId', () => {
     expect(res.body.data.progressBar).toBe(100);
   });
 
+  it('completes the project when the bar reaches 100 (200)', async () => {
+    mockPrisma.project.update.mockResolvedValue(projectRow({ status: 'COMPLETED', progressBar: '100.00' }));
+
+    await request(app)
+      .patch(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth())
+      .send({ progress_bar: 100 });
+
+    expect(mockPrisma.project.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { progressBar: '100', status: 'COMPLETED' } })
+    );
+  });
+
+  it('lets a status sent beside a 100 bar win over the derived one (200)', async () => {
+    mockPrisma.project.update.mockResolvedValue(projectRow({ status: 'ACTIVE', progressBar: '100.00' }));
+
+    await request(app)
+      .patch(`/api/projects/${PROJECT_ID}`)
+      .set('Authorization', ownerAuth())
+      .send({ status: 'ACTIVE', progress_bar: 100 });
+
+    expect(mockPrisma.project.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { status: 'ACTIVE', progressBar: '100' } })
+    );
+  });
+
   it('refuses an unrelated caller (403)', async () => {
     const res = await request(app)
       .patch(`/api/projects/${PROJECT_ID}`)

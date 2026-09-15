@@ -75,6 +75,39 @@ function companyAccessDenied() {
 }
 
 /**
+ * A company already has an accounting manager. The assignment API sets the
+ * manager once; changing it means removing the current one first.
+ */
+function accountingManagerAlreadyAssigned(currentManagerUserId, requestedManagerUserId) {
+  const same = currentManagerUserId === requestedManagerUserId;
+  return new ApiError(
+    409,
+    same
+      ? 'This accounting manager is already assigned to this company.'
+      : 'This company already has an accounting manager. Remove them before assigning another.',
+    {
+      code: 'ACCOUNTING_MANAGER_ALREADY_ASSIGNED',
+      details: { accountingManagerUserId: currentManagerUserId },
+    }
+  );
+}
+
+/**
+ * One or more services already have a specialist on this company. A service is
+ * staffed once through the assignment APIs; `taken` names each service and who
+ * holds it, as [{ specializationCode, specialistUserId }].
+ */
+function specialistAlreadyAssigned(taken) {
+  return new ApiError(
+    409,
+    taken.length === 1
+      ? `${taken[0].specializationCode} already has a specialist assigned on this company.`
+      : 'These services already have a specialist assigned on this company.',
+    { code: 'SPECIALIST_ALREADY_ASSIGNED', details: { taken } }
+  );
+}
+
+/**
  * The gate on every specialist write: only the company's OWN accounting manager
  * may staff it.
  *
@@ -874,8 +907,11 @@ function assertAdminForManagerWrite(caller, { requestId, userId, companyId }) {
 }
 
 /**
- * PUT /companies/:companyId/accounting-manager — set or replace the company's
- * single accounting manager. ADMIN only.
+ * PUT /companies/:companyId/accounting-manager — assign the company's single
+ * accounting manager. ADMIN only, and only while the company has none: a
+ * company that already has a manager is refused with 409
+ * ACCOUNTING_MANAGER_ALREADY_ASSIGNED. To change managers, DELETE the current
+ * one first.
  *
  * Four things are verified before the write, and all four inside the same
  * transaction as the write itself: the company exists (and is not soft-deleted),
@@ -897,32 +933,59 @@ async function assignAccountingManager({ userId, requestId, companyId, managerUs
   // for a transaction to say "no such company".
   await loadCompany(companyId);
 
-  const { updated, previous } = await prisma.$transaction(async (tx) => {
-    const current = await repo.findCompanyById(tx, companyId);
-    if (!current) throw companyNotFound();
+  let updated;
+  try {
+    updated = await prisma.$transaction(async (tx) => {
+      const current = await repo.findCompanyById(tx, companyId);
+      if (!current) throw companyNotFound();
 
-    const manager = await repo.findUserWithRole(tx, managerUserId);
-    if (!manager) throw targetUserNotFound();
-    if (!hasAccountingManagerRole(manager)) {
-      throw new ApiError(422, 'The selected user is not an accounting manager.', {
-        code: 'INVALID_ACCOUNTING_MANAGER_ROLE',
-      });
+      // Assigned once. A company that already has a manager — the same one or
+      // another — is refused; changing it means DELETE first, then assign.
+      if (current.accountingManagerUserId) {
+        throw accountingManagerAlreadyAssigned(current.accountingManagerUserId, managerUserId);
+      }
+
+      const manager = await repo.findUserWithRole(tx, managerUserId);
+      if (!manager) throw targetUserNotFound();
+      if (!hasAccountingManagerRole(manager)) {
+        throw new ApiError(422, 'The selected user is not an accounting manager.', {
+          code: 'INVALID_ACCOUNTING_MANAGER_ROLE',
+        });
+      }
+      if (manager.status !== 'ACTIVE') {
+        throw new ApiError(422, 'The selected accounting manager is not an active user.', {
+          code: 'INACTIVE_ACCOUNTING_MANAGER',
+        });
+      }
+
+      return repo.assignAccountingManagerIfVacant(tx, companyId, managerUserId);
+    });
+  } catch (err) {
+    let refusal = err.code === 'ACCOUNTING_MANAGER_ALREADY_ASSIGNED' ? err : null;
+
+    // P2025: the conditional write matched nothing — another request filled the
+    // slot (or removed the company) between the check above and the write.
+    // Re-read outside the aborted transaction to say which.
+    if (!refusal && err.code === 'P2025') {
+      const now = await repo.findCompanyById(prisma, companyId);
+      if (!now) throw companyNotFound();
+      refusal = accountingManagerAlreadyAssigned(now.accountingManagerUserId, managerUserId);
     }
-    if (manager.status !== 'ACTIVE') {
-      throw new ApiError(422, 'The selected accounting manager is not an active user.', {
-        code: 'INACTIVE_ACCOUNTING_MANAGER',
-      });
-    }
+    if (!refusal) throw err;
 
-    return {
-      previous: current.accountingManagerUserId,
-      updated: await repo.setAccountingManager(tx, companyId, managerUserId),
-    };
-  });
+    logEvent({
+      event: 'company.accounting_manager.denied',
+      status: 'failure',
+      requestId,
+      userId,
+      companyId,
+      errorCode: refusal.code,
+    });
+    throw refusal;
+  }
 
-  const replaced = previous && previous !== managerUserId;
   logEvent({
-    event: replaced ? 'company.accounting_manager.replaced' : 'company.accounting_manager.assigned',
+    event: 'company.accounting_manager.assigned',
     status: 'success',
     requestId,
     userId,
@@ -930,7 +993,8 @@ async function assignAccountingManager({ userId, requestId, companyId, managerUs
     accountingManagerUserId: managerUserId,
   });
 
-  adminEvents.accountingManagerAssigned(updated, previous);
+  // There is never a previous manager to report: the slot had to be empty.
+  adminEvents.accountingManagerAssigned(updated, null);
 
   return { company: dto.toCompanyWithPeople(updated) };
 }
@@ -1834,7 +1898,24 @@ async function setCompanySpecialists({ userId, requestId, companyId, assignments
       });
     }
 
-    const unassignedAt = new Date();
+    // Assigned once: a service that already has a specialist keeps them. The
+    // same specialist resubmitted for their own service is fine (the form sends
+    // the whole team); a different one is refused before anything is written.
+    const active = await repo.listActiveAssignments(tx, companyId);
+    const taken = [];
+    for (const entry of assignments) {
+      const service = serviceByCode.get(entry.specializationCode);
+      for (const row of active) {
+        if (row.specializationId === service.specializationId && row.specialistUserId !== entry.specialistUserId) {
+          taken.push({ specializationCode: entry.specializationCode, specialistUserId: row.specialistUserId });
+        }
+      }
+    }
+    if (taken.length) {
+      logEvent({ event: 'company.specialist.reassign_prevented', status: 'failure', requestId, userId, companyId, errorCode: 'SPECIALIST_ALREADY_ASSIGNED' });
+      throw specialistAlreadyAssigned(taken);
+    }
+
     const saved = [];
     /*
      * The standing-specialist columns on `companies` (db/schema/14), collected as
@@ -1883,16 +1964,8 @@ async function setCompanySpecialists({ userId, requestId, companyId, assignments
         });
       }
 
-      // Stand down whoever else held this service, then ensure the chosen one is
-      // active. Both inside the transaction, so the company is never briefly
-      // covered by two specialists or by none.
-      await repo.deactivateOtherAssignments(tx, {
-        companyId,
-        specializationId: service.specializationId,
-        keepSpecialistUserId: entry.specialistUserId,
-        unassignedAt,
-      });
-
+      // Nobody else holds this service (checked above), so the chosen specialist
+      // is either already active on it or gets a new assignment row.
       const [existing] = await repo.findActiveAssignments(tx, {
         companyId,
         specialistUserId: entry.specialistUserId,
@@ -2012,57 +2085,55 @@ async function assignSpecialists({ userId, requestId, companyId, specialistUserI
     });
   }
 
-  const specializationIds = specs.map((s) => s.id);
+  const specializationIds = new Set(specs.map((s) => s.id));
+  const codeById = new Map(specs.map((s) => [s.id, s.specializationCode]));
 
-  const { created, skipped } = await prisma.$transaction(async (tx) => {
-    const active = await repo.findActiveAssignments(tx, { companyId, specialistUserId, specializationIds });
-    const activeSpecIds = new Set(active.map((a) => a.specializationId));
+  const created = await prisma.$transaction(async (tx) => {
+    // Assigned once: a service that already has a specialist — this one or
+    // another — is refused, and nothing is written.
+    const taken = (await repo.listActiveAssignments(tx, companyId))
+      .filter((row) => specializationIds.has(row.specializationId))
+      .map((row) => ({ specializationCode: codeById.get(row.specializationId), specialistUserId: row.specialistUserId }));
+    if (taken.length) {
+      logEvent({ event: 'company.specialist.duplicate_prevented', status: 'failure', requestId, userId, companyId, specialistUserId, errorCode: 'SPECIALIST_ALREADY_ASSIGNED' });
+      throw specialistAlreadyAssigned(taken);
+    }
 
-    const createdRows = [];
-    const skippedCodes = [];
-
+    const rows = [];
     for (const spec of specs) {
-      if (activeSpecIds.has(spec.id)) {
-        skippedCodes.push(spec.specializationCode);
-        logEvent({ event: 'company.specialist.duplicate_prevented', status: 'skipped', requestId, userId, companyId, specialistUserId, specializationCode: spec.specializationCode, detail: 'duplicate' });
-        continue;
-      }
       try {
-        const row = await repo.createAssignment(tx, {
-          companyId,
-          specialistUserId,
-          specializationId: spec.id,
-          assignmentStatus: 'ACTIVE',
-        });
-        createdRows.push(row);
+        rows.push(
+          await repo.createAssignment(tx, {
+            companyId,
+            specialistUserId,
+            specializationId: spec.id,
+            assignmentStatus: 'ACTIVE',
+          })
+        );
         logEvent({ event: 'company.specialist.assigned', status: 'success', requestId, userId, companyId, specialistUserId, specializationCode: spec.specializationCode });
       } catch (err) {
         // Lost a race with a concurrent identical assignment (partial unique index).
         if (err.code === 'P2002') {
-          skippedCodes.push(spec.specializationCode);
-          logEvent({ event: 'company.specialist.duplicate_prevented', status: 'skipped', requestId, userId, companyId, specialistUserId, specializationCode: spec.specializationCode, detail: 'race' });
-          continue;
+          throw specialistAlreadyAssigned([{ specializationCode: spec.specializationCode, specialistUserId }]);
         }
         throw err;
       }
     }
-
-    return { created: createdRows, skipped: skippedCodes };
+    return rows;
   });
 
   // The team changed, so the admin table's Team Members cell is stale. Read it
   // back after the commit and broadcast the committed state, not the intent.
   // The same change may also unblock projects that were opened unstaffed on this
   // service line — see the note in setCompanySpecialists.
-  if (created.length) {
-    await publishTeamChange(companyId);
-    await projectService.backfillAfterStaffingChange(companyId, { requestId });
-  }
+  await publishTeamChange(companyId);
+  await projectService.backfillAfterStaffingChange(companyId, { requestId });
 
   return {
-    statusCode: created.length ? 201 : 200,
+    statusCode: 201,
     created: created.map(dto.toAssignment),
-    skipped,
+    // Kept for response compatibility: a taken service is now a 409, never a skip.
+    skipped: [],
   };
 }
 

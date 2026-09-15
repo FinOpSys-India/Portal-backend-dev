@@ -27,7 +27,7 @@ const { createStreamTicket, streamEvents } = require('../controllers/adminContro
  * The accounting-manager writes already exist as company operations and are
  * already ADMIN-only:
  *
- *   PUT    /companies/:companyId/accounting-manager   assign or replace
+ *   PUT    /companies/:companyId/accounting-manager   assign (once; 409 if already assigned)
  *   DELETE /companies/:companyId/accounting-manager   remove
  *
  * Giving them a second URL under /admin would mean two paths to one write, and
