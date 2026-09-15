@@ -20,6 +20,7 @@ const mockPrisma = {
   user: { findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   company: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
   companySpecialistAssignment: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
+  companyMember: { findFirst: jest.fn() },
   companySubscription: { findFirst: jest.fn(), findMany: jest.fn() },
   address: { create: jest.fn(), update: jest.fn() },
   companyAddress: { findFirst: jest.fn(), create: jest.fn() },
@@ -109,6 +110,7 @@ beforeEach(() => {
   mockPrisma.user.findUnique.mockResolvedValue(callerUser());
   mockPrisma.company.findFirst.mockResolvedValue(companyRow());
   mockPrisma.companySpecialistAssignment.findFirst.mockResolvedValue(null);
+  mockPrisma.companyMember.findFirst.mockResolvedValue(null);
   // Every company read now carries active services, the billing date and the
   // team. Default to "nothing bought, nobody staffed"; the tests that care opt in.
   mockPrisma.companySubscription.findMany.mockResolvedValue([]);
@@ -270,13 +272,14 @@ describe('GET /api/companies', () => {
     await request(app).get('/api/companies').set('Authorization', auth());
 
     const [args] = mockPrisma.company.findMany.mock.calls[0];
-    // Owned, managed, or served as an ACTIVE specialist — the same three routes
-    // the read-authorization rule recognises, so the list can never show a
-    // company the detail call would then refuse.
+    // Owned, managed, served as an ACTIVE specialist, or a teammate on it — the
+    // same four routes the read-authorization rule recognises, so the list can
+    // never show a company the detail call would then refuse.
     expect(args.where.OR).toEqual([
       { ownerUserId: USER_ID },
       { accountingManagerUserId: USER_ID },
       { specialistAssignments: { some: { specialistUserId: USER_ID, assignmentStatus: 'ACTIVE' } } },
+      { members: { some: { userId: USER_ID } } },
     ]);
     expect(args.where.deletedAt).toBeNull();
   });
@@ -300,6 +303,7 @@ describe('GET /api/companies', () => {
       { ownerUserId: USER_ID },
       { accountingManagerUserId: USER_ID },
       { specialistAssignments: { some: { specialistUserId: USER_ID, assignmentStatus: 'ACTIVE' } } },
+      { members: { some: { userId: USER_ID } } },
     ]);
     expect(search.OR).toEqual([
       { companyName: { contains: 'aero', mode: 'insensitive' } },
@@ -346,6 +350,37 @@ describe('GET /api/companies/:companyId', () => {
     const res = await request(app).get(`/api/companies/${COMPANY_ID}`).set('Authorization', auth());
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe('COMPANY_NOT_FOUND');
+  });
+
+  it('lets a teammate read the company they are a member of', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(callerUser({ specificRole: { code: 'TEAM' } }));
+    mockPrisma.company.findFirst.mockResolvedValue(
+      companyRow({ ownerUserId: 999, owner: { id: 999, firstName: 'Grace', lastName: 'Hopper' } })
+    );
+    mockPrisma.companyMember.findFirst.mockResolvedValue({ id: 1 });
+
+    const res = await request(app)
+      .get(`/api/companies/${COMPANY_ID}`)
+      .set('Authorization', auth({ specificRole: 'TEAM' }));
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.company).toMatchObject({ id: COMPANY_ID, accessRole: 'TEAM' });
+    expect(mockPrisma.companyMember.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { companyId: COMPANY_ID, userId: USER_ID } })
+    );
+  });
+
+  it('refuses a customer who is neither the owner nor a member', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(callerUser({ specificRole: { code: 'TEAM' } }));
+    mockPrisma.company.findFirst.mockResolvedValue(
+      companyRow({ ownerUserId: 999, owner: { id: 999, firstName: 'Grace', lastName: 'Hopper' } })
+    );
+
+    const res = await request(app)
+      .get(`/api/companies/${COMPANY_ID}`)
+      .set('Authorization', auth({ specificRole: 'TEAM' }));
+
+    expect(res.status).toBe(403);
   });
 });
 

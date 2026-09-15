@@ -9,6 +9,7 @@
 const mockPrisma = {
   user: { findUnique: jest.fn() },
   company: { findFirst: jest.fn(), update: jest.fn() },
+  companyMember: { findFirst: jest.fn() },
   specialization: { findMany: jest.fn() },
   companySpecialistAssignment: {
     findMany: jest.fn(),
@@ -76,6 +77,7 @@ function stageUsers(map) {
 beforeEach(() => {
   jest.clearAllMocks();
   mockPrisma.$transaction.mockImplementation(async (cb) => cb(mockPrisma));
+  mockPrisma.companyMember.findFirst.mockResolvedValue(null);
 });
 
 /* --------------------- PUT accounting-manager ---------------------------- */

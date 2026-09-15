@@ -17,6 +17,8 @@ const mockPrisma = {
   user: { findUnique: jest.fn(), findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   company: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   companySpecialistAssignment: { findFirst: jest.fn(), findMany: jest.fn() },
+  // Teammates are attached to a company through company_members.
+  companyMember: { findFirst: jest.fn(), findMany: jest.fn() },
   // The specialist profile carries that person's whole task table on the named
   // company.
   projectTask: { findMany: jest.fn() },
@@ -38,6 +40,7 @@ const MANAGER_ID = 11;
 const OWNER_ID = 10;
 const SPECIALIST_ID = 13;
 const OTHER_SPECIALIST_ID = 15;
+const TEAMMATE_ID = 20;
 const COMPANY_ID = 18;
 const OTHER_COMPANY_ID = 17;
 
@@ -101,6 +104,8 @@ beforeEach(() => {
   mockPrisma.user.count.mockResolvedValue(0);
   mockPrisma.company.findMany.mockResolvedValue([]);
   mockPrisma.company.findFirst.mockResolvedValue(company());
+  mockPrisma.companyMember.findMany.mockResolvedValue([]);
+  mockPrisma.companyMember.findFirst.mockResolvedValue(null);
   mockPrisma.companySpecialistAssignment.findMany.mockResolvedValue([]);
   mockPrisma.companySpecialistAssignment.findFirst.mockResolvedValue(null);
   mockPrisma.user.findFirst.mockResolvedValue(null);
@@ -628,13 +633,66 @@ describe('GET /customers', () => {
     };
   }
 
-  function stageCustomers({ users = [], owners = [] } = {}) {
+  function teammate(id, first, last, memberCompanies = []) {
+    return {
+      ...person(id, first, last, 'CUSTOMER', { specificRole: 'TEAM', specificRoleName: 'Team' }),
+      ownedCompanies: [],
+      companyMemberships: memberCompanies.map((c) => ({ company: c })),
+    };
+  }
+
+  function stageCustomers({ users = [], owners = [], members = [] } = {}) {
     mockPrisma.user.findMany.mockResolvedValue(users);
     mockPrisma.user.count.mockResolvedValue(users.length);
     mockPrisma.company.findMany.mockImplementation(({ distinct }) =>
       Promise.resolve(distinct ? owners.map((ownerUserId) => ({ ownerUserId })) : [])
     );
+    mockPrisma.companyMember.findMany.mockResolvedValue(members.map((userId) => ({ userId })));
   }
+
+  it('shows a teammate the companies they are a member of', async () => {
+    stageCustomers({
+      users: [
+        teammate(TEAMMATE_ID, 'Ravi', 'K', [
+          { id: COMPANY_ID, companyName: 'BlueHorizon Executive Aviation LLC', status: 'ACTIVE' },
+        ]),
+      ],
+    });
+
+    const res = await request(app).get('/api/customers').set('Authorization', adminAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.customers[0]).toMatchObject({
+      userId: TEAMMATE_ID,
+      specificRole: 'TEAM',
+      companyCount: 1,
+      companies: [{ companyId: COMPANY_ID, companyName: 'BlueHorizon Executive Aviation LLC', status: 'ACTIVE' }],
+    });
+  });
+
+  it('includes teammates in a company-scoped list', async () => {
+    stageCustomers({
+      users: [
+        customer(OWNER_ID, 'Shelly', 'Doe', [{ id: COMPANY_ID, companyName: 'BlueHorizon Executive Aviation LLC', status: 'ACTIVE' }]),
+        teammate(TEAMMATE_ID, 'Ravi', 'K', [{ id: COMPANY_ID, companyName: 'BlueHorizon Executive Aviation LLC', status: 'ACTIVE' }]),
+      ],
+      owners: [OWNER_ID],
+      members: [TEAMMATE_ID],
+    });
+
+    const res = await request(app)
+      .get(`/api/customers?companyId=${COMPANY_ID}`)
+      .set('Authorization', managerAuth());
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.customers.map((c) => c.userId)).toEqual([OWNER_ID, TEAMMATE_ID]);
+    // Both the owner and the member are in the id scope handed to the query.
+    expect(mockPrisma.user.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: { in: [OWNER_ID, TEAMMATE_ID] } }),
+      })
+    );
+  });
 
   it('gives an admin every customer with the companies they own', async () => {
     stageCustomers({
