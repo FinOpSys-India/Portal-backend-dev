@@ -777,7 +777,14 @@ async function updateProject({ userId, requestId, projectId, input }) {
       await assertDeadlineLeavesTasksValid(tx, { projectId, deadlineDate: input.deadlineDate });
     }
 
-    return repo.updateProject(tx, projectId, input);
+    // A bar at 100% means the work is done, so the project is COMPLETED — unless
+    // the same request sets the status itself, in which case the caller wins.
+    const data = { ...input };
+    if (data.status === undefined && data.progressBar !== undefined && Number(data.progressBar) === 100) {
+      data.status = 'COMPLETED';
+    }
+
+    return repo.updateProject(tx, projectId, data);
   });
 
   logEvent({

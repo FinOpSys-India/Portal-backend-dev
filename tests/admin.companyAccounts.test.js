@@ -762,14 +762,8 @@ describe('PUT /companies/:id/specialists', () => {
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
     expect(mockPrisma.companySpecialistAssignment.create).toHaveBeenCalledTimes(2);
 
-    // Whoever previously held each service is stood down in the same transaction,
-    // so the company is never covered by two specialists for one service.
-    expect(mockPrisma.companySpecialistAssignment.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ companyId: COMPANY_ID, assignmentStatus: 'ACTIVE' }),
-        data: expect.objectContaining({ assignmentStatus: 'INACTIVE' }),
-      })
-    );
+    // Assigned once: nobody is stood down — a held service is a 409 instead.
+    expect(mockPrisma.companySpecialistAssignment.updateMany).not.toHaveBeenCalled();
 
     // The standing-specialist columns on `companies` are written in the SAME
     // transaction as the assignment rows, so the grid's per-line columns and the
@@ -782,6 +776,56 @@ describe('PUT /companies/:id/specialists', () => {
     );
 
     expect(events.some((e) => e.event === 'company.team.changed')).toBe(true);
+  });
+
+  // Active assignment rows, filtered the way the two repository reads filter them.
+  function stageActive(rows) {
+    mockPrisma.companySpecialistAssignment.findMany.mockImplementation(({ where }) =>
+      Promise.resolve(
+        rows.filter(
+          (r) =>
+            (where.specialistUserId === undefined || r.specialistUserId === where.specialistUserId) &&
+            (!where.specializationId?.in || where.specializationId.in.includes(r.specializationId))
+        )
+      )
+    );
+  }
+
+  it('refuses a different specialist on a service that already has one (409)', async () => {
+    stageAssign();
+    // BOOKKEEPING (id 1) is already held by someone else.
+    stageActive([{ id: 501, companyId: COMPANY_ID, specialistUserId: 99, specializationId: 1, assignmentStatus: 'ACTIVE' }]);
+
+    const res = await request(app)
+      .put(`/api/companies/${COMPANY_ID}/specialists`)
+      .set('Authorization', managerAuth())
+      .send(bothServices);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('SPECIALIST_ALREADY_ASSIGNED');
+    expect(res.body.error.details.taken).toEqual([{ specializationCode: 'BOOKKEEPING', specialistUserId: 99 }]);
+    // Refused before anything is written — not even the free PAYROLL service.
+    expect(mockPrisma.companySpecialistAssignment.create).not.toHaveBeenCalled();
+    expect(mockPrisma.companySpecialistAssignment.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.company.update).not.toHaveBeenCalled();
+  });
+
+  it('accepts the same specialist resubmitted for their own service (200)', async () => {
+    stageAssign();
+    // The bookkeeper already holds BOOKKEEPING; the form resends the whole team.
+    stageActive([{ id: 501, companyId: COMPANY_ID, specialistUserId: BOOKKEEPER, specializationId: 1, assignmentStatus: 'ACTIVE' }]);
+
+    const res = await request(app)
+      .put(`/api/companies/${COMPANY_ID}/specialists`)
+      .set('Authorization', managerAuth())
+      .send(bothServices);
+
+    expect(res.status).toBe(200);
+    // Only the new service gets a row; the existing one is left as it is.
+    expect(mockPrisma.companySpecialistAssignment.create).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.companySpecialistAssignment.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ specialistUserId: PAYROLL_SPECIALIST, specializationId: 2 }) })
+    );
   });
 
   it('refuses a specialist whose role does not match the service (422)', async () => {
@@ -986,7 +1030,7 @@ describe('PUT /companies/:id/accounting-manager', () => {
     expect(mockPrisma.company.update).not.toHaveBeenCalled();
   });
 
-  it('replaces an existing manager and reports the previous one to listeners', async () => {
+  it('refuses a second manager when one is already assigned (409)', async () => {
     stageUsers({
       [ADMIN_ID]: person(ADMIN_ID, 'Root', 'Admin', 'ADMIN'),
       [OTHER_MANAGER_ID]: person(OTHER_MANAGER_ID, 'Ravi', 'Patel', 'ACCOUNTING_MANAGER'),
@@ -994,29 +1038,63 @@ describe('PUT /companies/:id/accounting-manager', () => {
     mockPrisma.company.findFirst.mockResolvedValue(
       company({ accountingManagerUserId: MANAGER_ID, accountingManager: managerPerson() })
     );
-    mockPrisma.company.update.mockResolvedValue(
-      company({
-        accountingManagerUserId: OTHER_MANAGER_ID,
-        accountingManager: { id: OTHER_MANAGER_ID, firstName: 'Ravi', lastName: 'Patel', email: 'ravi.patel@finopsys.ai' },
-      })
-    );
-
-    const events = [];
-    const unsubscribe = realtime.subscribe(fakeStream(events), { userId: ADMIN_ID });
 
     const res = await request(app)
       .put(`/api/companies/${COMPANY_ID}/accounting-manager`)
       .set('Authorization', auth())
       .send({ accountingManagerUserId: OTHER_MANAGER_ID });
-    unsubscribe();
 
-    expect(res.status).toBe(200);
-    expect(res.body.data.company.accountingManagerUserId).toBe(OTHER_MANAGER_ID);
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('ACCOUNTING_MANAGER_ALREADY_ASSIGNED');
+    expect(res.body.error.message).toMatch(/Remove them before assigning another/);
+    expect(res.body.error.details).toEqual({ accountingManagerUserId: MANAGER_ID });
+    expect(mockPrisma.company.update).not.toHaveBeenCalled();
+  });
 
-    const assigned = events.find((e) => e.event === 'company.accounting_manager.assigned');
-    expect(assigned).toBeDefined();
-    expect(assigned.data.previousAccountingManagerUserId).toBe(MANAGER_ID);
-    expect(assigned.data.company.accountingManager.userId).toBe(OTHER_MANAGER_ID);
+  it('refuses re-assigning the manager who is already assigned (409)', async () => {
+    stageUsers({
+      [ADMIN_ID]: person(ADMIN_ID, 'Root', 'Admin', 'ADMIN'),
+      [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER'),
+    });
+    mockPrisma.company.findFirst.mockResolvedValue(
+      company({ accountingManagerUserId: MANAGER_ID, accountingManager: managerPerson() })
+    );
+
+    const res = await request(app)
+      .put(`/api/companies/${COMPANY_ID}/accounting-manager`)
+      .set('Authorization', auth())
+      .send({ accountingManagerUserId: MANAGER_ID });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('ACCOUNTING_MANAGER_ALREADY_ASSIGNED');
+    expect(res.body.error.message).toMatch(/already assigned to this company/);
+    expect(mockPrisma.company.update).not.toHaveBeenCalled();
+  });
+
+  it('refuses when another request fills the slot first (409)', async () => {
+    stageUsers({
+      [ADMIN_ID]: person(ADMIN_ID, 'Root', 'Admin', 'ADMIN'),
+      [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER'),
+    });
+    // Empty when checked, filled by a concurrent request before the write lands.
+    mockPrisma.company.findFirst
+      .mockResolvedValueOnce(company())
+      .mockResolvedValueOnce(company())
+      .mockResolvedValue(company({ accountingManagerUserId: OTHER_MANAGER_ID }));
+    mockPrisma.company.update.mockRejectedValue(Object.assign(new Error('Record not found'), { code: 'P2025' }));
+
+    const res = await request(app)
+      .put(`/api/companies/${COMPANY_ID}/accounting-manager`)
+      .set('Authorization', auth())
+      .send({ accountingManagerUserId: MANAGER_ID });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('ACCOUNTING_MANAGER_ALREADY_ASSIGNED');
+    expect(res.body.error.details).toEqual({ accountingManagerUserId: OTHER_MANAGER_ID });
+    // The empty slot is part of the write itself, not only the check before it.
+    expect(mockPrisma.company.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: COMPANY_ID, accountingManagerUserId: null } })
+    );
   });
 });
 

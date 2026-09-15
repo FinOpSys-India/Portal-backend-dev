@@ -169,7 +169,8 @@ const listUsers = asyncHandler(async (req, res) => {
 /**
  * PUT /companies/:companyId/accounting-manager
  *
- * Assign or replace the company's single accounting manager.
+ * Assign the company's single accounting manager. Refused with 409 when the
+ * company already has one — remove them first (DELETE) to change managers.
  */
 const assignAccountingManager = asyncHandler(async (req, res) => {
   const companyId = parseId(req.params.companyId, 'companyId');

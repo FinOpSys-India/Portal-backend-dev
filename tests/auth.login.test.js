@@ -42,6 +42,11 @@ jest.mock('../src/services/emailService', () => ({
 
 const request = require('supertest');
 const app = require('../src/app');
+const config = require('../src/config');
+
+// Read from config so the tests hold whatever MAX_LOGIN_ATTEMPTS /
+// LOGIN_LOCK_MINUTES the environment sets.
+const { maxLoginAttempts: MAX_ATTEMPTS, loginLockMinutes: LOCK_MINUTES } = config.auth;
 
 const LOGIN_URL = '/api/auth/login';
 const EMAIL = 'user@finopsys.ai';
@@ -142,15 +147,22 @@ describe('POST /api/auth/login', () => {
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe('INVALID_CREDENTIALS');
     expect(res.body.error.message).toBe('Invalid email or password.');
+    expect(res.body.error.details).toBeUndefined();
     expect(mockSendOtpEmail).not.toHaveBeenCalled();
   });
 
-  it('returns the same generic 401 for a wrong password and records the failure', async () => {
+  it('returns a 401 with the attempts left for a wrong password and records the failure', async () => {
     const res = await request(app).post(LOGIN_URL).send({ email: EMAIL, password: 'WrongPass9' });
 
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe('INVALID_CREDENTIALS');
-    expect(res.body.error.message).toBe('Invalid email or password.');
+    expect(res.body.error.message).toBe(
+      `Invalid email or password. ${MAX_ATTEMPTS - 1} attempts left before your account is locked for ${LOCK_MINUTES} minutes.`
+    );
+    expect(res.body.error.details).toEqual({
+      attemptsRemaining: MAX_ATTEMPTS - 1,
+      maxAttempts: MAX_ATTEMPTS,
+    });
     expect(mockPrisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
         where: { id: 1 },
@@ -158,6 +170,57 @@ describe('POST /api/auth/login', () => {
       })
     );
     expect(mockSendOtpEmail).not.toHaveBeenCalled();
+  });
+
+  it('counts down to the last attempt', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(
+      activeUser({ failedLoginAttempts: MAX_ATTEMPTS - 2 })
+    );
+    const res = await request(app).post(LOGIN_URL).send({ email: EMAIL, password: 'WrongPass9' });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.details.attemptsRemaining).toBe(1);
+    expect(res.body.error.message).toContain('1 attempt left');
+  });
+
+  it('locks the account with a 423 on the final wrong password', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(
+      activeUser({ failedLoginAttempts: MAX_ATTEMPTS - 1 })
+    );
+    const res = await request(app).post(LOGIN_URL).send({ email: EMAIL, password: 'WrongPass9' });
+
+    expect(res.status).toBe(423);
+    expect(res.body.error.code).toBe('ACCOUNT_LOCKED');
+    expect(res.body.error.details.attemptsRemaining).toBe(0);
+    expect(res.body.error.details.retryAfterSeconds).toBe(LOCK_MINUTES * 60);
+    expect(res.headers['retry-after']).toBe(String(LOCK_MINUTES * 60));
+    expect(mockPrisma.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { failedLoginAttempts: 0, lockedUntil: expect.any(Date) },
+      })
+    );
+  });
+
+  it('refuses a locked account with a 423 without checking or counting the password', async () => {
+    const lockedUntil = new Date(Date.now() + 10 * 60 * 1000);
+    mockPrisma.user.findUnique.mockResolvedValue(activeUser({ lockedUntil }));
+    const res = await request(app).post(LOGIN_URL).send({ email: EMAIL, password: PASSWORD });
+
+    expect(res.status).toBe(423);
+    expect(res.body.error.code).toBe('ACCOUNT_LOCKED');
+    expect(res.body.error.message).toContain('Try again in 10 minutes');
+    expect(res.body.error.details.lockedUntil).toBe(lockedUntil.toISOString());
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    expect(mockSendOtpEmail).not.toHaveBeenCalled();
+  });
+
+  it('lets the user in again once the lock has expired', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(
+      activeUser({ lockedUntil: new Date(Date.now() - 1000) })
+    );
+    const res = await request(app).post(LOGIN_URL).send({ email: EMAIL, password: PASSWORD });
+
+    expect(res.status).toBe(202);
   });
 
   it('returns the same generic 401 for a correct password on a non-active account', async () => {

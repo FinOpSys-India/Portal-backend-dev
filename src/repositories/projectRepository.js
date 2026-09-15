@@ -301,6 +301,8 @@ function findProjectForAccess(client, projectId) {
       createdByUserId: true,
       assignedSpecialistUserId: true,
       status: true,
+      // Read so a task change can tell whether the bar it derives is new.
+      progressBar: true,
       deadlineDate: true,
     },
   });
@@ -312,6 +314,20 @@ function createProject(client, data) {
 
 function updateProject(client, projectId, data) {
   return client.project.update({ where: { id: projectId }, data, select: PROJECT_SELECT });
+}
+
+/**
+ * Move a project's status and progress bar and nothing else — the write the
+ * tasks feature makes when a task change carries its project with it. The
+ * narrow select is because that caller needs the new values back, not the row
+ * the project screen renders.
+ */
+function setProjectProgress(client, projectId, { status, progressBar }) {
+  return client.project.update({
+    where: { id: projectId },
+    data: { status, progressBar },
+    select: { id: true, status: true, progressBar: true },
+  });
 }
 
 function softDeleteProject(client, projectId, deletedAt) {
@@ -372,6 +388,7 @@ module.exports = {
   findProjectForAccess,
   createProject,
   updateProject,
+  setProjectProgress,
   softDeleteProject,
   listUnassignedProjects,
   setAssignedSpecialist,

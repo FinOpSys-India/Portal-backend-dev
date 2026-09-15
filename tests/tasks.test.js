@@ -25,7 +25,7 @@ const mockPrisma = {
   company: { findFirst: jest.fn() },
   companyMember: { findFirst: jest.fn() },
   companySpecialistAssignment: { findFirst: jest.fn(), findMany: jest.fn() },
-  project: { findFirst: jest.fn() },
+  project: { findFirst: jest.fn(), update: jest.fn() },
   projectTask: {
     findFirst: jest.fn(),
     findMany: jest.fn(),
@@ -117,6 +117,7 @@ function projectAccessRow(overrides = {}) {
     createdByUserId: OWNER_ID,
     assignedSpecialistUserId: BOOKKEEPER_ID,
     status: 'ACTIVE',
+    progressBar: '0.00',
     // The bound every task deadline is measured against.
     deadlineDate: new Date(`${PROJECT_DEADLINE}T00:00:00.000Z`),
     ...overrides,
@@ -652,6 +653,22 @@ describe('POST /tasks', () => {
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe('PROJECT_NOT_FOUND');
   });
+
+  it('reopens a COMPLETED project when new work is filed on it (201)', async () => {
+    mockPrisma.project.findFirst.mockResolvedValue(projectAccessRow({ status: 'COMPLETED' }));
+    mockPrisma.projectTask.groupBy.mockResolvedValue([
+      { status: 'COMPLETED', _count: { _all: 2 } },
+      { status: 'TODO', _count: { _all: 1 } },
+    ]);
+
+    const res = await request(app).post('/api/tasks').set('Authorization', specialistAuth()).send(body());
+
+    expect(res.status).toBe(201);
+    // 2 of 3 is 66.666…, rounded DOWN so the bar never claims more than is done.
+    expect(mockPrisma.project.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: PROJECT_ID }, data: { status: 'ACTIVE', progressBar: '66.66' } })
+    );
+  });
 });
 
 /* ==================== PATCH /tasks/:taskId/status ========================== */
@@ -812,6 +829,91 @@ describe('PATCH /tasks/:taskId/status', () => {
     // the value the user typed was never stored.
     expect(res.status).toBe(400);
     expect(res.body.error.details.unknown).toContain('taskName');
+  });
+
+  /* ---- the project's status follows its tasks ---- */
+
+  it('starts a TODO project when one of its tasks starts (200)', async () => {
+    mockPrisma.project.findFirst.mockResolvedValue(projectAccessRow({ status: 'TODO' }));
+    mockPrisma.projectTask.groupBy.mockResolvedValue([
+      { status: 'ACTIVE', _count: { _all: 1 } },
+      { status: 'TODO', _count: { _all: 2 } },
+    ]);
+
+    const res = await request(app)
+      .patch(`/api/tasks/${TASK_ID}/status`)
+      .set('Authorization', specialistAuth())
+      .send({ status: 'ACTIVE' });
+
+    expect(res.status).toBe(200);
+    expect(mockPrisma.project.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: PROJECT_ID }, data: { status: 'ACTIVE', progressBar: '0.00' } })
+    );
+    expect(res.body.data.project.status).toBe('ACTIVE');
+  });
+
+  it('completes the project when its last open task is completed (200)', async () => {
+    mockPrisma.projectTask.update.mockResolvedValue(taskRow({ status: 'COMPLETED' }));
+    mockPrisma.projectTask.groupBy.mockResolvedValue([{ status: 'COMPLETED', _count: { _all: 3 } }]);
+
+    const res = await request(app)
+      .patch(`/api/tasks/${TASK_ID}/status`)
+      .set('Authorization', specialistAuth())
+      .send({ status: 'COMPLETED' });
+
+    expect(res.status).toBe(200);
+    expect(mockPrisma.project.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: PROJECT_ID }, data: { status: 'COMPLETED', progressBar: '100.00' } })
+    );
+    expect(res.body.data.project.status).toBe('COMPLETED');
+  });
+
+  it('reopens a COMPLETED project when one of its tasks moves back (200)', async () => {
+    mockPrisma.project.findFirst.mockResolvedValue(projectAccessRow({ status: 'COMPLETED' }));
+    mockPrisma.projectTask.groupBy.mockResolvedValue([
+      { status: 'ACTIVE', _count: { _all: 1 } },
+      { status: 'COMPLETED', _count: { _all: 2 } },
+    ]);
+
+    await request(app)
+      .patch(`/api/tasks/${TASK_ID}/status`)
+      .set('Authorization', specialistAuth())
+      .send({ status: 'ACTIVE' });
+
+    expect(mockPrisma.project.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { status: 'ACTIVE', progressBar: '66.66' } })
+    );
+  });
+
+  it('leaves the project alone when its status already agrees (200)', async () => {
+    mockPrisma.projectTask.groupBy.mockResolvedValue([{ status: 'ACTIVE', _count: { _all: 1 } }]);
+
+    const res = await request(app)
+      .patch(`/api/tasks/${TASK_ID}/status`)
+      .set('Authorization', specialistAuth())
+      .send({ status: 'ACTIVE' });
+
+    expect(res.status).toBe(200);
+    expect(mockPrisma.project.update).not.toHaveBeenCalled();
+  });
+
+  it('raises the progress bar as tasks complete, before the project is done (200)', async () => {
+    mockPrisma.projectTask.update.mockResolvedValue(taskRow({ status: 'COMPLETED' }));
+    mockPrisma.projectTask.groupBy.mockResolvedValue([
+      { status: 'COMPLETED', _count: { _all: 1 } },
+      { status: 'ACTIVE', _count: { _all: 1 } },
+      { status: 'TODO', _count: { _all: 2 } },
+    ]);
+
+    await request(app)
+      .patch(`/api/tasks/${TASK_ID}/status`)
+      .set('Authorization', specialistAuth())
+      .send({ status: 'COMPLETED' });
+
+    // 1 of 4 completed: a quarter of the bar, and the project still ACTIVE.
+    expect(mockPrisma.project.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { status: 'ACTIVE', progressBar: '25.00' } })
+    );
   });
 });
 
@@ -1039,5 +1141,30 @@ describe('DELETE /tasks/:taskId', () => {
       .set('Authorization', specialistAuth());
 
     expect(res.status).toBe(200);
+  });
+
+  it('completes the project when the task withdrawn was its last open one (200)', async () => {
+    mockPrisma.projectTask.groupBy.mockResolvedValue([{ status: 'COMPLETED', _count: { _all: 2 } }]);
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', specialistAuth());
+
+    expect(res.status).toBe(200);
+    expect(mockPrisma.project.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: PROJECT_ID }, data: { status: 'COMPLETED', progressBar: '100.00' } })
+    );
+  });
+
+  it('leaves the project as set by hand once its last task is withdrawn (200)', async () => {
+    mockPrisma.projectTask.groupBy.mockResolvedValue([]);
+
+    const res = await request(app)
+      .delete(`/api/tasks/${TASK_ID}`)
+      .set('Authorization', specialistAuth());
+
+    // No tasks left means nothing to derive a bar from.
+    expect(res.status).toBe(200);
+    expect(mockPrisma.project.update).not.toHaveBeenCalled();
   });
 });

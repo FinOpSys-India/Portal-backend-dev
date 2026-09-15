@@ -216,6 +216,22 @@ function setAccountingManager(client, companyId, accountingManagerUserId) {
 }
 
 /**
+ * Assign an accounting manager ONLY while the company has none.
+ *
+ * The empty slot is part of the WHERE, so the write itself refuses a company
+ * that already has a manager — two admins assigning at the same moment cannot
+ * both win. A company whose slot is taken matches nothing and Prisma throws
+ * P2025, which the service turns into a 409.
+ */
+function assignAccountingManagerIfVacant(client, companyId, accountingManagerUserId) {
+  return client.company.update({
+    where: { id: companyId, accountingManagerUserId: null },
+    data: { accountingManagerUserId },
+    include: COMPANY_WITH_PEOPLE,
+  });
+}
+
+/**
  * Bring a company live, once it is paid for: ONBOARDING (the first payment) or
  * SUSPENDED (a recovered one) become ACTIVE.
  *
@@ -1188,6 +1204,7 @@ module.exports = {
   createCompany,
   updateCompany,
   setAccountingManager,
+  assignAccountingManagerIfVacant,
   activateCompanyOnPayment,
   suspendCompanyOnLapse,
   softDeleteCompany,

@@ -31,7 +31,8 @@ const {
  *   GET    /companies/:companyId                           -> one company + primary address
  *   PATCH  /companies/:companyId                           -> correct company details
  *   DELETE /companies/:companyId                           -> archive (soft delete)
- *   PUT    /companies/:companyId/accounting-manager        -> set/replace manager (ADMIN only)
+ *   PUT    /companies/:companyId/accounting-manager        -> assign manager once (ADMIN only;
+ *                                                             409 if one is already assigned)
  *   DELETE /companies/:companyId/accounting-manager        -> remove manager (ADMIN only)
  *   GET    /companies/:companyId/specialist-options        -> staffing dropdowns (the
  *                                                             company's manager, or ADMIN read-only)
