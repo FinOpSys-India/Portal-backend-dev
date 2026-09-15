@@ -20,7 +20,7 @@ const mockPrisma = {
   user: { findUnique: jest.fn(), findMany: jest.fn(), count: jest.fn() },
   company: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn(), update: jest.fn() },
   companySpecialistAssignment: { findFirst: jest.fn(), findMany: jest.fn(), count: jest.fn() },
-  companyMember: { findFirst: jest.fn() },
+  companyMember: { findFirst: jest.fn(), findMany: jest.fn() },
   companySubscription: { findFirst: jest.fn(), findMany: jest.fn() },
   address: { create: jest.fn(), update: jest.fn() },
   companyAddress: { findFirst: jest.fn(), create: jest.fn() },
@@ -111,6 +111,7 @@ beforeEach(() => {
   mockPrisma.company.findFirst.mockResolvedValue(companyRow());
   mockPrisma.companySpecialistAssignment.findFirst.mockResolvedValue(null);
   mockPrisma.companyMember.findFirst.mockResolvedValue(null);
+  mockPrisma.companyMember.findMany.mockResolvedValue([]);
   // Every company read now carries active services, the billing date and the
   // team. Default to "nothing bought, nobody staffed"; the tests that care opt in.
   mockPrisma.companySubscription.findMany.mockResolvedValue([]);
