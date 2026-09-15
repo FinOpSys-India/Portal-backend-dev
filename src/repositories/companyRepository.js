@@ -128,6 +128,8 @@ function companyAccessFilter({ userId, isAdmin }) {
       { ownerUserId: userId },
       { accountingManagerUserId: userId },
       { specialistAssignments: { some: { specialistUserId: userId, assignmentStatus: 'ACTIVE' } } },
+      // A teammate reads the companies they are a member of.
+      { members: { some: { userId } } },
     ],
   };
 }
@@ -342,6 +344,14 @@ function findAssignmentInCompany(client, { companyId, assignmentId }) {
 function findActiveAssignmentForUser(client, { companyId, userId }) {
   return client.companySpecialistAssignment.findFirst({
     where: { companyId, specialistUserId: userId, assignmentStatus: 'ACTIVE' },
+  });
+}
+
+/** Is this user a teammate (company_members row) on the company? */
+function findMembershipForUser(client, { companyId, userId }) {
+  return client.companyMember.findFirst({
+    where: { companyId, userId },
+    select: { id: true },
   });
 }
 
@@ -896,13 +906,13 @@ function buildCustomerDirectoryWhere({ userIds, search, includeInactive }) {
 }
 
 /**
- * One page of customer-side users with the companies they own.
+ * One page of customer-side users with the companies they own or are a member of.
  *
  * `companyIds` filters the NESTED companies as well as (via `userIds`) the outer
  * rows, so a caller scoped to one company sees that company on the row and not
- * the customer's other accounts. Ownership is the only customer-to-company link
- * the schema has: a CUSTOMER/TEAM user has no company column, which is why such
- * a user comes back with an empty list rather than being silently dropped.
+ * the customer's other accounts. Two links count: an owner is attached through
+ * `companies.owner_user_id`, a teammate through `company_members`. Reading only
+ * the first left every teammate with an empty company list.
  */
 function listCustomerDirectory(
   client,
@@ -917,6 +927,10 @@ function listCustomerDirectory(
         where: { deletedAt: null, ...(companyIds ? { id: { in: companyIds } } : {}) },
         select: { id: true, companyName: true, status: true },
         orderBy: { companyName: 'asc' },
+      },
+      companyMemberships: {
+        where: { company: { deletedAt: null }, ...(companyIds ? { companyId: { in: companyIds } } : {}) },
+        select: { company: { select: { id: true, companyName: true, status: true } } },
       },
     },
     orderBy: [{ [sort]: order }, { id: 'asc' }],
@@ -1086,15 +1100,24 @@ async function listOwnedCompanyIds(client, { ownerUserId, companyIds }) {
   return rows.map((row) => row.id);
 }
 
-/** The customer-side users attached to a set of companies — today, their owners. */
+/**
+ * The customer-side users attached to a set of companies: their owners
+ * (`companies.owner_user_id`) and their teammates (`company_members`).
+ */
 async function listCustomerIdsForCompanies(client, companyIds) {
   if (!companyIds.length) return [];
-  const rows = await client.company.findMany({
-    where: { id: { in: companyIds }, deletedAt: null },
-    select: { ownerUserId: true },
-    distinct: ['ownerUserId'],
-  });
-  return rows.map((row) => row.ownerUserId);
+  const [owners, members] = await Promise.all([
+    client.company.findMany({
+      where: { id: { in: companyIds }, deletedAt: null },
+      select: { ownerUserId: true },
+      distinct: ['ownerUserId'],
+    }),
+    client.companyMember.findMany({
+      where: { companyId: { in: companyIds }, company: { deletedAt: null } },
+      select: { userId: true },
+    }),
+  ]);
+  return [...new Set([...owners.map((row) => row.ownerUserId), ...members.map((row) => row.userId)])];
 }
 
 /* ----------------------------- idempotency ------------------------------- */
@@ -1163,6 +1186,7 @@ module.exports = {
   createAssignment,
   findAssignmentInCompany,
   findActiveAssignmentForUser,
+  findMembershipForUser,
   deactivateAssignment,
   listActiveAssignments,
   listAssignmentsPage,

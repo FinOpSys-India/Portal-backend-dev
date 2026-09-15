@@ -23,11 +23,9 @@ const { listCustomerDirectory, getCustomerDetail } = require('../controllers/com
  *                An accounting manager therefore sees the customer contacts for
  *                the account they are looking at, and nothing about any other.
  *
- * "Attached to a company" means OWNS it — `companies.owner_user_id` is the only
- * customer-to-company link in the schema today. A CUSTOMER/TEAM user has no such
- * link, so they appear in the admin's list with an empty company list and in
- * nobody else's. When team members gain a company association, this endpoint is
- * where that widens, and the response shape already has room for it.
+ * "Attached to a company" means OWNS it (`companies.owner_user_id`) or is a
+ * teammate on it (`company_members`). Both appear in a company-scoped list, and
+ * both kinds of company appear on a row's `companies`.
  */
 const router = express.Router();
 

@@ -637,11 +637,22 @@ function toSpecialistDetail({ user, specialities, tasks }) {
  * and follows the seed.
  */
 function toCustomerRow(user) {
-  const companies = (user.ownedCompanies ?? []).map((company) => ({
-    companyId: company.id,
-    companyName: company.companyName,
-    status: company.status,
-  }));
+  // Owned companies and member companies, once each: an owner who is also listed
+  // in company_members must not see the same company twice.
+  const byId = new Map();
+  for (const company of user.ownedCompanies ?? []) byId.set(company.id, company);
+  for (const membership of user.companyMemberships ?? []) {
+    const company = membership.company;
+    if (company && !byId.has(company.id)) byId.set(company.id, company);
+  }
+
+  const companies = [...byId.values()]
+    .sort((a, b) => a.companyName.localeCompare(b.companyName))
+    .map((company) => ({
+      companyId: company.id,
+      companyName: company.companyName,
+      status: company.status,
+    }));
 
   return {
     ...toDirectoryUser(user),

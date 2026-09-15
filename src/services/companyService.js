@@ -197,6 +197,12 @@ async function assertReadAccess(caller, company) {
     userId: caller.id,
   });
   if (assignment) return;
+  // A teammate may read the company they are a member of.
+  const membership = await repo.findMembershipForUser(prisma, {
+    companyId: company.id,
+    userId: caller.id,
+  });
+  if (membership) return;
   throw companyAccessDenied();
 }
 
@@ -549,7 +555,12 @@ async function accessRoleFor(caller, company) {
     companyId: company.id,
     userId: caller.id,
   });
-  return assignment ? 'SPECIALIST' : null;
+  if (assignment) return 'SPECIALIST';
+  const membership = await repo.findMembershipForUser(prisma, {
+    companyId: company.id,
+    userId: caller.id,
+  });
+  return membership ? 'TEAM' : null;
 }
 
 /**
