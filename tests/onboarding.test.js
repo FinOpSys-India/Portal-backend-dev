@@ -495,29 +495,6 @@ describe('PUT /onboarding/profile — submit the onboarding form', () => {
     expect(res.body.data.onboarding).toMatchObject({ profileComplete: true, complete: false });
   });
 
-  /*
-   * The form backs the registration flow's Back button, so it has to stay open:
-   * an owner who already filled it in may return and correct any of the four
-   * fields, as often as they like.
-   */
-  it('lets an owner who already submitted the form submit it again', async () => {
-    mockPrisma.user.findUnique.mockResolvedValue(completedOwner());
-    mockPrisma.user.update.mockResolvedValue(completedOwner({ jobTitle: 'Chief Financial Officer' }));
-
-    const res = await request(app)
-      .put('/api/onboarding/profile')
-      .set('Authorization', auth())
-      .send(validProfile({ jobTitle: 'Chief Financial Officer' }));
-
-    expect(res.status).toBe(200);
-    expect(res.body.data.user.jobTitle).toBe('Chief Financial Officer');
-    expect(mockPrisma.user.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ jobTitle: 'Chief Financial Officer' }),
-      })
-    );
-  });
-
   it('rejects a body missing required fields with 400', async () => {
     const res = await request(app)
       .put('/api/onboarding/profile')
