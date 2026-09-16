@@ -307,42 +307,21 @@ async function provision({ userId }) {
  * Submit the onboarding form (step 7): first name, last name, phone, job title.
  * Identity comes from the token; the body carries profile data only.
  *
- * FIRST TIME ONLY, AND FOR OWNERS ONLY. Once an owner's four fields are set the
- * endpoint is closed to them for good, because it is the only route that can
- * write a name or a job title and leaving it open made those fields editable for
- * the life of the account — which is exactly what `PATCH /users/me` deliberately
- * refuses to allow (it accepts phone and address, nothing else). An open
- * onboarding route was therefore a way round that rule rather than a separate
- * feature.
+ * REPEATABLE, FOR EVERY ROLE. An owner used to be locked out once their four
+ * fields were set, which meant a Back button on the registration flow could not
+ * reopen this form and a name typed wrongly at sign-up needed an administrator.
+ * The form may now be resubmitted as often as the user likes, and each
+ * submission overwrites all four fields.
  *
- * The lock is deliberately NOT extended to anyone else. An owner is the account
- * holder, and their name is what appears against a company on every internal
- * screen — pinning it at sign-up is the point. A teammate, specialist,
- * accounting manager or admin is a person working in the portal, and freezing a
- * colleague's own name and job title on the strength of one form submission is a
- * customer-account rule applied where no customer account is involved.
- *
- * The guard asks `buildStatus` rather than re-deriving "is it filled in?" or
- * re-checking the role pair by hand, so the condition that closes this endpoint
- * and the `isOwner`/`profileComplete` flags the client reads from GET /onboarding
- * cannot drift apart.
- *
- * The cost is that an OWNER whose name was typed wrongly at sign-up needs an
- * administrator to correct it. That is the intended trade: an owner's name is
- * set once, on purpose.
+ * Note this is the only route that can write a name or a job title — `PATCH
+ * /users/me` accepts phone and address and nothing else — so those fields are
+ * now editable for the life of the account by the user themselves.
  *
  * @param {{ userId: number, profile: { firstName: string, lastName: string, phone: string, jobTitle: string } }} params
  */
 async function submitProfile({ userId, profile }) {
   const existing = await prisma.user.findUnique({ where: { id: userId }, select: STATUS_SELECT });
   if (!existing) throw userNotFound();
-
-  const { isOwner, profileComplete } = buildStatus(existing).onboarding;
-  if (isOwner && profileComplete) {
-    throw new ApiError(409, 'Your profile has already been submitted.', {
-      code: 'PROFILE_ALREADY_SUBMITTED',
-    });
-  }
 
   try {
     const user = await prisma.user.update({
