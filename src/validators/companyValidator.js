@@ -28,6 +28,7 @@ const MAX = {
   companyName: common.LIMITS.companyName,
   companyPhone: common.LIMITS.phone,
   revenueCurrency: 3,
+  enNumber: 100,
   line1: common.LIMITS.addressLine,
   line2: common.LIMITS.addressLine,
   city: common.LIMITS.city,
@@ -91,6 +92,7 @@ const ONBOARDING_FIELDS = [
   'employeeCount',
   'lastYearRevenue',
   'revenueCurrency',
+  'enNumber',
   'address',
 ];
 
@@ -171,6 +173,7 @@ function validateCompanyOnboarding(body = {}) {
     employeeCount: common.integer(body.employeeCount, 'employeeCount', { min: 0, max: MAX_EMPLOYEE_COUNT }),
     lastYearRevenue: common.decimalAmount(body.lastYearRevenue, 'lastYearRevenue'),
     revenueCurrency: validateCurrency(body.revenueCurrency),
+    enNumber: common.str(body.enNumber, 'enNumber', { max: MAX.enNumber }),
     address: validateAddress(body.address),
   };
 }

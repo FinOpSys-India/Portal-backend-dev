@@ -438,6 +438,7 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
         employeeCount: input.employeeCount,
         lastYearRevenue: input.lastYearRevenue,
         revenueCurrency: input.revenueCurrency,
+        enNumber: input.enNumber,
         // Ownership comes from the verified token, never from the request.
         ownerUserId: userId,
         /*

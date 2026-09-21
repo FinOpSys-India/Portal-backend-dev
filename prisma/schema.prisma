@@ -520,6 +520,7 @@ model Company {
   // realistic annual revenue without rounding error.
   lastYearRevenue         Decimal       @map("last_year_revenue") @db.Decimal(18, 2)
   revenueCurrency         String        @map("revenue_currency") @db.Char(3)
+  enNumber                String?       @map("en_number") @db.VarChar(100)
   ownerUserId             Int           @map("owner_user_id")
   accountingManagerUserId Int?          @map("accounting_manager_user_id")
 
