@@ -55,6 +55,7 @@ function toCompany(company) {
     employeeCount: company.employeeCount,
     lastYearRevenue: decimalString(company.lastYearRevenue),
     revenueCurrency: company.revenueCurrency,
+    enNumber: company.enNumber ?? null,
     ownerUserId: company.ownerUserId,
     accountingManagerUserId: company.accountingManagerUserId ?? null,
     bookkeepingSpecialistUserId: company.bookkeepingSpecialistUserId ?? null,
