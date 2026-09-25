@@ -195,6 +195,7 @@ const UPDATABLE_FIELDS = [
   'employeeCount',
   'lastYearRevenue',
   'revenueCurrency',
+  'enNumber',
   'address',
 ];
 
@@ -217,6 +218,7 @@ function validateCompanyUpdate(body = {}) {
   if (body.employeeCount !== undefined) out.employeeCount = common.integer(body.employeeCount, 'employeeCount', { min: 0, max: MAX_EMPLOYEE_COUNT });
   if (body.lastYearRevenue !== undefined) out.lastYearRevenue = common.decimalAmount(body.lastYearRevenue, 'lastYearRevenue');
   if (body.revenueCurrency !== undefined) out.revenueCurrency = validateCurrency(body.revenueCurrency);
+  if (body.enNumber !== undefined) out.enNumber = common.str(body.enNumber, 'enNumber', { max: MAX.enNumber });
   if (body.address !== undefined) out.address = validateAddress(body.address);
 
   return out;
