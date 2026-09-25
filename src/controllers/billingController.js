@@ -10,10 +10,12 @@ const {
   validateCancelRequest,
   validatePayrollUpdate,
   validatePortalRequest,
+  validateCustomPlanRequest,
 } = require('../validators/billingValidator');
 const checkoutService = require('../services/checkoutService');
 const subscriptionService = require('../services/subscriptionService');
 const stripeWebhookService = require('../services/stripeWebhookService');
+const customPlanService = require('../services/customPlanService');
 
 /**
  * HTTP layer for the billing flows. Thin by design, exactly as companyController
@@ -238,6 +240,28 @@ const handleWebhook = asyncHandler(async (req, res) => {
 });
 
 /**
+ * POST /billing/custom-plan-request
+ *
+ * "Connect with us" for a custom service plan. Every click is recorded; the
+ * support team and the user are emailed unless the company already asked in the
+ * last 24 hours. The response is the same either way.
+ */
+const requestCustomPlan = asyncHandler(async (req, res) => {
+  const { companyId } = validateCustomPlanRequest(req.body);
+
+  const data = await customPlanService.requestCustomPlan({
+    userId: req.user.id,
+    companyId,
+  });
+
+  return res.status(201).json({
+    success: true,
+    message: 'We received your request. The FinOpSys team will get back to you within 24 hours.',
+    data,
+  });
+});
+
+/**
  * The Idempotency-Key header may arrive as a string or (for a repeated header) an
  * array. Reduce it to a single trimmed string, or null when absent/blank.
  */
@@ -258,5 +282,6 @@ module.exports = {
   updatePayroll,
   cancelSubscription,
   createPortalSession,
+  requestCustomPlan,
   handleWebhook,
 };

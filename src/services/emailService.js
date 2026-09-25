@@ -568,6 +568,207 @@ const sendPasswordChangedEmail = async ({
   });
 };
 
+/**
+ * Label/value rows for the custom-plan emails. Empty values are dropped rather
+ * than shown blank, so a company with no EN number simply has no EN row.
+ */
+const companyDetailRows = (company) => {
+  const revenue =
+    company.lastYearRevenue !== undefined && company.lastYearRevenue !== null
+      ? `${company.revenueCurrency} ${Number(company.lastYearRevenue).toLocaleString("en-US", {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        })}`
+      : null;
+
+  return [
+    ["Company name", company.companyName],
+    ["Company type", company.companyType],
+    ["Company email", company.companyEmail],
+    ["Company phone", company.companyPhone],
+    ["EN number", company.enNumber],
+    ["Employees", company.employeeCount],
+    ["Last year revenue", revenue]
+  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
+};
+
+const detailsTableHtml = (title, rows) => `
+  <p style="margin: 24px 0 8px; font-weight: 700;">${escapeHtml(title)}</p>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top: 1px solid #e5e5ea;">
+    ${rows
+      .map(
+        ([label, value]) => `
+      <tr>
+        <td style="padding: 8px 0; color: #666666; font-size: 14px; width: 40%; border-bottom: 1px solid #f0f0f3;">${escapeHtml(label)}</td>
+        <td style="padding: 8px 0; font-size: 14px; border-bottom: 1px solid #f0f0f3;">${escapeHtml(value)}</td>
+      </tr>`
+      )
+      .join("")}
+  </table>
+`;
+
+const detailsText = (title, rows) =>
+  [title, ...rows.map(([label, value]) => `${label}: ${value}`)].join("\n");
+
+const cardHtml = (pageTitle, innerHtml) => `
+  <!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>${escapeHtml(pageTitle)}</title>
+    </head>
+    <body style="margin: 0; padding: 0; background-color: #f5f5f7; font-family: Arial, Helvetica, sans-serif; color: #222222;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f7;">
+        <tr>
+          <td align="center" style="padding: 40px 16px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width: 600px; background-color: #ffffff; border-radius: 10px;">
+              <tr>
+                <td style="padding: 40px;">
+                  ${innerHtml}
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+  </html>
+`;
+
+/**
+ * Confirmation to the user who clicked "Connect with us" for a custom plan.
+ * Goes to the account's own email, read from the database by the caller.
+ */
+const sendCustomPlanAckEmail = async ({ recipientEmail, recipientFirstName, company }) => {
+  const name = recipientFirstName || "there";
+  const rows = companyDetailRows(company);
+
+  return transporter.sendMail({
+    from: {
+      name: process.env.SMTP_FROM_NAME || "FinOpSys Portal",
+      address: process.env.SMTP_FROM || process.env.SMTP_USER
+    },
+    to: recipientEmail,
+    subject: "We've received your custom plan request – FinOpSys",
+
+    text: [
+      `Hello ${name},`,
+      "",
+      "Thanks for reaching out!",
+      "",
+      "We've received your request for a custom service plan. The FinOpSys team will get back to you within 24 hours.",
+      "",
+      detailsText("Your registered company details", rows),
+      "",
+      "If any of these details are wrong, reply to this email and we'll update them.",
+      "",
+      "— Team FinOpSys"
+    ].join("\n"),
+
+    html: cardHtml(
+      "Custom Plan Request",
+      `
+      <p style="margin: 0 0 16px; line-height: 1.6;">Hello ${escapeHtml(name)},</p>
+
+      <h1 style="margin: 0 0 16px; font-size: 25px; line-height: 1.3;">Thanks for reaching out!</h1>
+
+      <p style="margin: 0 0 16px; line-height: 1.6;">
+        We've received your request for a custom service plan. The FinOpSys team
+        will get back to you within 24 hours.
+      </p>
+
+      ${detailsTableHtml("Your registered company details", rows)}
+
+      <p style="margin: 24px 0 0; color: #666666; font-size: 13px; line-height: 1.5;">
+        If any of these details are wrong, reply to this email and we'll update them.
+      </p>
+
+      <p style="margin: 24px 0 0; line-height: 1.6;">— Team FinOpSys</p>
+    `
+    )
+  });
+};
+
+/**
+ * Internal notice to the support mailbox (SUPPORT_EMAIL) asking the team to
+ * contact the user. Reply-To is the user, so support can answer directly.
+ *
+ * `followUp` marks a company that asked before and is asking again after the
+ * 24h window — the subject says so and the body gives the first request date.
+ */
+const sendCustomPlanSupportEmail = async ({ user, company, requestedAt, followUp = false, firstRequestedAt }) => {
+  const supportEmail = process.env.SUPPORT_EMAIL || "support@finopsys.ai";
+  const fullName = [user.firstName, user.lastName].filter(Boolean).join(" ");
+
+  const userRows = [
+    ["Name", fullName],
+    ["Email", user.email],
+    ["Phone", user.phone],
+    ["Role", user.role?.code]
+  ].filter(([, value]) => value);
+
+  const companyRows = [["Company ID", company.id], ...companyDetailRows(company), ["Status", company.status]];
+
+  const formatUtc = (date) =>
+    new Date(date).toLocaleString("en-US", {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone: "UTC"
+    });
+
+  const requestedText = formatUtc(requestedAt || Date.now());
+  const firstRequestedText = followUp && firstRequestedAt ? formatUtc(firstRequestedAt) : null;
+  const heading = followUp ? "Follow-up: custom plan request" : "New custom plan request";
+
+  return transporter.sendMail({
+    from: {
+      name: process.env.SMTP_FROM_NAME || "FinOpSys Portal",
+      address: process.env.SMTP_FROM || process.env.SMTP_USER
+    },
+    replyTo: user.email,
+    to: supportEmail,
+    subject: `${followUp ? "Follow-up: " : ""}Custom plan request – ${company.companyName}`,
+
+    text: [
+      heading,
+      "",
+      "Please connect with this user regarding a custom service plan.",
+      firstRequestedText ? `This user first requested on ${firstRequestedText} UTC and is still waiting.` : "",
+      "",
+      detailsText("User", userRows),
+      "",
+      detailsText("Company", companyRows),
+      "",
+      `Requested on ${requestedText} UTC`
+    ].join("\n"),
+
+    html: cardHtml(
+      "Custom Plan Request",
+      `
+      <h1 style="margin: 0 0 16px; font-size: 25px; line-height: 1.3;">${escapeHtml(heading)}</h1>
+
+      <p style="margin: 0 0 8px; line-height: 1.6;">
+        Please connect with this user regarding a custom service plan.
+      </p>
+
+      ${
+        firstRequestedText
+          ? `<p style="margin: 8px 0; padding: 12px 16px; background-color: #fff6e5; border-radius: 6px; line-height: 1.6;">This user first requested on <strong>${firstRequestedText} UTC</strong> and is still waiting.</p>`
+          : ""
+      }
+
+      ${detailsTableHtml("User", userRows)}
+      ${detailsTableHtml("Company", companyRows)}
+
+      <p style="margin: 24px 0 0; color: #666666; font-size: 13px; line-height: 1.5;">
+        Requested on <strong>${requestedText} UTC</strong>
+      </p>
+    `
+    )
+  });
+};
+
 const verifyEmailConnection = async () => {
   await transporter.verify();
 };
@@ -663,6 +864,8 @@ module.exports = {
   sendPasswordResetOtpEmail,
   sendPasswordChangedEmail,
   sendComposedEmail,
+  sendCustomPlanAckEmail,
+  sendCustomPlanSupportEmail,
   htmlToText,
   verifyEmailConnection
 };

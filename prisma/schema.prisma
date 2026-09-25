@@ -184,6 +184,8 @@ model User {
   // Every emoji this user has put on a chat message or file.
   chatReactions    ChatReaction[]     @relation("ChatReactionUser")
 
+  customPlanRequests CustomPlanRequest[]
+
   sentEmails     EmailMessage[]   @relation("EmailMessageSender")
   receivedEmails EmailRecipient[] @relation("EmailRecipientUser")
 
@@ -575,6 +577,7 @@ model Company {
   projects              Project[]
   emailMessages         EmailMessage[]
   chatConversations     ChatConversation[]
+  customPlanRequests    CustomPlanRequest[]
 
   @@index([ownerUserId])
   @@index([accountingManagerUserId])
@@ -1205,7 +1208,7 @@ model EmailMessage {
   /// no sort step runs. The database index is (company_id, created_at DESC);
   /// Prisma cannot express the direction, which costs nothing — it describes the
   /// index rather than creating it.
-  @@index([companyId, createdAt])
+  @@index([companyId])
   @@map("email_messages")
 }
 
@@ -1449,4 +1452,23 @@ enum ChatReactionKind {
   thanks
 
   @@map("chat_reaction_kind")
+}
+
+/// One row each time a user clicks "Connect with us" for a custom service plan
+/// (db/schema/25). Only who asked, for which company, when, and what kind of
+/// click it was — the details sent in the emails are read from `companies` and
+/// `users`.
+model CustomPlanRequest {
+  id          Int      @id @default(autoincrement())
+  companyId   Int      @map("company_id")
+  userId      Int      @map("user_id")
+  /// NEW | REPEAT | FOLLOW_UP — a plain VARCHAR with a CHECK constraint in SQL.
+  requestType String   @default("NEW") @map("request_type") @db.VarChar(20)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@index([companyId])
+  @@map("custom_plan_requests")
 }
