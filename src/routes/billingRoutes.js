@@ -15,6 +15,7 @@ const {
   updatePayroll,
   cancelSubscription,
   createPortalSession,
+  requestCustomPlan,
 } = require('../controllers/billingController');
 
 /*
@@ -31,6 +32,7 @@ const {
  *   DELETE /billing/subscription         -> cancel (end of period by default)
  *   GET    /billing/payments             -> payment history
  *   POST   /billing/portal               -> link into Stripe's hosted portal
+ *   POST   /billing/custom-plan-request  -> "Connect with us" for a custom plan
  *
  * POST /billing/webhook is NOT mounted here. It is unauthenticated (Stripe holds
  * no token; the signature is the authentication) and needs the raw request body,
@@ -71,5 +73,7 @@ router.post('/subscription/services', billingLimiter, canBill, addServices);
 router.patch('/subscription/payroll', billingLimiter, canBill, updatePayroll);
 router.delete('/subscription', billingLimiter, canBill, cancelSubscription);
 router.post('/portal', billingLimiter, canBill, createPortalSession);
+// Sends two emails and saves a row; rate-limited so the button cannot spam support.
+router.post('/custom-plan-request', billingLimiter, canBill, requestCustomPlan);
 
 module.exports = router;

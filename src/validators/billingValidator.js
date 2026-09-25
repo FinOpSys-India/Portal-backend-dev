@@ -321,6 +321,13 @@ function validatePortalRequest(body = {}) {
   return { companyId: common.parseId(body.companyId, 'companyId') };
 }
 
+/** Validate POST /billing/custom-plan-request ("Connect with us"). */
+function validateCustomPlanRequest(body = {}) {
+  common.rejectUnknown(body, ['companyId']);
+  common.requireFields(body, ['companyId']);
+  return { companyId: common.parseId(body.companyId, 'companyId') };
+}
+
 module.exports = {
   validateCheckoutRequest,
   validateAddServicesRequest,
@@ -330,6 +337,7 @@ module.exports = {
   validateCancelRequest,
   validatePayrollUpdate,
   validatePortalRequest,
+  validateCustomPlanRequest,
   parseId: common.parseId,
   // exported for unit testing
   _internals: { validateCount, validateOptionId, isSelected, parseSelectedServices },
