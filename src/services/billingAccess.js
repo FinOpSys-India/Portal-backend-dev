@@ -2,6 +2,7 @@
 
 const { prisma } = require('../config/prisma');
 const ApiError = require('../utils/ApiError');
+const { getCachedCaller } = require('../utils/requestCache');
 const companyRepo = require('../repositories/companyRepository');
 
 /**
@@ -35,10 +36,13 @@ function companyAccessDenied() {
  * @throws {ApiError} 401 USER_NOT_FOUND / 404 COMPANY_NOT_FOUND / 403 COMPANY_ACCESS_DENIED
  */
 async function authorizeCompany(userId, companyId, client = prisma) {
-  const caller = await companyRepo.findUserWithRole(client, userId);
+  // Independent reads, fetched together to save a database round trip.
+  const [caller, company] = await Promise.all([
+    // Outside a transaction the caller row requireAuth read is reused.
+    (client === prisma && getCachedCaller(userId)) || companyRepo.findUserWithRole(client, userId),
+    companyRepo.findCompanyById(client, companyId),
+  ]);
   if (!caller) throw callerNotFound();
-
-  const company = await companyRepo.findCompanyById(client, companyId);
   if (!company) throw companyNotFound();
 
   const isAdmin = caller.role?.code === 'ADMIN';
