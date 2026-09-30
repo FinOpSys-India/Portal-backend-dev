@@ -14,6 +14,7 @@ const notFound = require('./middlewares/notFound');
 const errorHandler = require('./middlewares/errorHandler');
 const { requireCsrf } = require('./middlewares/csrf');
 const logger = require('./utils/logger');
+const { requestCacheMiddleware } = require('./utils/requestCache');
 
 // Every feature router is mounted under one prefix, so the public contract is
 // defined in a single place (config.apiPrefix, overridable with API_PREFIX).
@@ -224,6 +225,11 @@ app.use(
 app.get('/', (req, res) => {
   res.json({ success: true, message: 'Portal backend API' });
 });
+
+// Per-request cache of the caller's user row (see utils/requestCache). Mounted
+// after the body parsers: they resume the chain from stream events, which would
+// run outside the request's async context.
+app.use(requestCacheMiddleware);
 
 app.use(API_PREFIX, routes);
 

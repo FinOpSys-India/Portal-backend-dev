@@ -359,6 +359,11 @@ describe('GET /api/companies/:companyId', () => {
       companyRow({ ownerUserId: 999, owner: { id: 999, firstName: 'Grace', lastName: 'Hopper' } })
     );
     mockPrisma.companyMember.findFirst.mockResolvedValue({ id: 1 });
+    // accessRole is read from the company's member list, loaded once with the
+    // rest of the company context.
+    mockPrisma.companyMember.findMany.mockResolvedValue([
+      { companyId: COMPANY_ID, user: { id: USER_ID, firstName: 'Ada', lastName: 'Lovelace', email: 'ada@x.com' } },
+    ]);
 
     const res = await request(app)
       .get(`/api/companies/${COMPANY_ID}`)

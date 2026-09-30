@@ -12,6 +12,7 @@ const storage = require('../utils/storage');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { logEvent } = require('../utils/auditLog');
+const { getCachedCaller } = require('../utils/requestCache');
 
 /**
  * Projects: open a unit of work against a company, list what is open, and keep
@@ -92,7 +93,7 @@ const isSpecialist = (caller) => caller.role?.code === 'SPECIALIST';
 
 /** Load the caller with their role, or 401. */
 async function loadCaller(userId) {
-  const caller = await companyRepo.findUserWithRole(prisma, userId);
+  const caller = getCachedCaller(userId) ?? (await companyRepo.findUserWithRole(prisma, userId));
   if (!caller) throw callerNotFound();
   return caller;
 }
@@ -240,9 +241,11 @@ function assertDeleteAccess(caller, company, project) {
  * either is changed.
  */
 async function loadProjectForRead(client, { userId, projectId }) {
-  const caller = await loadCaller(userId);
-
-  const project = await repo.findProjectForAccess(client, projectId);
+  // Independent reads, fetched together to save a database round trip.
+  const [caller, project] = await Promise.all([
+    loadCaller(userId),
+    repo.findProjectForAccess(client, projectId),
+  ]);
   if (!project) throw projectNotFound();
 
   const company = await loadCompany(client, project.companyId);
@@ -261,8 +264,10 @@ async function loadProjectForRead(client, { userId, projectId }) {
  * instead of one project's.
  */
 async function loadCompanyForRead(client, { userId, companyId }) {
-  const caller = await loadCaller(userId);
-  const company = await loadCompany(client, companyId);
+  const [caller, company] = await Promise.all([
+    loadCaller(userId),
+    loadCompany(client, companyId),
+  ]);
   await assertReadAccess(client, caller, company);
   return { caller, company };
 }
@@ -649,9 +654,10 @@ async function listProjects({ userId, requestId, query }) {
 
 /** GET /projects/:projectId — one project in full. */
 async function getProject({ userId, requestId, projectId }) {
-  const caller = await loadCaller(userId);
-
-  const project = await repo.findProjectDetail(prisma, projectId);
+  const [caller, project] = await Promise.all([
+    loadCaller(userId),
+    repo.findProjectDetail(prisma, projectId),
+  ]);
   if (!project) throw projectNotFound();
 
   const company = await loadCompany(prisma, project.companyId);

@@ -14,6 +14,7 @@ const { chatAttachmentKey, EXTENSION_BY_MIME, ACCEPTED_LABEL } = require('../uti
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { logEvent } = require('../utils/auditLog');
+const { getCachedCaller } = require('../utils/requestCache');
 
 /**
  * Company-scoped chat between an accounting manager and the people on that
@@ -246,9 +247,11 @@ const isAccountingManager = (caller) => caller.role?.code === 'ACCOUNTING_MANAGE
  * there is exactly one place the authorization can be got wrong.
  */
 async function loadConversationForParticipant(userId, conversationId) {
-  const caller = await loadCaller(userId);
-
-  const conversation = await repo.findConversationById(prisma, conversationId);
+  // Independent reads, fetched together to save a database round trip.
+  const [caller, conversation] = await Promise.all([
+    loadCaller(userId),
+    repo.findConversationById(prisma, conversationId),
+  ]);
   if (!conversation) throw conversationNotFound();
 
   assertParticipant(caller, conversation);
@@ -264,6 +267,8 @@ async function loadConversationForParticipant(userId, conversationId) {
  * this adds is the role, which decides which side of a new thread they are on.
  */
 async function loadCaller(userId) {
+  const cached = getCachedCaller(userId);
+  if (cached) return cached;
   const caller = await prisma.user.findUnique({
     where: { id: userId },
     select: { id: true, role: { select: { code: true } }, specificRole: { select: { code: true } } },
@@ -655,19 +660,19 @@ async function openConversation({ userId, requestId, body }) {
 async function listMessages({ userId, requestId, conversationId, query }) {
   const { caller, conversation } = await loadConversationForParticipant(userId, conversationId);
 
-  const messages = await repo.listMessages(prisma, {
-    conversationId: conversation.id,
-    limit: query.limit,
-    before: query.before,
-    after: query.after,
-  });
-
-  const unreadCount = (
-    await repo.countUnreadByConversation(prisma, {
+  const [messages, unreadByConversation] = await Promise.all([
+    repo.listMessages(prisma, {
+      conversationId: conversation.id,
+      limit: query.limit,
+      before: query.before,
+      after: query.after,
+    }),
+    repo.countUnreadByConversation(prisma, {
       conversationIds: [conversation.id],
       userId: caller.id,
-    })
-  ).get(conversation.id) ?? 0;
+    }),
+  ]);
+  const unreadCount = unreadByConversation.get(conversation.id) ?? 0;
 
   /*
    * The cursor names the OLDEST row on this page, which is where the next
