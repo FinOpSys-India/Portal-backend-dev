@@ -3,6 +3,7 @@
 const { prisma } = require('../config/prisma');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
+const { invalidateAuthUser } = require('../utils/authCache');
 const { signAccessToken } = require('../utils/tokens');
 const adminEvents = require('./adminEventService');
 
@@ -256,6 +257,7 @@ async function provision({ userId }) {
       data: { roleId, specificRoleId },
       select: STATUS_SELECT,
     });
+    invalidateAuthUser(userId);
     const status = buildStatus(user);
 
     logger.info(`Onboarding: provisioned user ${userId} as OWNER.`);
@@ -334,6 +336,7 @@ async function submitProfile({ userId, profile }) {
       },
       select: STATUS_SELECT,
     });
+    invalidateAuthUser(userId);
     logger.info(`Onboarding: profile submitted for user ${userId}.`);
 
     // The name shown next to every company this user manages just changed.
