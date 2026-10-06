@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const { prisma } = require('../config/prisma');
 const ApiError = require('../utils/ApiError');
 const { logEvent } = require('../utils/auditLog');
-const { getCachedCaller } = require('../utils/requestCache');
 const catalog = require('../config/serviceCatalog');
 const repo = require('../repositories/companyRepository');
 // The specialist profile carries that person's task table, so it reads the tasks
@@ -202,7 +201,7 @@ function companyEmailInUse(reason) {
 
 /** Load the caller (with role) or 401. */
 async function loadCaller(userId) {
-  const caller = getCachedCaller(userId) ?? (await repo.findUserWithRole(prisma, userId));
+  const caller = await repo.findUserWithRole(prisma, userId);
   if (!caller) throw callerNotFound();
   return caller;
 }
@@ -599,24 +598,6 @@ async function accessRoleFor(caller, company) {
 }
 
 /**
- * accessRoleFor, answered from a loadCompanyContext result instead of the
- * database. The context already holds the company's ACTIVE assignments and its
- * members, so asking again per company made a 25-row list up to fifty extra
- * round trips. The members list only includes ACTIVE users, which the caller
- * always is — requireAuth rejects anyone else.
- */
-function accessRoleFromContext(caller, company, context) {
-  if (isAdmin(caller)) return 'ADMIN';
-  if (company.ownerUserId === caller.id) return 'OWNER';
-  if (company.accountingManagerUserId === caller.id) return 'ACCOUNTING_MANAGER';
-  if (context.assignmentsFor(company.id).some((a) => a.specialistUserId === caller.id)) {
-    return 'SPECIALIST';
-  }
-  if (context.membersFor(company.id).some((m) => m.user.id === caller.id)) return 'TEAM';
-  return null;
-}
-
-/**
  * Load the active subscription and the team for a page of companies, in two
  * queries rather than two per company.
  *
@@ -693,7 +674,7 @@ async function listCompanies({ userId, requestId, query }) {
         subscription: context.subscriptionFor(company.id),
         assignments: context.assignmentsFor(company.id),
         members: context.membersFor(company.id),
-        accessRole: accessRoleFromContext(caller, company, context),
+        accessRole: await accessRoleFor(caller, company),
       })
     );
   }
@@ -711,10 +692,8 @@ async function listCompanies({ userId, requestId, query }) {
 
 /** GET /companies/:companyId — one company, with its primary address. */
 async function getCompany({ userId, requestId, companyId }) {
-  const [caller, company] = await Promise.all([
-    loadCaller(userId),
-    repo.findCompanyDetail(prisma, companyId),
-  ]);
+  const caller = await loadCaller(userId);
+  const company = await repo.findCompanyDetail(prisma, companyId);
   if (!company) throw companyNotFound();
   await assertReadAccess(caller, company);
 
@@ -728,7 +707,7 @@ async function getCompany({ userId, requestId, companyId }) {
     subscription: context.subscriptionFor(companyId),
     assignments: context.assignmentsFor(companyId),
     members: context.membersFor(companyId),
-    accessRole: accessRoleFromContext(caller, company, context),
+    accessRole: await accessRoleFor(caller, company),
   });
 }
 

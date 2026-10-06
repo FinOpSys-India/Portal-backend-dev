@@ -4,7 +4,6 @@ const { prisma } = require('../config/prisma');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { verifyAccessToken } = require('../utils/tokens');
-const { setCachedCaller } = require('../utils/requestCache');
 
 /**
  * Authenticate a request from its Bearer access token and expose the verified
@@ -30,12 +29,6 @@ function requireAuth(req, res, next) {
   if (scheme !== 'Bearer' || !token) {
     return next(new ApiError(401, 'Authentication required.', { code: 'AUTH_REQUIRED' }));
   }
-
-  // Several routers are mounted behind requireAuth in routes/index.js AND apply
-  // it again themselves. Once this token has passed on this request, a second
-  // run would only repeat the database read and rebuild req.user (dropping what
-  // later middleware memoised on it), so skip it.
-  if (req._authVerifiedToken === token) return next();
 
   let decoded;
   try {
@@ -92,25 +85,13 @@ function requireAuth(req, res, next) {
  * primary-key lookup returning a single nullable timestamp.
  */
 async function checkPasswordRotation(req, next) {
-  if (!req.user.issuedAt) return passed(req, next);
+  if (!req.user.issuedAt) return next();
 
   let row;
   try {
-    // The role and name columns are not needed for this check. They are read in
-    // the same query so the services can reuse the row (utils/requestCache)
-    // instead of loading the caller again.
     row = await prisma.user.findUnique({
       where: { id: req.user.id },
-      select: {
-        passwordChangedAt: true,
-        id: true,
-        firstName: true,
-        lastName: true,
-        email: true,
-        status: true,
-        role: { select: { code: true } },
-        specificRole: { select: { code: true } },
-      },
+      select: { passwordChangedAt: true, status: true },
     });
   } catch (err) {
     // A database blip must not turn every authenticated request into a 401.
@@ -147,16 +128,6 @@ async function checkPasswordRotation(req, next) {
     }
   }
 
-  const { passwordChangedAt, ...caller } = row;
-  setCachedCaller(caller);
-
-  return passed(req, next);
-}
-
-/** Record that this request's token passed every check, then continue. */
-function passed(req, next) {
-  const [, token] = (req.headers.authorization || '').split(' ');
-  req._authVerifiedToken = token;
   return next();
 }
 
