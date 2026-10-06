@@ -1,7 +1,5 @@
 'use strict';
 
-const { invalidateAuthUser } = require('../utils/authCache');
-
 /**
  * Data access for the caller's own profile.
  *
@@ -85,11 +83,8 @@ function updateAddress(client, addressId, data) {
 }
 
 /** Apply a partial profile patch and return the full profile shape. */
-async function updateMe(client, userId, data) {
-  const row = await client.user.update({ where: { id: userId }, data, select: ME_SELECT });
-  // The name is part of the row requireAuth caches.
-  invalidateAuthUser(userId);
-  return row;
+function updateMe(client, userId, data) {
+  return client.user.update({ where: { id: userId }, data, select: ME_SELECT });
 }
 
 module.exports = {

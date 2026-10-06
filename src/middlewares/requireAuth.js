@@ -5,7 +5,6 @@ const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { verifyAccessToken } = require('../utils/tokens');
 const { setCachedCaller } = require('../utils/requestCache');
-const { getAuthUser, setAuthUser } = require('../utils/authCache');
 
 /**
  * Authenticate a request from its Bearer access token and expose the verified
@@ -95,12 +94,12 @@ function requireAuth(req, res, next) {
 async function checkPasswordRotation(req, next) {
   if (!req.user.issuedAt) return passed(req, next);
 
-  let row = getAuthUser(req.user.id);
+  let row;
   try {
     // The role and name columns are not needed for this check. They are read in
     // the same query so the services can reuse the row (utils/requestCache)
     // instead of loading the caller again.
-    row ??= await prisma.user.findUnique({
+    row = await prisma.user.findUnique({
       where: { id: req.user.id },
       select: {
         passwordChangedAt: true,
@@ -113,7 +112,6 @@ async function checkPasswordRotation(req, next) {
         specificRole: { select: { code: true } },
       },
     });
-    if (row) setAuthUser(req.user.id, row);
   } catch (err) {
     // A database blip must not turn every authenticated request into a 401.
     // The token itself is already cryptographically verified; failing open on

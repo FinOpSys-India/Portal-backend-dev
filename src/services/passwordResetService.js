@@ -6,7 +6,6 @@ const { prisma } = require('../config/prisma');
 const config = require('../config');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
-const { invalidateAuthUser } = require('../utils/authCache');
 const { hashPassword, verifyPassword } = require('../utils/password');
 const { generatePasswordResetToken, hashPasswordResetToken } = require('../utils/tokens');
 const { generateOtp, digestOtp, verifyOtp, hashContext, maskEmail } = require('../utils/otp');
@@ -574,7 +573,6 @@ async function completePasswordReset({ resetToken, password, context = {} }) {
 
     return revoked.count;
   });
-  invalidateAuthUser(ticket.userId);
 
   logger.info(
     `Password reset completed for user ${ticket.userId} ` +
