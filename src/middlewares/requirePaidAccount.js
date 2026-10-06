@@ -3,7 +3,6 @@
 const onboardingService = require('../services/onboardingService');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
-const { getCachedCaller } = require('../utils/requestCache');
 
 /**
  * Hold an owner outside the portal until every company they own is paid for.
@@ -44,14 +43,6 @@ const { getCachedCaller } = require('../utils/requestCache');
 async function requirePaidAccount(req, res, next) {
   if (!req.user) {
     return next(new ApiError(401, 'Authentication required.', { code: 'AUTH_REQUIRED' }));
-  }
-
-  // Only an owner can be gated. When requireAuth has already read this user's
-  // current role from the database and it is not the owner pair, there is
-  // nothing to check, so skip the status query.
-  const cached = getCachedCaller(req.user.id);
-  if (cached && !(cached.role?.code === 'CUSTOMER' && cached.specificRole?.code === 'OWNER')) {
-    return next();
   }
 
   let status;
