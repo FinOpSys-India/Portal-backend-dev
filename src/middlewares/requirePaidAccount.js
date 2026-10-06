@@ -5,7 +5,8 @@ const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 
 /**
- * Hold an owner outside the portal until every company they own is paid for.
+ * Hold an owner outside the portal until at least one company they own is paid
+ * for, and refuse any request that names one of their companies still unpaid.
  *
  * The flags on GET /onboarding always described this rule, but nothing enforced
  * it: they were a hint for the client's router and no more. A caller who skipped
@@ -60,11 +61,35 @@ async function requirePaidAccount(req, res, next) {
     return next(err);
   }
 
-  const { isOwner, complete, companyCreated, paymentComplete } = status.onboarding;
+  const { isOwner, complete, companyCreated, paymentComplete, companies = [] } = status.onboarding;
 
   // Not an owner: no company to pay for, nothing to gate.
   if (!isOwner) return next();
-  if (complete) return next();
+
+  if (complete) {
+    /*
+     * At least one company is paid, so the account is open — but a request that
+     * names one of the owner's OTHER, unpaid companies is still refused. A
+     * companyId that is not theirs passes through: the route's own ownership
+     * check answers that one.
+     */
+    const requestedId = Number(req.query?.companyId ?? req.body?.companyId);
+    const requested = Number.isInteger(requestedId)
+      ? companies.find((c) => c.id === requestedId)
+      : undefined;
+    if (!requested || requested.paymentComplete) return next();
+
+    logger.info(
+      `[${req.id}] Owner ${req.user.id} blocked from ${req.method} ${req.originalUrl}: ` +
+        `company ${requestedId} is unpaid.`
+    );
+    return next(
+      new ApiError(402, 'Complete payment for this company to continue.', {
+        code: 'PAYMENT_REQUIRED',
+        details: { companyId: requestedId, companyCreated: true, paymentComplete: false },
+      })
+    );
+  }
 
   logger.info(
     `[${req.id}] Owner ${req.user.id} blocked from ${req.method} ${req.originalUrl}: ` +

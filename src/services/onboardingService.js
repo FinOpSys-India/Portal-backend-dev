@@ -63,6 +63,7 @@ const STATUS_SELECT = {
     where: { deletedAt: null },
     select: {
       id: true,
+      companyName: true,
       subscriptions: {
         where: { status: PAID_SUBSCRIPTION_STATUS },
         select: { id: true },
@@ -122,6 +123,21 @@ function buildStatus(user) {
    */
   const paymentComplete = companyCreated && companies.every((c) => c.subscriptions.length > 0);
 
+  /*
+   * Per-company payment state. An owner who has paid for at least one company is
+   * an established customer: their extra, unpaid companies are gated one by one
+   * (requirePaidAccount refuses a request naming one) rather than locking them
+   * out of the account they already pay for. `paymentComplete` above keeps its
+   * meaning — every company paid — for clients that read it.
+   */
+  const companyPayments = companies.map((c) => ({
+    id: c.id,
+    companyName: c.companyName ?? null,
+    paymentComplete: c.subscriptions.length > 0,
+  }));
+  const paidCompanies = companyPayments.filter((c) => c.paymentComplete).length;
+  const hasPaidCompany = paidCompanies > 0;
+
   return {
     user: {
       id: user.id,
@@ -139,9 +155,10 @@ function buildStatus(user) {
       profileComplete,
       companyCreated,
       paymentComplete,
-      complete: isOwner
-        ? profileComplete && companyCreated && paymentComplete
-        : profileComplete,
+      complete: isOwner ? profileComplete && hasPaidCompany : profileComplete,
+      totalCompanies: companyPayments.length,
+      paidCompanies,
+      companies: companyPayments,
       /*
        * Retained for clients still reading the old field name. It always meant
        * "holds the owner role pair", which is now `isOwner`; it was never a step

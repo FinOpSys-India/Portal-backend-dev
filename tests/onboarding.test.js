@@ -135,6 +135,38 @@ describe('Onboarding — authentication guard', () => {
   });
 });
 
+describe('requirePaidAccount — per-company payment gate', () => {
+  it('blocks an owner whose only company is unpaid (402)', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(completedOwner({ ownedCompanies: [company(false, 1)] }));
+
+    const res = await request(app).get('/api/projects?companyId=1').set('Authorization', auth());
+
+    expect(res.status).toBe(402);
+    expect(res.body.error.code).toBe('PAYMENT_REQUIRED');
+  });
+
+  it('blocks a request naming an unpaid company when another is paid (402)', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(
+      completedOwner({ ownedCompanies: [company(true, 1), company(false, 2)] })
+    );
+
+    const res = await request(app).get('/api/projects?companyId=2').set('Authorization', auth());
+
+    expect(res.status).toBe(402);
+    expect(res.body.error.code).toBe('PAYMENT_REQUIRED');
+  });
+
+  it('lets a request naming the paid company through', async () => {
+    mockPrisma.user.findUnique.mockResolvedValue(
+      completedOwner({ ownedCompanies: [company(true, 1), company(false, 2)] })
+    );
+
+    const res = await request(app).get('/api/projects?companyId=1').set('Authorization', auth());
+
+    expect(res.status).not.toBe(402);
+  });
+});
+
 describe('GET /onboarding — status', () => {
   it('reports an owner who has finished all three steps as complete', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(completedOwner());
@@ -215,25 +247,30 @@ describe('GET /onboarding — status', () => {
   });
 
   /*
-   * One paid company is enough. An owner who has since added a second, unpaid
-   * one is an established customer partway through a purchase — throwing them
-   * back into onboarding would lock them out of the account they already pay for.
+   * One paid company is enough to complete the owner. An owner who has since
+   * added a second, unpaid one is an established customer partway through a
+   * purchase — throwing them back into onboarding would lock them out of the
+   * account they already pay for. The unpaid company is reported per company
+   * and gated on its own by requirePaidAccount; `paymentComplete` still means
+   * every company is paid.
    */
-  /*
-   * The rule this asserts was once the opposite: ANY paid company completed the
-   * owner. That let an owner who had paid for their first company create further
-   * ones that were never billed while the portal went on reporting them finished,
-   * so nothing ever routed them back to service selection. Every company owned
-   * must be paid for.
-   */
-  it('is incomplete when one company is paid and another is not', async () => {
+  it('is complete when one company is paid and another is not, reporting each', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(
       completedOwner({ ownedCompanies: [company(true, 1), company(false, 2)] })
     );
 
     const res = await request(app).get('/api/onboarding').set('Authorization', auth());
 
-    expect(res.body.data.onboarding).toMatchObject({ paymentComplete: false, complete: false });
+    expect(res.body.data.onboarding).toMatchObject({
+      paymentComplete: false,
+      complete: true,
+      totalCompanies: 2,
+      paidCompanies: 1,
+      companies: [
+        { id: 1, paymentComplete: true },
+        { id: 2, paymentComplete: false },
+      ],
+    });
   });
 
   it('completes an owner once every company they own is paid', async () => {
@@ -265,6 +302,7 @@ describe('GET /onboarding — status', () => {
             where: { deletedAt: null },
             select: {
               id: true,
+              companyName: true,
               subscriptions: { where: { status: 'ACTIVE' }, select: { id: true }, take: 1 },
             },
           },
