@@ -180,14 +180,26 @@ async function findCompanyAccountingManager(client, companyId) {
  * it is a presentation decision, not a storage one.
  */
 async function listCompanySpecialistSources(client, companyId) {
-  const company = await client.company.findFirst({
-    where: { id: companyId, deletedAt: null },
-    select: {
-      id: true,
-      companyName: true,
-      ...Object.fromEntries(STANDING_SPECIALIST_COLUMNS.map((entry) => [entry.column, true])),
-    },
-  });
+  // Both halves at once: neither depends on the other, and one after the other
+  // they cost two round trips. The assignments are discarded if the company is
+  // gone.
+  const [company, assignments] = await Promise.all([
+    client.company.findFirst({
+      where: { id: companyId, deletedAt: null },
+      select: {
+        id: true,
+        companyName: true,
+        ...Object.fromEntries(STANDING_SPECIALIST_COLUMNS.map((entry) => [entry.column, true])),
+      },
+    }),
+    client.companySpecialistAssignment.findMany({
+      where: { companyId, assignmentStatus: 'ACTIVE' },
+      select: {
+        specialistUserId: true,
+        specialization: { select: { specializationCode: true, specializationName: true } },
+      },
+    }),
+  ]);
 
   if (!company) return { company: null, standing: [], assignments: [] };
 
@@ -198,14 +210,6 @@ async function listCompanySpecialistSources(client, companyId) {
     specializationCode: entry.specializationCode,
     userId: company[entry.column],
   })).filter((entry) => entry.userId);
-
-  const assignments = await client.companySpecialistAssignment.findMany({
-    where: { companyId, assignmentStatus: 'ACTIVE' },
-    select: {
-      specialistUserId: true,
-      specialization: { select: { specializationCode: true, specializationName: true } },
-    },
-  });
 
   return { company, standing, assignments };
 }

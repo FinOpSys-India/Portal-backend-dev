@@ -477,15 +477,18 @@ const FIELD_BY_TYPE = { TO: 'to', CC: 'cc', BCC: 'bcc' };
  * either.
  */
 async function loadAddressBook(companyId) {
-  const sources = await repo.listCompanySpecialistSources(prisma, companyId);
+  // Customers and the manager do not wait on the specialist sources; only the
+  // specialist lookup needs their ids.
   const [customers, specialists, { manager }] = await Promise.all([
     repo.listCompanyCustomers(prisma, { companyId }),
-    repo.findSpecialistsByIds(prisma, [
-      ...new Set([
-        ...sources.standing.map((s) => s.userId),
-        ...sources.assignments.map((a) => a.specialistUserId),
-      ]),
-    ]),
+    repo.listCompanySpecialistSources(prisma, companyId).then((sources) =>
+      repo.findSpecialistsByIds(prisma, [
+        ...new Set([
+          ...sources.standing.map((s) => s.userId),
+          ...sources.assignments.map((a) => a.specialistUserId),
+        ]),
+      ])
+    ),
     repo.findCompanyAccountingManager(prisma, companyId),
   ]);
 

@@ -129,18 +129,31 @@ function listPurchasedPlans(client, companyId) {
  * company that has been archived, and one that already exists on it should stop
  * appearing.
  */
+const COMPANY_FOR_PROJECTS_SELECT = {
+  id: true,
+  companyName: true,
+  ownerUserId: true,
+  accountingManagerUserId: true,
+  bookkeepingSpecialistUserId: true,
+  payrollSpecialistUserId: true,
+  taxSpecialistUserId: true,
+};
+
 function findCompanyForProjects(client, companyId) {
   return client.company.findFirst({
     where: { id: companyId, deletedAt: null },
-    select: {
-      id: true,
-      companyName: true,
-      ownerUserId: true,
-      accountingManagerUserId: true,
-      bookkeepingSpecialistUserId: true,
-      payrollSpecialistUserId: true,
-      taxSpecialistUserId: true,
-    },
+    select: COMPANY_FOR_PROJECTS_SELECT,
+  });
+}
+
+/**
+ * The same company row, found through one of its projects — so it can be read
+ * in parallel with the project itself instead of waiting for its companyId.
+ */
+function findCompanyForProjectsByProject(client, projectId) {
+  return client.company.findFirst({
+    where: { deletedAt: null, projects: { some: { id: projectId } } },
+    select: COMPANY_FOR_PROJECTS_SELECT,
   });
 }
 
@@ -377,6 +390,7 @@ module.exports = {
   PROJECT_SELECT,
   listPurchasedPlans,
   findCompanyForProjects,
+  findCompanyForProjectsByProject,
   findMembership,
   findActiveAssignmentsForSpecialization,
   findEligibleSpecialists,

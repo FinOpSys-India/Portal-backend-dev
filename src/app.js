@@ -9,6 +9,8 @@ const config = require('./config');
 const routes = require('./routes');
 const billingWebhookRoutes = require('./routes/billingWebhookRoutes');
 const requestId = require('./middlewares/requestId');
+const { requestContext } = require('./utils/requestContext');
+const compression = require('compression');
 const normalizeRequest = require('./middlewares/normalizeRequest');
 const notFound = require('./middlewares/notFound');
 const errorHandler = require('./middlewares/errorHandler');
@@ -135,6 +137,26 @@ app.use(
 // and the error handler, both of which reference it. Registered before the body
 // parsers so the Stripe webhook below is correlated in the logs too.
 app.use(requestId);
+// Per-request store, so the caller row requireAuth loads is reused downstream
+// instead of being queried again.
+app.use(requestContext);
+
+/*
+ * gzip/brotli for JSON responses (the default threshold skips anything under
+ * 1kb). Large lists — companies, projects, tasks — shrink several-fold, which
+ * matters to a browser far from the server.
+ *
+ * Server-sent events are excluded: compression buffers output, and a buffered
+ * event stream delivers nothing until the buffer fills.
+ */
+app.use(
+  compression({
+    filter: (req, res) => {
+      if (String(res.getHeader('Content-Type') || '').startsWith('text/event-stream')) return false;
+      return compression.filter(req, res);
+    },
+  })
+);
 
 /*
  * The Stripe webhook is mounted HERE, ahead of express.json(), and the order is

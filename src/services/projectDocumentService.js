@@ -307,17 +307,24 @@ async function confirmUploads({ userId, requestId, projectId, companyId, files }
     });
   }
 
-  const already = await repo.findDocumentsByKeys(prisma, files.map((f) => f.key));
+  // The database check and the bucket checks are all reads, so they run at once;
+  // the outcomes are still judged in the same order as before.
+  const [alreadyResult, statsResult] = await Promise.allSettled([
+    repo.findDocumentsByKeys(prisma, files.map((f) => f.key)),
+    Promise.all(files.map((file) => storage.statObject({ bucket: BUCKET, key: file.key }))),
+  ]);
+  if (alreadyResult.status === 'rejected') throw alreadyResult.reason;
+  const already = alreadyResult.value;
   if (already.length) {
     throw new ApiError(409, 'Those uploads have already been recorded.', {
       code: 'DOCUMENT_ALREADY_RECORDED',
       details: { documentIds: already.map((d) => d.id) },
     });
   }
-
-  const stats = await Promise.all(
-    files.map((file) => storage.statObject({ bucket: BUCKET, key: file.key }))
-  );
+  // A bucket failure surfaces only now, after the duplicate check, as it did
+  // when the two ran one after the other.
+  if (statsResult.status === 'rejected') throw statsResult.reason;
+  const stats = statsResult.value;
 
   const missing = files.filter((_, i) => !stats[i]);
   if (missing.length) {
@@ -722,19 +729,28 @@ async function createDownloadLinks({ userId, requestId, projectId, documentIds }
  * who can know it was theirs to take away.
  */
 async function deleteDocument({ userId, requestId, projectId, documentId }) {
-  const document = await repo.findDocumentForAccess(prisma, documentId);
+  /*
+   * The document and the project access check run at once — the project id is
+   * in the URL, so the second need not wait for the first. Outcomes are judged in
+   * the original order: a missing document is a 404 before access is considered.
+   *
+   * `loadProjectForRead` still runs, and still has to: it settles that the caller
+   * is on this project's company at all, and a stranger must get the same 403
+   * here as they do everywhere else rather than a message telling them who the
+   * uploader is. The rule below narrows that decision; it does not replace it.
+   */
+  const [documentResult, accessResult] = await Promise.allSettled([
+    repo.findDocumentForAccess(prisma, documentId),
+    projectService.loadProjectForRead(prisma, { userId, projectId }),
+  ]);
+  if (documentResult.status === 'rejected') throw documentResult.reason;
+  const document = documentResult.value;
   if (!document || document.projectId !== projectId || document.project?.deletedAt) {
     throw documentNotFound();
   }
 
-  // `loadProjectForRead` still runs, and still has to: it settles that the caller
-  // is on this project's company at all, and a stranger must get the same 403
-  // here as they do everywhere else rather than a message telling them who the
-  // uploader is. The rule below narrows that decision; it does not replace it.
-  const { caller, company } = await projectService.loadProjectForRead(prisma, {
-    userId,
-    projectId: document.projectId,
-  });
+  if (accessResult.status === 'rejected') throw accessResult.reason;
+  const { caller, company } = accessResult.value;
 
   /*
    * THE UPLOADER, AND NOBODY ELSE.

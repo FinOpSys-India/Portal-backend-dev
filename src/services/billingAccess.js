@@ -3,6 +3,7 @@
 const { prisma } = require('../config/prisma');
 const ApiError = require('../utils/ApiError');
 const companyRepo = require('../repositories/companyRepository');
+const { getCaller } = require('../utils/requestContext');
 
 /**
  * Per-company authorization for every billing operation, in one place so the
@@ -35,10 +36,15 @@ function companyAccessDenied() {
  * @throws {ApiError} 401 USER_NOT_FOUND / 404 COMPANY_NOT_FOUND / 403 COMPANY_ACCESS_DENIED
  */
 async function authorizeCompany(userId, companyId, client = prisma) {
-  const caller = await companyRepo.findUserWithRole(client, userId);
+  // Both reads at once (they are independent), and the caller row requireAuth
+  // already loaded is reused when there is one. The checks below still run in
+  // the same order, so a missing caller is reported before a missing company.
+  const cachedCaller = client === prisma ? getCaller(userId) : undefined;
+  const [caller, company] = await Promise.all([
+    cachedCaller ?? companyRepo.findUserWithRole(client, userId),
+    companyRepo.findCompanyById(client, companyId),
+  ]);
   if (!caller) throw callerNotFound();
-
-  const company = await companyRepo.findCompanyById(client, companyId);
   if (!company) throw companyNotFound();
 
   const isAdmin = caller.role?.code === 'ADMIN';

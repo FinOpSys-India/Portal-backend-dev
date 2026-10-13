@@ -192,10 +192,12 @@ async function deliverResetOtp(
       expiresInMinutes: Math.round(config.otp.ttlSeconds / 60),
       requestedAt,
     });
-    await markDelivery(challengeId, 'DELIVERED');
+    // Not awaited: markDelivery never throws, and the caller need not wait on
+    // one more database round trip for a status column.
+    markDelivery(challengeId, 'DELIVERED');
     logger.info(`Reset OTP email queued for challenge ${challengeId}.`);
   } catch (err) {
-    await markDelivery(challengeId, 'FAILED');
+    markDelivery(challengeId, 'FAILED');
     logger.error(`Reset OTP delivery failed for challenge ${challengeId}: ${err.message}`);
     if (throwOnFailure) {
       throw new ApiError(503, 'We could not send the verification code. Please try again.', {
@@ -584,18 +586,21 @@ async function completePasswordReset({ resetToken, password, context = {} }) {
   // Best-effort notification, after the commit. This is how the real owner finds
   // out if the reset was not theirs, so it is worth attempting — but the password
   // has already changed, and failing the request now would tell the user their
-  // reset did not work when it did.
-  try {
-    await sendPasswordChangedEmail({
-      recipientEmail: ticket.user.email,
-      recipientFirstName: ticket.user.firstName,
-      changedAt: now,
+  // reset did not work when it did. Not awaited, for the same reason: the
+  // outcome cannot change the response, so the user should not wait on SMTP.
+  Promise.resolve()
+    .then(() =>
+      sendPasswordChangedEmail({
+        recipientEmail: ticket.user.email,
+        recipientFirstName: ticket.user.firstName,
+        changedAt: now,
+      })
+    )
+    .catch((err) => {
+      logger.error(
+        `Password-changed notification failed for user ${ticket.userId}: ${err.message}`
+      );
     });
-  } catch (err) {
-    logger.error(
-      `Password-changed notification failed for user ${ticket.userId}: ${err.message}`
-    );
-  }
 
   return { passwordUpdated: true, sessionsRevoked };
 }

@@ -6,6 +6,9 @@ const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: smtpPort,
   secure: process.env.SMTP_SECURE === "true" || smtpPort === 465,
+  // Keep SMTP connections open between sends, so each email skips the TCP + TLS
+  // + AUTH handshake.
+  pool: true,
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASSWORD

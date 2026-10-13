@@ -174,7 +174,19 @@ function buildMetadata({ userId, companyId, subscriptionId, selections, selected
  * @returns {Promise<{ statusCode: number, body: object, idempotent: boolean }>}
  */
 async function createCheckoutSession({ userId, requestId, companyId, selections, selectedServices, idempotencyKey }) {
-  const { company } = await authorizeCompany(userId, companyId);
+  const requestHash = fingerprint({ companyId, selections });
+  const key = checkoutIdempotencyKey({ headerKey: idempotencyKey, companyId, requestHash });
+
+  /*
+   * The three opening reads are independent, so they run at once rather than one
+   * round trip after another. Nothing is acted on until authorization has
+   * passed: if it throws, the other two results are simply dropped.
+   */
+  const [{ company }, active, storedKey] = await Promise.all([
+    authorizeCompany(userId, companyId),
+    repo.findActiveSubscriptionForCompany(prisma, companyId),
+    repo.findIdempotencyKey(prisma, { userId, idempotencyKey: key }),
+  ]);
 
   /*
    * One live subscription per company is a database invariant (a partial unique
@@ -182,7 +194,6 @@ async function createCheckoutSession({ userId, requestId, companyId, selections,
    * would be a P2002 raised deep inside the webhook — after the customer has
    * already paid — into a clear refusal before they are redirected.
    */
-  const active = await repo.findActiveSubscriptionForCompany(prisma, companyId);
   if (active) {
     logEvent({
       event: 'billing.checkout.rejected',
@@ -198,10 +209,7 @@ async function createCheckoutSession({ userId, requestId, companyId, selections,
     });
   }
 
-  const requestHash = fingerprint({ companyId, selections });
-  const key = checkoutIdempotencyKey({ headerKey: idempotencyKey, companyId, requestHash });
-
-  const replayed = await replayIfPossible({ userId, requestId, companyId, key, requestHash });
+  const replayed = await replayIfPossible({ userId, requestId, companyId, existing: storedKey, requestHash });
   if (replayed) return replayed;
 
   logEvent({
@@ -309,8 +317,6 @@ async function createCheckoutSession({ userId, requestId, companyId, selections,
     });
   }
 
-  await repo.updateSubscription(prisma, subscription.id, { stripeCheckoutSessionId: session.id });
-
   const body = {
     success: true,
     message: 'Checkout session created successfully.',
@@ -322,7 +328,11 @@ async function createCheckoutSession({ userId, requestId, companyId, selections,
     }),
   };
 
-  await rememberCheckout({ userId, companyId, key, requestHash, body });
+  // Independent writes, so together. rememberCheckout never throws.
+  await Promise.all([
+    repo.updateSubscription(prisma, subscription.id, { stripeCheckoutSessionId: session.id }),
+    rememberCheckout({ userId, companyId, key, requestHash, body, existing: storedKey }),
+  ]);
 
   logEvent({
     event: 'billing.checkout.created',
@@ -349,8 +359,7 @@ async function createCheckoutSession({ userId, requestId, companyId, selections,
  * re-read from Stripe first; if it has expired or already completed, the record
  * is treated as spent and a fresh checkout is created in its place.
  */
-async function replayIfPossible({ userId, requestId, companyId, key, requestHash }) {
-  const existing = await repo.findIdempotencyKey(prisma, { userId, idempotencyKey: key });
+async function replayIfPossible({ userId, requestId, companyId, existing, requestHash }) {
   if (!existing) return null;
 
   if (existing.requestHash !== requestHash) {
@@ -408,9 +417,11 @@ async function replayIfPossible({ userId, requestId, companyId, key, requestHash
  * turn a successful checkout into an error. It only costs the duplicate-click
  * protection on the next click, which is logged.
  */
-async function rememberCheckout({ userId, companyId, key, requestHash, body }) {
+async function rememberCheckout({ userId, companyId, key, requestHash, body, existing }) {
   try {
-    const existing = await repo.findIdempotencyKey(prisma, { userId, idempotencyKey: key });
+    // `existing` is the row this request already read for the replay check. If a
+    // concurrent request created one since, the create below fails on the unique
+    // key and is logged — the same outcome that race had before.
     if (existing) {
       await repo.updateIdempotencyKey(prisma, existing.id, {
         requestHash,

@@ -12,6 +12,7 @@ const storage = require('../utils/storage');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { logEvent } = require('../utils/auditLog');
+const { getCaller } = require('../utils/requestContext');
 
 /**
  * Projects: open a unit of work against a company, list what is open, and keep
@@ -92,7 +93,8 @@ const isSpecialist = (caller) => caller.role?.code === 'SPECIALIST';
 
 /** Load the caller with their role, or 401. */
 async function loadCaller(userId) {
-  const caller = await companyRepo.findUserWithRole(prisma, userId);
+  // Reuse the row requireAuth already loaded for this request, if any.
+  const caller = getCaller(userId) ?? (await companyRepo.findUserWithRole(prisma, userId));
   if (!caller) throw callerNotFound();
   return caller;
 }
@@ -240,12 +242,15 @@ function assertDeleteAccess(caller, company, project) {
  * either is changed.
  */
 async function loadProjectForRead(client, { userId, projectId }) {
-  const caller = await loadCaller(userId);
-
-  const project = await repo.findProjectForAccess(client, projectId);
+  // All three at once: the company is found through the project rather than by
+  // waiting for its companyId. The checks still run in the original order.
+  const [caller, project, company] = await Promise.all([
+    loadCaller(userId),
+    repo.findProjectForAccess(client, projectId),
+    repo.findCompanyForProjectsByProject(client, projectId),
+  ]);
   if (!project) throw projectNotFound();
-
-  const company = await loadCompany(client, project.companyId);
+  if (!company) throw companyNotFound();
   await assertReadAccess(client, caller, company);
 
   return { caller, project, company };
@@ -261,8 +266,7 @@ async function loadProjectForRead(client, { userId, projectId }) {
  * instead of one project's.
  */
 async function loadCompanyForRead(client, { userId, companyId }) {
-  const caller = await loadCaller(userId);
-  const company = await loadCompany(client, companyId);
+  const [caller, company] = await Promise.all([loadCaller(userId), loadCompany(client, companyId)]);
   await assertReadAccess(client, caller, company);
   return { caller, company };
 }
@@ -431,46 +435,49 @@ async function resolveSpecialist(client, company, { specializationId, serviceCod
  * @returns {Promise<{ assigned: number, remaining: number }>}
  */
 async function backfillSpecialists(companyId, { requestId } = {}) {
-  const company = await repo.findCompanyForProjects(prisma, companyId);
-  if (!company) return { assigned: 0, remaining: 0 };
+  const [company, pending] = await Promise.all([
+    repo.findCompanyForProjects(prisma, companyId),
+    repo.listUnassignedProjects(prisma, companyId),
+  ]);
+  if (!company || !pending.length) return { assigned: 0, remaining: 0 };
 
-  const pending = await repo.listUnassignedProjects(prisma, companyId);
-  if (!pending.length) return { assigned: 0, remaining: 0 };
+  /*
+   * Resolve each specialization ONCE, in parallel, rather than once per project.
+   * The answer depends only on the company and the specialization, and nothing
+   * in this sweep changes either, so every project on a line gets the same one.
+   */
+  const specializations = new Map();
+  for (const project of pending) {
+    const specialization = project.servicePlan?.specialization;
+    if (specialization) specializations.set(specialization.id, specialization);
+  }
+  const specialistBySpecialization = new Map(
+    await Promise.all(
+      [...specializations.values()].map(async (specialization) => [
+        specialization.id,
+        await resolveSpecialist(prisma, company, {
+          specializationId: specialization.id,
+          serviceCode: specialization.specializationCode,
+        }),
+      ])
+    )
+  );
+
+  const work = [];
+  for (const project of pending) {
+    const specialistUserId = specialistBySpecialization.get(project.servicePlan?.specialization?.id);
+    if (specialistUserId) work.push({ project, specialistUserId });
+  }
 
   let assigned = 0;
   let tasksMoved = 0;
-  for (const project of pending) {
-    const specialization = project.servicePlan?.specialization;
-    if (!specialization) continue;
-
-    const specialistUserId = await resolveSpecialist(prisma, company, {
-      specializationId: specialization.id,
-      serviceCode: specialization.specializationCode,
-    });
-    if (!specialistUserId) continue;
-
-    /*
-     * The project and its open tasks move TOGETHER, in one transaction.
-     *
-     * A task's specialist must equal its project's. The database was going to
-     * hold that itself — a composite foreign key with ON UPDATE CASCADE — and
-     * that constraint was dropped, so this pairing is now the only thing making
-     * the two agree. Outside a transaction, a failure between the two writes
-     * would leave a project staffed to one person and its tasks to another, with
-     * nothing to detect it: exactly the drift the cascade would have made
-     * impossible.
-     */
-    const moved = await prisma.$transaction(async (tx) => {
-      await repo.setAssignedSpecialist(tx, project.id, specialistUserId);
-      const result = await taskRepo.reassignOpenTaskSpecialist(tx, {
-        projectId: project.id,
-        specialistUserId,
-      });
-      return result?.count ?? 0;
-    });
-
-    assigned += 1;
-    tasksMoved += moved;
+  // A few projects at a time: each is its own short transaction on its own
+  // connection, so they overlap instead of queueing — without taking the whole
+  // connection pool from concurrent requests.
+  for (let i = 0; i < work.length; i += BACKFILL_CONCURRENCY) {
+    const moved = await Promise.all(work.slice(i, i + BACKFILL_CONCURRENCY).map(backfillOne));
+    assigned += moved.length;
+    tasksMoved += moved.reduce((sum, n) => sum + n, 0);
   }
 
   if (assigned) {
@@ -488,6 +495,32 @@ async function backfillSpecialists(companyId, { requestId } = {}) {
   }
 
   return { assigned, remaining: pending.length - assigned };
+}
+
+/** How many backfill transactions may run at once. */
+const BACKFILL_CONCURRENCY = 4;
+
+/** Staff one project and its open tasks. Returns how many tasks moved. */
+function backfillOne({ project, specialistUserId }) {
+  /*
+   * The project and its open tasks move TOGETHER, in one transaction.
+   *
+   * A task's specialist must equal its project's. The database was going to
+   * hold that itself — a composite foreign key with ON UPDATE CASCADE — and
+   * that constraint was dropped, so this pairing is now the only thing making
+   * the two agree. Outside a transaction, a failure between the two writes
+   * would leave a project staffed to one person and its tasks to another, with
+   * nothing to detect it: exactly the drift the cascade would have made
+   * impossible.
+   */
+  return prisma.$transaction(async (tx) => {
+    await repo.setAssignedSpecialist(tx, project.id, specialistUserId);
+    const result = await taskRepo.reassignOpenTaskSpecialist(tx, {
+      projectId: project.id,
+      specialistUserId,
+    });
+    return result?.count ?? 0;
+  });
 }
 
 /**
@@ -677,36 +710,38 @@ async function getProject({ userId, requestId, projectId }) {
 /**
  * POST /projects — open a project.
  *
- * Everything the request does not supply is resolved here, in one transaction:
- * which plan the named service is, who is staffed on it, and who is recorded as
- * having created it. The transaction is what makes the staffing read and the
- * insert one decision — without it, a specialist reassigned between the two
- * reads would be stamped onto a project after they had already left the line.
+ * Everything the request does not supply is resolved here: which plan the named
+ * service is, who is staffed on it, and who is recorded as having created it.
+ *
+ * No interactive transaction. It used to wrap these reads, but at Postgres's
+ * default READ COMMITTED level a plain read takes no lock, so it never stopped a
+ * specialist being reassigned between the read and the insert — it only made
+ * each read queue behind the last on one connection. The single insert is atomic
+ * on its own. The checks run in the same order as before.
  */
 async function createProject({ userId, requestId, input }) {
-  const caller = await loadCaller(userId);
+  const [caller, company, services] = await Promise.all([
+    loadCaller(userId),
+    loadCompany(prisma, input.companyId),
+    loadServiceOptions(prisma, input.companyId),
+  ]);
+  await assertCreateAccess(prisma, caller, company);
 
-  const project = await prisma.$transaction(async (tx) => {
-    const company = await loadCompany(tx, input.companyId);
-    await assertCreateAccess(tx, caller, company);
+  const service = resolveService(services, input);
 
-    const services = await loadServiceOptions(tx, company.id);
-    const service = resolveService(services, input);
+  const assignedSpecialistUserId = await resolveSpecialist(prisma, company, {
+    specializationId: service.specializationId,
+    serviceCode: service.serviceCode,
+  });
 
-    const assignedSpecialistUserId = await resolveSpecialist(tx, company, {
-      specializationId: service.specializationId,
-      serviceCode: service.serviceCode,
-    });
-
-    return repo.createProject(tx, {
-      companyId: company.id,
-      projectName: input.projectName,
-      deadlineDate: input.deadlineDate,
-      servicePlanId: service.servicePlanId,
-      assignedSpecialistUserId,
-      createdByUserId: caller.id,
-      description: input.description,
-    });
+  const project = await repo.createProject(prisma, {
+    companyId: company.id,
+    projectName: input.projectName,
+    deadlineDate: input.deadlineDate,
+    servicePlanId: service.servicePlanId,
+    assignedSpecialistUserId,
+    createdByUserId: caller.id,
+    description: input.description,
   });
 
   logEvent({
@@ -762,30 +797,33 @@ async function assertDeadlineLeavesTasksValid(client, { projectId, deadlineDate 
  * The SERVICE cannot be changed here; see the validator for why.
  */
 async function updateProject({ userId, requestId, projectId, input }) {
-  const caller = await loadCaller(userId);
+  // The access reads together, before any transaction: the company is found
+  // through the project, so it need not wait for the project's companyId.
+  const [caller, project, company] = await Promise.all([
+    loadCaller(userId),
+    repo.findProjectForAccess(prisma, projectId),
+    repo.findCompanyForProjectsByProject(prisma, projectId),
+  ]);
+  if (!project) throw projectNotFound();
+  if (!company) throw companyNotFound();
+  assertWriteAccess(caller, company, project);
 
-  const updated = await prisma.$transaction(async (tx) => {
-    const project = await repo.findProjectForAccess(tx, projectId);
-    if (!project) throw projectNotFound();
+  // A bar at 100% means the work is done, so the project is COMPLETED — unless
+  // the same request sets the status itself, in which case the caller wins.
+  const data = { ...input };
+  if (data.status === undefined && data.progressBar !== undefined && Number(data.progressBar) === 100) {
+    data.status = 'COMPLETED';
+  }
 
-    const company = await loadCompany(tx, project.companyId);
-    assertWriteAccess(caller, company, project);
-
-    // Inside the transaction, so a task filed between the check and the write
-    // cannot slip past it.
-    if (input.deadlineDate !== undefined) {
-      await assertDeadlineLeavesTasksValid(tx, { projectId, deadlineDate: input.deadlineDate });
-    }
-
-    // A bar at 100% means the work is done, so the project is COMPLETED — unless
-    // the same request sets the status itself, in which case the caller wins.
-    const data = { ...input };
-    if (data.status === undefined && data.progressBar !== undefined && Number(data.progressBar) === 100) {
-      data.status = 'COMPLETED';
-    }
-
-    return repo.updateProject(tx, projectId, data);
-  });
+  // The deadline check and the write stay together in a transaction, as before;
+  // an edit that does not move the deadline is a single update and needs none.
+  const updated =
+    input.deadlineDate !== undefined
+      ? await prisma.$transaction(async (tx) => {
+          await assertDeadlineLeavesTasksValid(tx, { projectId, deadlineDate: input.deadlineDate });
+          return repo.updateProject(tx, projectId, data);
+        })
+      : await repo.updateProject(prisma, projectId, data);
 
   logEvent({
     event: 'project.updated',
@@ -845,7 +883,15 @@ async function discardProjectDocumentObjects(keys, requestId) {
 }
 
 async function deleteProject({ userId, requestId, projectId }) {
-  const caller = await loadCaller(userId);
+  // Access reads together and before the transaction (see updateProject).
+  const [caller, project, company] = await Promise.all([
+    loadCaller(userId),
+    repo.findProjectForAccess(prisma, projectId),
+    repo.findCompanyForProjectsByProject(prisma, projectId),
+  ]);
+  if (!project) throw projectNotFound();
+  if (!company) throw companyNotFound();
+  assertDeleteAccess(caller, company, project);
 
   /*
    * THE PROJECT'S DOCUMENTS AND TASKS GO WITH IT — rows for both, bytes for the
@@ -876,12 +922,6 @@ async function deleteProject({ userId, requestId, projectId }) {
    * the join will happily report.
    */
   const { companyId, fileKeys, documentCount, taskCount } = await prisma.$transaction(async (tx) => {
-    const project = await repo.findProjectForAccess(tx, projectId);
-    if (!project) throw projectNotFound();
-
-    const company = await loadCompany(tx, project.companyId);
-    assertDeleteAccess(caller, company, project);
-
     const documents = await documentRepo.listLiveDocumentKeysForProject(tx, projectId);
     // One timestamp for the project, every document and every task on it, so the
     // audit trail reads as the single action it was rather than a scatter of

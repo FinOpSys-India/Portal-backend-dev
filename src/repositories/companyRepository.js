@@ -57,6 +57,12 @@ function findUserWithRole(client, userId) {
   return client.user.findUnique({ where: { id: userId }, select: USER_ROLE_SELECT });
 }
 
+/** Several users with their role pair, in one query. Missing ids are simply absent. */
+function findUsersWithRole(client, userIds) {
+  if (!userIds.length) return Promise.resolve([]);
+  return client.user.findMany({ where: { id: { in: userIds } }, select: USER_ROLE_SELECT });
+}
+
 /**
  * Any user whose login email is this address. Case-insensitive: `users.email` is
  * unique but the column is plain VARCHAR, so 'Ada@x.com' and 'ada@x.com' can both
@@ -1163,6 +1169,7 @@ function createIdempotencyKey(client, data) {
 
 module.exports = {
   USER_ROLE_SELECT,
+  findUsersWithRole,
   DIRECTORY_SELECT,
   ACCOUNTING_MANAGER_ROLE_CODE,
   listEligibleAccountingManagers,

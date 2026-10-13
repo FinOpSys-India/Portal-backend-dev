@@ -80,15 +80,18 @@ async function requestCustomPlan({ userId, companyId }) {
     data: { companyId: company.id, userId: caller.id, requestType, createdAt: requestedAt },
   });
 
-  try {
-    await emailService.sendCustomPlanAckEmail({
-      recipientEmail: caller.email,
-      recipientFirstName: caller.firstName,
-      company,
+  // Best-effort and not awaited: its outcome never changes the response.
+  Promise.resolve()
+    .then(() =>
+      emailService.sendCustomPlanAckEmail({
+        recipientEmail: caller.email,
+        recipientFirstName: caller.firstName,
+        company,
+      })
+    )
+    .catch((err) => {
+      logger.error(`Custom plan confirmation email failed (request ${request.id}):`, err.message);
     });
-  } catch (err) {
-    logger.error(`Custom plan confirmation email failed (request ${request.id}):`, err.message);
-  }
 
   logger.info(`Custom plan request ${request.id} (${requestType}) for company ${company.id} by user ${caller.id}.`);
 

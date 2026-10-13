@@ -19,6 +19,7 @@ const mockPrisma = {
     create: jest.fn(),
     update: jest.fn(),
     updateMany: jest.fn(),
+    delete: jest.fn(),
   },
   $transaction: jest.fn(async (cb) => cb(mockPrisma)),
 };
@@ -97,6 +98,7 @@ beforeEach(() => {
   mockPrisma.refreshToken.updateMany.mockResolvedValue({ count: 1 });
   mockPrisma.refreshToken.create.mockResolvedValue({ id: 11 });
   mockPrisma.refreshToken.update.mockResolvedValue({ id: 10 });
+  mockPrisma.refreshToken.delete.mockResolvedValue({ id: 11 });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -112,16 +114,14 @@ describe('POST /api/auth/refresh', () => {
     expect(res.body.data.refreshToken).toEqual(expect.any(String));
     expect(res.body.data.refreshToken).not.toBe(RAW_TOKEN);
 
-    // The presented token is revoked and linked to its successor. That link is
-    // what a later replay reads to recognise itself as spent.
+    // The presented token is revoked and linked to its successor in ONE
+    // conditional update. That link is what a later replay reads to recognise
+    // itself as spent.
     expect(mockPrisma.refreshToken.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({ id: 10, revokedAt: null, replacedById: null }),
-        data: expect.objectContaining({ revokedReason: 'rotated' }),
+        data: expect.objectContaining({ revokedReason: 'rotated', replacedById: 11 }),
       })
-    );
-    expect(mockPrisma.refreshToken.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 10 }, data: { replacedById: 11 } })
     );
 
     // The successor stays in the same family, so reuse detection can still cut
@@ -233,7 +233,10 @@ describe('POST /api/auth/refresh', () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe('REFRESH_TOKEN_INVALID');
-    expect(mockPrisma.refreshToken.create).not.toHaveBeenCalled();
+    // The loser's successor was never handed out, and is removed.
+    expect(mockPrisma.refreshToken.delete).toHaveBeenCalledWith({ where: { id: 11 } });
+    // No family-wide revoke: only the guarded rotation update ran.
+    expect(mockPrisma.refreshToken.updateMany).toHaveBeenCalledTimes(1);
   });
 
   it('sets a fresh HttpOnly cookie and a readable CSRF token', async () => {

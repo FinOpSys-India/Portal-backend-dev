@@ -4,6 +4,8 @@ const { prisma } = require('../config/prisma');
 const ApiError = require('../utils/ApiError');
 const logger = require('../utils/logger');
 const { verifyAccessToken } = require('../utils/tokens');
+const { setCaller } = require('../utils/requestContext');
+const { USER_ROLE_SELECT } = require('../repositories/companyRepository');
 
 /**
  * Authenticate a request from its Bearer access token and expose the verified
@@ -29,6 +31,10 @@ function requireAuth(req, res, next) {
   if (scheme !== 'Bearer' || !token) {
     return next(new ApiError(401, 'Authentication required.', { code: 'AUTH_REQUIRED' }));
   }
+
+  // Gated routes mount requireAuth twice (index.js and the feature router).
+  // The second pass has nothing new to check, so skip its database read.
+  if (req.user && req._authToken === token) return next();
 
   let decoded;
   try {
@@ -65,6 +71,7 @@ function requireAuth(req, res, next) {
     // most one query.
     _dbRole: undefined,
   };
+  req._authToken = token;
 
   return checkPasswordRotation(req, next);
 }
@@ -89,9 +96,11 @@ async function checkPasswordRotation(req, next) {
 
   let row;
   try {
+    // The role fields ride along on the same query (one JOINed round trip) so
+    // requireRole and the services' loadCaller need no read of their own.
     row = await prisma.user.findUnique({
       where: { id: req.user.id },
-      select: { passwordChangedAt: true, status: true },
+      select: { ...USER_ROLE_SELECT, passwordChangedAt: true },
     });
   } catch (err) {
     // A database blip must not turn every authenticated request into a 401.
@@ -127,6 +136,10 @@ async function checkPasswordRotation(req, next) {
       );
     }
   }
+
+  req.user._dbRole = { role: row.role?.code ?? null, specificRole: row.specificRole?.code ?? null };
+  const { passwordChangedAt, ...caller } = row;
+  setCaller(caller);
 
   return next();
 }

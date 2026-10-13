@@ -148,22 +148,32 @@ async function updateMe({ userId, requestId, input }) {
 async function setAvatar({ userId, requestId, file }) {
   const avatarKey = avatarKeyFor(userId, file.mimetype);
 
-  await storage.putObject({
-    bucket: config.storage.avatarBucket,
-    key: avatarKey,
-    body: file.buffer,
-    contentType: file.mimetype,
-  });
+  /*
+   * The current key is read WHILE the new picture uploads, rather than after: it
+   * is a plain read either way (no row lock — the transaction this used to sit in
+   * did not take one), and the order that matters below is unchanged: the row is
+   * only pointed at the new key once the upload has finished.
+   */
+  const [stored, currentRead] = await Promise.allSettled([
+    storage.putObject({
+      bucket: config.storage.avatarBucket,
+      key: avatarKey,
+      body: file.buffer,
+      contentType: file.mimetype,
+    }),
+    repo.findMeForUpdate(prisma, userId),
+  ]);
+  if (stored.status === 'rejected') throw stored.reason;
 
   let previousKey = null;
   let updated;
   try {
-    updated = await prisma.$transaction(async (tx) => {
-      const current = await repo.findMeForUpdate(tx, userId);
-      if (!current) throw userNotFound();
-      previousKey = current.avatarKey;
-      return repo.updateMe(tx, userId, { avatarKey });
-    });
+    if (currentRead.status === 'rejected') throw currentRead.reason;
+    const current = currentRead.value;
+    if (!current) throw userNotFound();
+    previousKey = current.avatarKey;
+    // One statement, so no transaction is needed around it.
+    updated = await repo.updateMe(prisma, userId, { avatarKey });
   } catch (err) {
     await discardAvatar(avatarKey, requestId);
     throw err;
@@ -185,15 +195,13 @@ async function setAvatar({ userId, requestId, file }) {
  * a 404 here would only make a double-click look like an error.
  */
 async function removeAvatar({ userId, requestId }) {
-  let previousKey = null;
-
-  const updated = await prisma.$transaction(async (tx) => {
-    const current = await repo.findMeForUpdate(tx, userId);
-    if (!current) throw userNotFound();
-    previousKey = current.avatarKey;
-    if (!current.avatarKey) return repo.findMe(tx, userId);
-    return repo.updateMe(tx, userId, { avatarKey: null });
-  });
+  // A plain read then (at most) one update. The transaction this used to sit in
+  // took no row lock, so it added round trips and no protection. Reading the
+  // full profile up front also answers the nothing-to-remove case in one query.
+  const current = await repo.findMe(prisma, userId);
+  if (!current) throw userNotFound();
+  const previousKey = current.avatarKey;
+  const updated = previousKey ? await repo.updateMe(prisma, userId, { avatarKey: null }) : current;
 
   await discardAvatar(previousKey, requestId);
 

@@ -29,7 +29,22 @@ const ROLE_SELECT = {
 };
 
 /** Every role, ordered by id so the list is stable between calls. */
+/*
+ * The role catalog changes only when the seed runs (or someone edits it by hand
+ * in the database), so it is kept in memory for a minute rather than read on
+ * every request — each read is a full round trip to a distant database.
+ */
+const CACHE_TTL_MS = 60 * 1000;
+let cached = null;
+
 async function listRoles() {
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const value = await loadRoles();
+  cached = { value, expiresAt: Date.now() + CACHE_TTL_MS };
+  return value;
+}
+
+async function loadRoles() {
   const roles = await prisma.role.findMany({
     select: ROLE_SELECT,
     orderBy: { id: 'asc' },
@@ -56,4 +71,9 @@ async function listRoles() {
   }));
 }
 
-module.exports = { listRoles };
+/** Drop the cached catalog. For tests, which stage a different catalog each time. */
+function clearCache() {
+  cached = null;
+}
+
+module.exports = { listRoles, clearCache };

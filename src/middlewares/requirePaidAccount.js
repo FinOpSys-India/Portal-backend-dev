@@ -46,6 +46,12 @@ async function requirePaidAccount(req, res, next) {
     return next(new ApiError(401, 'Authentication required.', { code: 'AUTH_REQUIRED' }));
   }
 
+  // requireAuth already read the caller's current role from the database. If it
+  // is not the owner pair, getStatus would only report isOwner: false, so skip
+  // that round trip.
+  const dbRole = req.user._dbRole;
+  if (dbRole && !(dbRole.role === 'CUSTOMER' && dbRole.specificRole === 'OWNER')) return next();
+
   let status;
   try {
     // Memoised for the lifetime of the request, so mounting this on a router

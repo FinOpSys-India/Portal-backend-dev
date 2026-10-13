@@ -7,6 +7,7 @@ const { logEvent } = require('../utils/auditLog');
 const { generateInvitationToken } = require('../utils/tokens');
 const { sendInvitationEmail } = require('./emailService');
 const companyRepo = require('../repositories/companyRepository');
+const { getCaller } = require('../utils/requestContext');
 
 /**
  * The customer-side role codes this file needs by NAME rather than by id.
@@ -107,10 +108,13 @@ function invitationNotFound() {
  * accepted their own invitation yet, and a HIBERNATED one is deactivated.
  */
 async function loadInviter(inviterUserId) {
-  const inviter = await prisma.user.findUnique({
-    where: { id: inviterUserId },
-    select: { id: true, email: true, firstName: true, lastName: true, status: true, role: { select: { code: true } } },
-  });
+  // The caller row requireAuth already loaded carries every field read here.
+  const inviter =
+    getCaller(inviterUserId) ??
+    (await prisma.user.findUnique({
+      where: { id: inviterUserId },
+      select: { id: true, email: true, firstName: true, lastName: true, status: true, role: { select: { code: true } } },
+    }));
   if (!inviter) {
     throw new ApiError(401, 'Your account could not be found.', { code: 'USER_NOT_FOUND' });
   }
@@ -219,6 +223,12 @@ function assertRoleAllowsEmailDomain(email, role) {
  * `rawToken` goes into the email and is never stored; `tokenHash` is what the
  * row keeps and what sign-up matches against.
  */
+/** The value of a Promise.allSettled entry, or its error re-thrown. */
+function settled(result) {
+  if (result.status === 'rejected') throw result.reason;
+  return result.value;
+}
+
 function mintToken() {
   const { rawToken, tokenHash } = generateInvitationToken();
   return {
@@ -279,15 +289,25 @@ async function deliver({ invitation, inviter, token, requestId, fields = INVITAT
  * mis-click cannot spam the invitee with a second email. Use the explicit resend
  * endpoint for that, which reuses the SAME token rather than minting a new one.
  */
-async function createInvitation({ inviterUserId, requestId, input, fields = INVITATION_FIELDS }) {
-  const inviter = await loadInviter(inviterUserId);
-  const { role, specificRole } = await resolveRolePair(input);
+async function createInvitation({ inviterUserId, requestId, input, fields = INVITATION_FIELDS, rolePair = null }) {
+  /*
+   * The three precondition reads are independent, so they run at once. Their
+   * outcomes are then checked in the original order, so the error a caller sees
+   * is the same one they always saw when more than one check would fail.
+   */
+  const [inviterResult, rolePairResult, existingUserResult] = await Promise.allSettled([
+    loadInviter(inviterUserId),
+    rolePair ?? resolveRolePair(input),
+    prisma.user.findFirst({
+      where: { email: { equals: input.email, mode: 'insensitive' } },
+      select: { id: true },
+    }),
+  ]);
+  const inviter = settled(inviterResult);
+  const { role, specificRole } = settled(rolePairResult);
   assertRoleAllowsEmailDomain(input.email, role);
 
-  const existingUser = await prisma.user.findFirst({
-    where: { email: { equals: input.email, mode: 'insensitive' } },
-    select: { id: true },
-  });
+  const existingUser = settled(existingUserResult);
   if (existingUser) {
     throw new ApiError(409, `${input.email} already has an account.`, {
       code: 'USER_ALREADY_EXISTS',
@@ -433,17 +453,24 @@ async function resolveInvitableCompanies({ caller, companyIds }) {
  * separate role test that could drift away from it.
  */
 async function createTeammateInvitation({ inviterUserId, requestId, input }) {
-  const caller = await prisma.user.findUnique({
-    where: { id: inviterUserId },
-    select: { id: true, status: true },
-  });
+  const caller =
+    getCaller(inviterUserId) ??
+    (await prisma.user.findUnique({
+      where: { id: inviterUserId },
+      select: { id: true, status: true },
+    }));
   if (!caller) {
     throw new ApiError(401, 'Your account could not be found.', { code: 'USER_NOT_FOUND' });
   }
 
-  const companyIds = await resolveInvitableCompanies({ caller, companyIds: input.companyIds });
-
-  const { role, specificRole } = await resolveRolePair(input);
+  // Ownership and the role pair are independent reads; checked in the original
+  // order once both are in.
+  const [companiesResult, rolePairResult] = await Promise.allSettled([
+    resolveInvitableCompanies({ caller, companyIds: input.companyIds }),
+    resolveRolePair(input),
+  ]);
+  const companyIds = settled(companiesResult);
+  const { role, specificRole } = settled(rolePairResult);
 
   if (role.code !== CUSTOMER_ROLE_CODE) {
     throw new ApiError(400, 'A teammate must be invited with the customer role.', {
@@ -459,12 +486,12 @@ async function createTeammateInvitation({ inviterUserId, requestId, input }) {
   }
 
   // Everything above is a precondition; the invitation itself, its token, its
-  // email and its audit entry are the shared path. `createInvitation` re-resolves
-  // the role pair — cheap, and it keeps that function correct on its own terms
-  // rather than depending on a caller having done it first.
+  // email and its audit entry are the shared path. The role pair resolved above
+  // is handed over rather than read again from the database.
   return createInvitation({
     inviterUserId,
     requestId,
+    rolePair: { role, specificRole },
     input: { ...input, companyIds },
     // The only place the wider shape is used: a teammate invitation is the only
     // one that HAS a job title and companies to report.

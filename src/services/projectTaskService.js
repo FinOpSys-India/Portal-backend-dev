@@ -381,11 +381,13 @@ async function getTask({ userId, requestId, taskId }) {
 /**
  * POST /tasks — file a task against a project.
  *
- * In one transaction, because three of the four things it decides are read from
- * rows that can move underneath it: who is staffed on the project, what the
- * project's deadline is, and whether the project still exists. Resolving the
- * specialist in one statement and inserting in another would let a project
- * re-staffed in between stamp a task with someone who had already left it.
+ * The access reads (project, company, caller) run BEFORE the transaction, in
+ * parallel: inside it they would queue one after another on its single
+ * connection, each a full round trip to the database. That gives up nothing —
+ * at Postgres's default READ COMMITTED level a plain read takes no lock, so a
+ * project re-staffed between the read and the insert could slip through inside
+ * the transaction just the same. The transaction holds what it actually has to:
+ * the insert and the project's progress moving together.
  *
  * `specialistUserId` is COPIED from the project rather than referenced. The
  * database no longer holds the two together — the composite foreign key that
@@ -394,16 +396,16 @@ async function getTask({ userId, requestId, taskId }) {
  * projectService.backfillSpecialists).
  */
 async function createTask({ userId, requestId, input }) {
+  const { caller, project, company } = await projectService.loadProjectForRead(prisma, {
+    userId,
+    projectId: input.projectId,
+  });
+
+  assertCompanyMatches(input.companyId, project);
+  assertTaskWriteAccess(caller, company, project);
+  assertDeadlineWithinProject(input.deadlineDate, project.deadlineDate);
+
   const created = await prisma.$transaction(async (tx) => {
-    const { caller, project, company } = await projectService.loadProjectForRead(tx, {
-      userId,
-      projectId: input.projectId,
-    });
-
-    assertCompanyMatches(input.companyId, project);
-    assertTaskWriteAccess(caller, company, project);
-    assertDeadlineWithinProject(input.deadlineDate, project.deadlineDate);
-
     const task = await repo.createTask(tx, {
       projectId: project.id,
       taskName: input.taskName,
@@ -444,19 +446,20 @@ async function createTask({ userId, requestId, input }) {
  * to undo.
  */
 async function updateTaskStatus({ userId, requestId, taskId, input }) {
+  // Access reads before the transaction, for the reason given on createTask.
+  const task = await repo.findTaskForAccess(prisma, taskId);
+  if (!task) throw taskNotFound();
+
+  // A task on a soft-deleted project is not reachable, matching the lists.
+  if (!task.project || task.project.deletedAt) throw projectNotFound();
+
+  const { caller, project, company } = await projectService.loadProjectForRead(prisma, {
+    userId,
+    projectId: task.projectId,
+  });
+  assertTaskWriteAccess(caller, company, project);
+
   const updated = await prisma.$transaction(async (tx) => {
-    const task = await repo.findTaskForAccess(tx, taskId);
-    if (!task) throw taskNotFound();
-
-    // A task on a soft-deleted project is not reachable, matching the lists.
-    if (!task.project || task.project.deletedAt) throw projectNotFound();
-
-    const { caller, project, company } = await projectService.loadProjectForRead(tx, {
-      userId,
-      projectId: task.projectId,
-    });
-    assertTaskWriteAccess(caller, company, project);
-
     const moved = await repo.updateTask(tx, taskId, { status: input.status });
     return withProjectStatus(moved, await syncProjectFromTasks(tx, project));
   });
@@ -489,25 +492,24 @@ async function updateTaskStatus({ userId, requestId, taskId, input }) {
  * every report that counts completions. "Done" is not a synonym for "never
  * should have been here".
  *
- * The same transaction shape as updateTaskStatus, for the same reason: the
- * access decision reads the project and the company, and those must not be able
- * to change between being read and being acted on.
+ * The same shape as updateTaskStatus: access reads first, then the delete and
+ * the project's progress together in one transaction.
  */
 async function deleteTask({ userId, requestId, taskId }) {
+  const task = await repo.findTaskForAccess(prisma, taskId);
+  if (!task) throw taskNotFound();
+
+  // A task on a soft-deleted project is not reachable, matching the lists and
+  // the status write. Its rows are marked by the project delete itself.
+  if (!task.project || task.project.deletedAt) throw projectNotFound();
+
+  const { caller, project, company } = await projectService.loadProjectForRead(prisma, {
+    userId,
+    projectId: task.projectId,
+  });
+  assertTaskDeleteAccess(caller, company, task);
+
   const { companyId, projectId } = await prisma.$transaction(async (tx) => {
-    const task = await repo.findTaskForAccess(tx, taskId);
-    if (!task) throw taskNotFound();
-
-    // A task on a soft-deleted project is not reachable, matching the lists and
-    // the status write. Its rows are marked by the project delete itself.
-    if (!task.project || task.project.deletedAt) throw projectNotFound();
-
-    const { caller, project, company } = await projectService.loadProjectForRead(tx, {
-      userId,
-      projectId: task.projectId,
-    });
-    assertTaskDeleteAccess(caller, company, task);
-
     await repo.softDeleteTask(tx, taskId, new Date());
     // One task fewer changes the total the progress bar is a share of, and
     // withdrawing the last open one leaves only finished work behind.

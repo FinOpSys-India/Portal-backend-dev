@@ -27,6 +27,7 @@ jest.mock('../src/config/prisma', () => ({
 const request = require('supertest');
 const app = require('../src/app');
 const { signAccessToken } = require('../src/utils/tokens');
+const roleService = require('../src/services/roleService');
 
 const ADMIN_ID = 1;
 
@@ -63,6 +64,8 @@ function catalog() {
 }
 
 beforeEach(() => {
+  // The role catalog is cached in memory; each test stages its own.
+  roleService.clearCache();
   jest.clearAllMocks();
   // requireAuth re-reads the subject to check token freshness.
   mockPrisma.user.findUnique.mockResolvedValue({ status: 'ACTIVE', passwordChangedAt: null });

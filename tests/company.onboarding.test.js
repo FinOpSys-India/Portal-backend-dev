@@ -113,6 +113,7 @@ function validBody(overrides = {}) {
     employee_count: 25,
     last_year_revenue: 1500000.0,
     revenue_currency: 'usd',
+    en_number: 'EN-12345',
     address: {
       address_line_1: '123 Main Street',
       address_line_2: 'Suite 400',

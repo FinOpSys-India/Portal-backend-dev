@@ -343,10 +343,13 @@ async function login({ email, password, context = {} }) {
       where: { userId: user.id, purpose: LOGIN_PURPOSE, usedAt: null, invalidatedAt: null },
       data: { invalidatedAt: now },
     });
-    await tx.user.update({
-      where: { id: user.id },
-      data: { failedLoginAttempts: 0, lockedUntil: null },
-    });
+    // Usually already clean; skipping the no-op write saves a round trip.
+    if (user.failedLoginAttempts !== 0 || user.lockedUntil !== null) {
+      await tx.user.update({
+        where: { id: user.id },
+        data: { failedLoginAttempts: 0, lockedUntil: null },
+      });
+    }
     await tx.loginChallenge.create({
       data: {
         id: challengeId,
@@ -420,10 +423,12 @@ async function deliverOtp(challengeId, { recipientEmail, otp, requestedAt }) {
       expiresInMinutes: Math.round(config.otp.ttlSeconds / 60),
       requestedAt,
     });
-    await markDelivery(challengeId, 'DELIVERED');
+    // Not awaited: markDelivery never throws, and the caller need not wait on
+    // one more database round trip for a status column.
+    markDelivery(challengeId, 'DELIVERED');
     logger.info(`OTP email queued for challenge ${challengeId}.`);
   } catch (err) {
-    await markDelivery(challengeId, 'FAILED');
+    markDelivery(challengeId, 'FAILED');
     logger.error(`OTP email delivery failed for challenge ${challengeId}: ${err.message}`);
     throw new ApiError(503, 'We could not send the verification code. Please try again.', {
       code: 'OTP_DELIVERY_UNAVAILABLE',

@@ -22,6 +22,7 @@ const projectService = require('./projectService');
 // requires it: `profileComplete` must have exactly one definition, and that
 // definition lives with the endpoint that publishes it.
 const onboardingService = require('./onboardingService');
+const { getCaller } = require('../utils/requestContext');
 
 /**
  * Company onboarding and team management.
@@ -201,7 +202,8 @@ function companyEmailInUse(reason) {
 
 /** Load the caller (with role) or 401. */
 async function loadCaller(userId) {
-  const caller = await repo.findUserWithRole(prisma, userId);
+  // Reuse the row requireAuth already loaded for this request, if any.
+  const caller = getCaller(userId) ?? (await repo.findUserWithRole(prisma, userId));
   if (!caller) throw callerNotFound();
   return caller;
 }
@@ -581,10 +583,20 @@ async function onboardCompany({ userId, requestId, idempotencyKey, input }) {
  * rules live here; a client that reimplements them is a client that will
  * eventually disagree with the server about what a user may do.
  */
-async function accessRoleFor(caller, company) {
+async function accessRoleFor(caller, company, context = null) {
   if (isAdmin(caller)) return 'ADMIN';
   if (company.ownerUserId === caller.id) return 'OWNER';
   if (company.accountingManagerUserId === caller.id) return 'ACCOUNTING_MANAGER';
+  /*
+   * With a loadCompanyContext result in hand, answer from the rows it already
+   * fetched instead of two queries per company. Same filters: assignments are
+   * ACTIVE ones, and members are restricted to ACTIVE users — which the caller
+   * always is, since requireAuth refuses any other status.
+   */
+  if (context) {
+    if (context.assignmentsFor(company.id).some((a) => a.specialistUserId === caller.id)) return 'SPECIALIST';
+    return context.membersFor(company.id).some((m) => m.user?.id === caller.id) ? 'TEAM' : null;
+  }
   const assignment = await repo.findActiveAssignmentForUser(prisma, {
     companyId: company.id,
     userId: caller.id,
@@ -674,7 +686,7 @@ async function listCompanies({ userId, requestId, query }) {
         subscription: context.subscriptionFor(company.id),
         assignments: context.assignmentsFor(company.id),
         members: context.membersFor(company.id),
-        accessRole: await accessRoleFor(caller, company),
+        accessRole: await accessRoleFor(caller, company, context),
       })
     );
   }
@@ -1858,16 +1870,15 @@ function currentSpecialistsFor(company, service, assignments) {
  */
 async function setCompanySpecialists({ userId, requestId, companyId, assignments }) {
   const caller = await loadCaller(userId);
-  // 404 before 403 would leak which company ids exist to anyone; this order —
-  // load, then authorize — is the same one every other company write uses.
-  assertCompanyAccountingManager(caller, await loadCompany(companyId));
 
   const result = await prisma.$transaction(async (tx) => {
+    // 404 before 403 would leak which company ids exist to anyone; this order —
+    // load, then authorize — is the same one every other company write uses.
+    // Checked inside the transaction (and only there, to save a round trip): an
+    // admin can reassign the accounting manager at any moment, and the caller
+    // must still hold the account at the instant the write lands.
     const company = await repo.findCompanyById(tx, companyId);
     if (!company) throw companyNotFound();
-    // Re-checked inside the transaction: an admin can reassign the accounting
-    // manager at any moment, and the caller must still hold the account at the
-    // instant the write lands.
     assertCompanyAccountingManager(caller, company);
 
     const { services } = await loadActiveServices(tx, companyId);
@@ -1917,6 +1928,10 @@ async function setCompanySpecialists({ userId, requestId, companyId, assignments
       throw specialistAlreadyAssigned(taken);
     }
 
+    // Every chosen specialist in ONE query rather than one per service.
+    const specialists = await repo.findUsersWithRole(tx, assignments.map((e) => e.specialistUserId));
+    const specialistById = new Map(specialists.map((u) => [u.id, u]));
+
     const saved = [];
     /*
      * The standing-specialist columns on `companies` (db/schema/14), collected as
@@ -1934,7 +1949,7 @@ async function setCompanySpecialists({ userId, requestId, companyId, assignments
     for (const entry of assignments) {
       const service = serviceByCode.get(entry.specializationCode);
 
-      const specialist = await repo.findUserWithRole(tx, entry.specialistUserId);
+      const specialist = specialistById.get(entry.specialistUserId);
       if (!specialist) throw targetUserNotFound();
       if (!hasSpecialistRole(specialist)) {
         throw new ApiError(422, 'The selected user is not a specialist.', {
@@ -1966,12 +1981,11 @@ async function setCompanySpecialists({ userId, requestId, companyId, assignments
       }
 
       // Nobody else holds this service (checked above), so the chosen specialist
-      // is either already active on it or gets a new assignment row.
-      const [existing] = await repo.findActiveAssignments(tx, {
-        companyId,
-        specialistUserId: entry.specialistUserId,
-        specializationIds: [service.specializationId],
-      });
+      // is either already active on it or gets a new assignment row. `active` is
+      // every ACTIVE row on the company, read above in this transaction.
+      const existing = active.find(
+        (row) => row.specialistUserId === entry.specialistUserId && row.specializationId === service.specializationId
+      );
 
       saved.push(
         existing
@@ -2004,35 +2018,42 @@ async function setCompanySpecialists({ userId, requestId, companyId, assignments
       await repo.updateCompany(tx, companyId, standing);
     }
 
-    // Read the committed team back through the same query the table uses, so the
-    // response and the broadcast describe the company exactly as the next page
-    // load will.
-    const refreshed = await repo.findCompanyWithPeople(tx, companyId);
-    const team = await repo.listActiveAssignments(tx, companyId);
-    return { company: refreshed, team, count: saved.length };
+    return { count: saved.length };
   });
 
-  adminEvents.companyTeamChanged(result.company, result.team);
-
   /*
-   * The staffing just changed, so projects on this company that were opened
-   * while nobody was on their service line can now be filled in. See
-   * projectService.backfillSpecialists — it only ever fills a NULL, so a project
-   * that already has a specialist is left exactly as it is.
+   * Read the committed team back through the same queries the table uses, so the
+   * response and the broadcast describe the company exactly as the next page
+   * load will. After the commit and in parallel: inside the transaction these
+   * ran one after another on its single connection.
    *
-   * Awaited but never allowed to throw: the assignment above has already
-   * committed, and reporting a completed staffing change as failed because a
-   * follow-up sweep stumbled would make the client retry a write that already
-   * succeeded.
+   * The backfill runs alongside them. It only fills project specialist columns,
+   * which none of these reads look at.
    */
-  await projectService.backfillAfterStaffingChange(companyId, { requestId });
+  const [refreshed, team, members] = await Promise.all([
+    repo.findCompanyWithPeople(prisma, companyId),
+    repo.listActiveAssignments(prisma, companyId),
+    repo.listMembersForCompanies(prisma, [companyId]),
+    /*
+     * The staffing just changed, so projects on this company that were opened
+     * while nobody was on their service line can now be filled in. See
+     * projectService.backfillSpecialists — it only ever fills a NULL, so a
+     * project that already has a specialist is left exactly as it is.
+     *
+     * Awaited but never allowed to throw: the assignment above has already
+     * committed, and reporting a completed staffing change as failed because a
+     * follow-up sweep stumbled would make the client retry a write that already
+     * succeeded.
+     */
+    projectService.backfillAfterStaffingChange(companyId, { requestId }),
+  ]);
 
-  const members = await repo.listMembersForCompanies(prisma, [companyId]);
+  adminEvents.companyTeamChanged(refreshed, team);
 
   return {
     companyId,
     assignmentCount: result.count,
-    team: dto.toTeam({ company: result.company, assignments: result.team, members }),
+    team: dto.toTeam({ company: refreshed, assignments: team, members }),
   };
 }
 

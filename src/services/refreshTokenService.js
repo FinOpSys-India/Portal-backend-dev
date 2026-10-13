@@ -187,38 +187,44 @@ async function rotate({ rawToken, context = {}, requestId }) {
   const refresh = generateRefreshToken({ familyId: existing.familyId });
 
   /*
-   * Rotate inside one transaction, guarded by a conditional update. Two tabs
-   * refreshing simultaneously both hold the same valid token; without the guard
-   * both would rotate it and the loser's successor would be orphaned, and the
-   * next request from that tab would look exactly like a reuse. The conditional
-   * update means precisely one wins, and the loser gets the ordinary "log in
-   * again" rather than tripping the family revoke.
+   * Rotate in two statements rather than an interactive transaction: the
+   * database is a full network round trip away, and BEGIN / three writes /
+   * COMMIT cost five of them on every page load.
+   *
+   * 1. Insert the successor. Until step 2 links it, nothing points at it and
+   *    its raw value has not left this process, so it is inert.
+   * 2. ONE conditional update revokes the presented token AND links it to the
+   *    successor. Two tabs refreshing simultaneously both hold the same valid
+   *    token; the guard means precisely one wins. Revoke and link land in the
+   *    same statement, so a replay of the old token always sees `replacedById`.
+   *
+   * The loser deletes its unused successor and gets the ordinary "log in again"
+   * rather than tripping the family revoke.
    */
-  const result = await prisma.$transaction(async (tx) => {
-    const { count } = await tx.refreshToken.updateMany({
-      where: { id: existing.id, revokedAt: null, replacedById: null },
-      data: { revokedAt: new Date(), revokedReason: REVOKED_REASON.ROTATED, lastUsedAt: new Date() },
-    });
-    if (count !== 1) {
-      // Another request rotated it between our read and this write.
-      throw invalidRefreshToken();
-    }
-
-    const created = await persistRefreshToken(tx, {
-      userId: existing.userId,
-      refresh,
-      context,
-    });
-
-    // Link old -> new. This is what a later replay of the old token reads to
-    // recognise itself as spent.
-    await tx.refreshToken.update({
-      where: { id: existing.id },
-      data: { replacedById: created.id },
-    });
-
-    return created;
+  const result = await persistRefreshToken(prisma, {
+    userId: existing.userId,
+    refresh,
+    context,
   });
+
+  const now = new Date();
+  const { count } = await prisma.refreshToken.updateMany({
+    where: { id: existing.id, revokedAt: null, replacedById: null },
+    data: {
+      revokedAt: now,
+      revokedReason: REVOKED_REASON.ROTATED,
+      lastUsedAt: now,
+      replacedById: result.id,
+    },
+  });
+  if (count !== 1) {
+    // Another request rotated it between our read and this write. The
+    // successor was never handed out; removing it is tidiness, not safety.
+    await prisma.refreshToken
+      .delete({ where: { id: result.id } })
+      .catch((err) => logger.warn(`[${requestId}] Could not remove unused refresh token ${result.id}: ${err.message}`));
+    throw invalidRefreshToken();
+  }
 
   const accessToken = signAccessToken({
     userId: existing.user.id,

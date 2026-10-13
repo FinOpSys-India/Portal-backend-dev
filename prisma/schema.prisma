@@ -11,8 +11,12 @@
 // If it drifts from the real tables, queries fail at runtime against columns
 // that do not exist. See db/README.md.
 
+// relationJoins: load nested selects with one JOINed query instead of one query
+// per relation. The database is far from the server, so every extra query is a
+// full network round trip.
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["relationJoins"]
 }
 
 // The connection URL is supplied at runtime (prisma.config.js for the CLI,

@@ -91,9 +91,13 @@ function cacheSet(priceId, price) {
   });
 }
 
-/** Drop the memoised Price objects. Test seam, and useful after a price rotation. */
+/**
+ * Drop the memoised Price objects and the cached plan list. Test seam, and
+ * useful after a price rotation.
+ */
 function clearPriceCache() {
   priceCache.clear();
+  catalogCache = null;
 }
 
 /**
@@ -293,6 +297,16 @@ async function resolveSelection(selections, client = prisma) {
   const rows = await repo.findActivePlansByCodes(client, planCodes);
   const byCode = new Map(rows.map((r) => [r.planCode, r]));
 
+  /*
+   * Warm the price cache with every Stripe price at once, instead of one Stripe
+   * call per line inside the loop. Failures are ignored here on purpose: the loop
+   * below calls retrievePrice again for anything not cached and reports errors
+   * exactly as before, in the same order.
+   */
+  if (config.stripe.verifyPricesWithApi) {
+    await Promise.allSettled(rows.map((plan) => retrievePrice(plan.stripePriceId, plan.planCode)));
+  }
+
   const lines = [];
   for (const want of wanted) {
     const plan = byCode.get(want.planCode);
@@ -391,7 +405,24 @@ function assertCompatible(lines) {
  * This is what lets the client render the four bookkeeping tiers and the three
  * tax tiers without ever learning a price id.
  */
+/*
+ * GET /billing/plans is the same for everyone and changes only when the plan
+ * table is edited, so it is kept in memory for a minute. Display only: checkout
+ * resolves prices fresh (resolveSelection), so a cached list can never decide
+ * what anyone is charged.
+ */
+const CATALOG_TTL_MS = 60 * 1000;
+let catalogCache = null;
+
 async function listCatalog(client = prisma) {
+  if (client !== prisma) return buildCatalog(client);
+  if (catalogCache && catalogCache.expiresAt > Date.now()) return catalogCache.value;
+  const value = await buildCatalog(client);
+  catalogCache = { value, expiresAt: Date.now() + CATALOG_TTL_MS };
+  return value;
+}
+
+async function buildCatalog(client) {
   const rows = await repo.listActivePlans(client, catalog.ALL_PLAN_CODES);
   const byCode = new Map(rows.map((r) => [r.planCode, r]));
 

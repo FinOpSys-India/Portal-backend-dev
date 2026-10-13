@@ -723,7 +723,7 @@ describe('PUT /companies/:id/specialists', () => {
   const TAX_SPECIALIST = 73;
 
   function stageAssign({ services = ['BOOKKEEPING', 'PAYROLL'], users = {} } = {}) {
-    stageUsers({
+    const staged = {
       [ADMIN_ID]: person(ADMIN_ID, 'Root', 'Admin', 'ADMIN'),
       [MANAGER_ID]: person(MANAGER_ID, 'Sarah', 'Jones', 'ACCOUNTING_MANAGER'),
       [OTHER_MANAGER_ID]: person(OTHER_MANAGER_ID, 'Ravi', 'Patel', 'ACCOUNTING_MANAGER'),
@@ -731,7 +731,12 @@ describe('PUT /companies/:id/specialists', () => {
       [PAYROLL_SPECIALIST]: specialist(PAYROLL_SPECIALIST, 'Pat', 'Pay', 'SPECIALIST_1'),
       [TAX_SPECIALIST]: specialist(TAX_SPECIALIST, 'Tia', 'Tax', 'SPECIALIST_2'),
       ...users,
-    });
+    };
+    stageUsers(staged);
+    // The chosen specialists are loaded in one batched `id IN (...)` read.
+    mockPrisma.user.findMany.mockImplementation(({ where }) =>
+      Promise.resolve((where?.id?.in ?? []).map((id) => staged[id]).filter(Boolean))
+    );
     mockPrisma.company.findFirst.mockResolvedValue(managedCompany());
     mockPrisma.companySubscription.findMany.mockResolvedValue([subscription({ services })]);
     mockPrisma.companySpecialistAssignment.create.mockImplementation(({ data }) =>
@@ -1182,6 +1187,7 @@ describe('POST /onboarding/company — accounting manager is never auto-assigned
       employeeCount: 4,
       lastYearRevenue: '250000.00',
       revenueCurrency: 'USD',
+      enNumber: 'EN-12345',
       address: {
         addressLine1: '1 Congress Ave',
         city: 'Austin',
