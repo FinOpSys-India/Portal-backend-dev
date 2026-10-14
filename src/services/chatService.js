@@ -751,7 +751,14 @@ async function measureAttachments({ conversationId, requestId, files }) {
   // `file_key` is UNIQUE. A key already on a message means a retried or replayed
   // request, and inserting it again would break on the index — a 500 for what is
   // really a duplicate submit.
-  const already = await repo.findAttachmentsByKeys(prisma, files.map((file) => file.key));
+  // The duplicate check and the bucket stats are both reads, so they run
+  // together; results are still checked in the original order.
+  const [alreadyResult, statsResult] = await Promise.allSettled([
+    repo.findAttachmentsByKeys(prisma, files.map((file) => file.key)),
+    Promise.all(files.map((file) => storage.statObject({ bucket: BUCKET, key: file.key }))),
+  ]);
+  if (alreadyResult.status === 'rejected') throw alreadyResult.reason;
+  const already = alreadyResult.value;
   if (already.length) {
     throw new ApiError(409, 'Those files have already been sent.', {
       code: 'ATTACHMENT_ALREADY_RECORDED',
@@ -759,9 +766,8 @@ async function measureAttachments({ conversationId, requestId, files }) {
     });
   }
 
-  const stats = await Promise.all(
-    files.map((file) => storage.statObject({ bucket: BUCKET, key: file.key }))
-  );
+  if (statsResult.status === 'rejected') throw statsResult.reason;
+  const stats = statsResult.value;
 
   const missing = files.filter((_, i) => !stats[i]);
   if (missing.length) {
@@ -878,6 +884,28 @@ async function sendMessage({ userId, requestId, conversationId, body }) {
       code: 'EMPTY_MESSAGE',
       fields: { body: 'Type a message or attach a file.' },
     });
+  }
+
+  // Text only: one atomic statement instead of a four-round-trip transaction,
+  // then the usual read-back so the response shape is unchanged.
+  if (!attachmentRows.length) {
+    const messageId = await repo.createTextMessageAndTouch(prisma, {
+      conversationId: conversation.id,
+      senderUserId: caller.id,
+      body: body.body,
+    });
+    const message = await repo.findMessageById(prisma, messageId);
+
+    logEvent({
+      event: 'chat.message.sent',
+      status: 'success',
+      requestId,
+      userId,
+      companyId: conversation.companyId,
+      detail: `conversation ${conversation.id}, 0 attachment(s)`,
+    });
+
+    return dto.toMessage(message, { conversation, viewerUserId: caller.id });
   }
 
   let message;

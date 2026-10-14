@@ -398,33 +398,35 @@ describe('POST /chat/conversations/:id/messages', () => {
   beforeEach(() => {
     mockPrisma.chatConversation.findUnique.mockResolvedValue(conversationRow());
     mockPrisma.chatConversation.update.mockResolvedValue({ id: CONVERSATION_ID, lastMessageAt: new Date() });
+    // Text-only sends: one CTE writes the message and touches the thread, then
+    // the row is read back through MESSAGE_SELECT.
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 1n }]);
+    mockPrisma.chatMessage.findUnique.mockResolvedValue(messageRow());
   });
 
-  it('stores the message and moves the thread’s lastMessageAt in one transaction', async () => {
-    const created = messageRow();
-    mockPrisma.chatMessage.create.mockResolvedValue(created);
-
+  it('stores a text message and moves the thread’s lastMessageAt in one statement', async () => {
     const res = await request(app)
       .post(`/api/chat/conversations/${CONVERSATION_ID}/messages`)
       .set('Authorization', managerAuth())
       .send({ body: '  Sent the Q3 books over.  ' });
 
     expect(res.status).toBe(201);
-    expect(mockPrisma.$transaction).toHaveBeenCalled();
-    expect(mockPrisma.chatMessage.create.mock.calls[0][0].data).toMatchObject({
-      conversationId: CONVERSATION_ID,
-      senderUserId: MANAGER_ID,
-      // Trimmed, and stored as typed.
-      body: 'Sent the Q3 books over.',
-    });
+    // No interactive transaction: the single statement is atomic on its own.
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    expect(mockPrisma.chatMessage.create).not.toHaveBeenCalled();
 
-    // The preview column takes the message's OWN timestamp, so the two cannot
-    // disagree by the width of the transaction.
-    expect(mockPrisma.chatConversation.update.mock.calls[0][0].data.lastMessageAt).toEqual(created.createdAt);
+    const [strings, ...values] = mockPrisma.$queryRaw.mock.calls[0];
+    const sql = strings.join('?');
+    expect(sql).toMatch(/INSERT INTO chat_messages/);
+    // The preview column takes the message's OWN timestamp.
+    expect(sql).toMatch(/last_message_at = m\.created_at/);
+    // Trimmed, and stored as typed.
+    expect(values).toEqual([CONVERSATION_ID, MANAGER_ID, 'Sent the Q3 books over.', CONVERSATION_ID]);
+
+    expect(mockPrisma.chatMessage.findUnique.mock.calls[0][0].where).toEqual({ id: 1n });
   });
 
   it('returns the receiver and both email addresses, none of which are stored', async () => {
-    mockPrisma.chatMessage.create.mockResolvedValue(messageRow());
 
     const res = await request(app)
       .post(`/api/chat/conversations/${CONVERSATION_ID}/messages`)
@@ -441,7 +443,7 @@ describe('POST /chat/conversations/:id/messages', () => {
   });
 
   it('derives the receiver from the other side when the customer is the sender', async () => {
-    mockPrisma.chatMessage.create.mockResolvedValue(
+    mockPrisma.chatMessage.findUnique.mockResolvedValue(
       messageRow({ senderUserId: OWNER_ID, sender: PEOPLE[OWNER_ID] })
     );
 
@@ -464,6 +466,7 @@ describe('POST /chat/conversations/:id/messages', () => {
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('EMPTY_MESSAGE');
     expect(mockPrisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(mockPrisma.$queryRaw).not.toHaveBeenCalled();
   });
 
   it('refuses a teammate who is on the company but not in this thread', async () => {
@@ -475,6 +478,7 @@ describe('POST /chat/conversations/:id/messages', () => {
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('CHAT_ACCESS_DENIED');
     expect(mockPrisma.chatMessage.create).not.toHaveBeenCalled();
+    expect(mockPrisma.$queryRaw).not.toHaveBeenCalled();
   });
 
   it('404s a thread that does not exist', async () => {

@@ -339,6 +339,37 @@ function createMessage(client, { conversationId, senderUserId, body, attachments
 }
 
 /**
+ * Write a text-only message AND move the thread's `lastMessageAt`, in ONE
+ * statement.
+ *
+ * The same two writes sendMessage otherwise makes inside an interactive
+ * transaction (BEGIN, insert, update, COMMIT — four round trips to a database
+ * on another continent). A data-modifying CTE is a single statement, so it is
+ * atomic on its own: both rows commit together or neither does, and Realtime
+ * sees the same INSERT and UPDATE it always did. `last_message_at` still takes
+ * the message's own `created_at`, and `updated_at` is bumped as Prisma's
+ * `@updatedAt` would.
+ *
+ * Text only: a message with attachments keeps the Prisma nested write.
+ * Returns the new message id; the caller reads it back through MESSAGE_SELECT.
+ */
+async function createTextMessageAndTouch(client, { conversationId, senderUserId, body }) {
+  const rows = await client.$queryRaw`
+    WITH m AS (
+      INSERT INTO chat_messages (conversation_id, sender_user_id, body)
+      VALUES (${conversationId}, ${senderUserId}, ${body})
+      RETURNING id, created_at
+    )
+    UPDATE chat_conversations c
+       SET last_message_at = m.created_at, updated_at = now()
+      FROM m
+     WHERE c.id = ${conversationId}
+    RETURNING m.id
+  `;
+  return rows[0].id;
+}
+
+/**
  * Mark as read everything in a thread the reader did NOT send.
  *
  * `senderUserId: { not: readerUserId }` is the whole rule, and it is why no
@@ -677,6 +708,7 @@ module.exports = {
   findMessageById,
   findMessageForAccess,
   createMessage,
+  createTextMessageAndTouch,
   markRead,
   countUnreadByConversation,
   findLatestMessages,

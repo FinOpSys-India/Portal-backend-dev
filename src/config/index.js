@@ -559,7 +559,16 @@ const config = {
      * a TLS handshake and the stock 2s transaction acquisition window produces
      * spurious P2028 "unable to start a transaction" errors.
      */
-    poolMax: parseInt(process.env.DB_POOL_MAX, 10) || 10,
+    /*
+     * Supabase's SESSION pooler (pooler host, port 5432) caps every client of
+     * the project at pool_size 15, and prod and pre-prod share it. Queries now
+     * run in parallel, so a pool of 10 per process could exhaust it
+     * (EMAXCONNSESSION -> 500s). Default to 5 there; the transaction pooler
+     * (6543) and direct connections keep 10. DB_POOL_MAX still overrides.
+     */
+    poolMax:
+      parseInt(process.env.DB_POOL_MAX, 10) ||
+      (/pooler\.supabase\.com:5432\b/.test(process.env.DATABASE_URL || '') ? 5 : 10),
     connectTimeoutMs: parseInt(process.env.DB_CONNECT_TIMEOUT_MS, 10) || 10000,
     // maxWait: time allowed to acquire a connection for a transaction.
     txMaxWaitMs: parseInt(process.env.DB_TX_MAX_WAIT_MS, 10) || 10000,
